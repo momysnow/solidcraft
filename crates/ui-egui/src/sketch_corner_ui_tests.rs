@@ -163,6 +163,75 @@ fn derived_offset_context_action_releases_geometry_and_undo_restores() {
     assert_eq!(h.app.session.model.state().sketch(sid).unwrap().sketch.freeform_offsets.len(), 1);
 }
 
+#[test]
+fn shift_clicks_on_two_curves_extend_both_to_where_they_meet() {
+    // A runs right along y=0 to (8,0); B comes down x=12 from (12,6) to (12,2). With Shift, the
+    // first click remembers A and the second (on B) extends both to (12,0). Without Shift a click
+    // is still the single-curve extend.
+    let mut h = crate::scenario::Harness::new();
+    h.app.home.open = false;
+    h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
+    h.app.run("sketch.line", json!({"points":[[0,0],[8,0]],"connect":false,"infer":false})).unwrap();
+    h.app.run("sketch.line", json!({"points":[[12,6],[12,2]],"connect":false,"infer":false})).unwrap();
+    h.call("ui.view", json!({"view": "top"}));
+    h.app.cam.distance = 60.0;
+    h.frames(3);
+    h.call("ui.start", json!({"command": "sketch.extend"}));
+    h.frames(2);
+    let undo = h.app.session.undo.len();
+
+    shift_click(&mut h, &json!({"sketch": [6, 0]}));
+    assert_eq!(h.app.session.undo.len(), undo, "the first Shift click only remembers its curve");
+    shift_click(&mut h, &json!({"sketch": [12, 3]}));
+    assert_eq!(h.app.session.undo.len(), undo + 1, "the second runs the two-curve extend, in one step");
+
+    let st = h.app.session.world_state();
+    let ss = st.sketch(h.app.session.active_sketch.unwrap()).unwrap();
+    for end in ["l1.end", "l2.end"] {
+        let p = ss.sketch.point(ss.sketch.resolve_point(end).unwrap()).unwrap();
+        assert!(p.dist(Vec2::new(12.0, 0.0)) < 1e-6, "{end} at the meeting point: {p:?}, {:?}", h.app.status);
+    }
+}
+
+#[test]
+fn escape_drops_a_pending_pair_pick() {
+    // The first Shift click waits for a second curve. Escape cancels the tool, so a later Shift
+    // click on the other curve, with the tool started again, starts afresh and runs nothing.
+    let mut h = crate::scenario::Harness::new();
+    h.app.home.open = false;
+    h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
+    h.app.run("sketch.line", json!({"points":[[0,0],[8,0]],"connect":false,"infer":false})).unwrap();
+    h.app.run("sketch.line", json!({"points":[[12,6],[12,2]],"connect":false,"infer":false})).unwrap();
+    h.call("ui.view", json!({"view": "top"}));
+    h.app.cam.distance = 60.0;
+    h.frames(3);
+    h.call("ui.start", json!({"command": "sketch.extend"}));
+    h.frames(2);
+    shift_click(&mut h, &json!({"sketch": [6, 0]}));
+    h.step(&json!({"key": "Escape"})).unwrap();
+    h.call("ui.start", json!({"command": "sketch.extend"}));
+    h.frames(2);
+    let undo = h.app.session.undo.len();
+
+    shift_click(&mut h, &json!({"sketch": [12, 3]}));
+    assert_eq!(h.app.session.undo.len(), undo, "the pending first pick went with Escape");
+}
+
+/// A click with Shift held at `at`: hover first so the pointer is over the curve, then press and
+/// release with the modifier.
+fn shift_click(h: &mut crate::scenario::Harness, at: &Value) {
+    let [sx, sy] = h.at(at).expect("on screen");
+    let p = egui::pos2(sx as f32, sy as f32);
+    let shift = egui::Modifiers { shift: true, ..Default::default() };
+    h.app.synthetic.push(egui::Event::PointerMoved(p));
+    h.app.synthetic.push(egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed: true, modifiers: shift });
+    h.app.synthetic.push(egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed: false, modifiers: shift });
+    while !h.app.synthetic.is_empty() {
+        h.frame();
+    }
+    h.frames(2);
+}
+
 /// The size fields of the open Fillet or Chamfer window, as if they had been typed.
 fn set_size(app: &mut SolveApp, text: &str) {
     match app.dialog.as_mut().map(|d| &mut d.kind) {

@@ -2797,3 +2797,275 @@ fn a_fillet_stays_a_quarter_arc_when_its_corner_is_pinned_or_dragged_to_the_othe
     assert_eq!(curve(&si, "l1")["end_at"], json!([45.0, 10.0]), "{}", curve(&si, "l1"));
     assert_eq!(curve(&si, "l2")["start_at"], json!([40.0, 5.0]), "{}", curve(&si, "l2"));
 }
+
+// ---------------------------------------------------------------------------------------------
+// `sketch.extend` with two curves (#4750): each grows to where the two meet, and they are joined.
+
+fn coincident_count(sk: &solidcraft_sketch::Sketch) -> usize {
+    sk.constraints.iter().filter(|c| matches!(c.kind, ConstraintKind::Coincident { .. })).count()
+}
+
+fn point_at(sk: &solidcraft_sketch::Sketch, id: &str) -> Vec2 {
+    sk.point(sk.resolve_point(id).expect("a point")).expect("its position")
+}
+
+#[test]
+fn extend_two_lines_meet_in_an_open_l_and_close_into_one_profile() {
+    // A runs right along y=0 and stops at (8,0); B comes down x=12 from (12,6) to (12,2). Their
+    // lines meet at (12,0): A grows 4 (8 to 12), B grows 2 (2 to 0). One Coincident joins them.
+    let mut s = new_sketch();
+    let a = ids(&run(&mut s, "sketch.line", json!({"points":[[0,0],[8,0]],"connect":false,"infer":false}))["curves"])[0].clone();
+    let b = ids(&run(&mut s, "sketch.line", json!({"points":[[12,6],[12,2]],"connect":false,"infer":false}))["curves"])[0].clone();
+    let before = sketch(&s);
+    let (curves, points, coincident) = (before.curves.len(), before.points.len(), coincident_count(&before));
+
+    let out = run(&mut s, "sketch.extend", json!({"curves": [a, b]}));
+
+    let sk = sketch(&s);
+    assert_eq!((sk.curves.len(), sk.points.len()), (curves, points), "no curve or point is added");
+    assert_eq!(coincident_count(&sk), coincident + 1, "one Coincident joins the two ends");
+    assert!(point_at(&sk, &format!("{a}.end")).dist(Vec2::new(12.0, 0.0)) < 1e-6, "{a} ends at the meeting point");
+    assert!(point_at(&sk, &format!("{b}.end")).dist(Vec2::new(12.0, 0.0)) < 1e-6, "{b} ends at the meeting point");
+    let meet = out["moved"].as_str().expect("the meeting point id");
+    assert!(point_at(&sk, meet).dist(Vec2::new(12.0, 0.0)) < 1e-6, "{meet}");
+
+    // A closing line (12,6) to (0,0) makes the L a triangle of area 12 * 6 / 2 = 36.
+    run(&mut s, "sketch.line", json!({"points":[[12,6],[0,0]],"closed":false}));
+    assert!(profiles(&s).iter().any(|area| (area - 36.0).abs() < 1e-6), "{:?}", profiles(&s));
+}
+
+#[test]
+fn extend_a_line_and_an_arc_meet_at_the_point_both_reach() {
+    // Arc: centre (0,0), radius 5, from (0,5) round to (-5,0). Line: x=-3 from (-3,-1) to (-3,-2).
+    // They meet at (-3,-4), a 3-4-5 point: the arc grows from (-5,0) through 53.13 degrees
+    // (atan2(-4,-3) is 233.13 degrees), and the line grows 2 (from (-3,-2) to (-3,-4)).
+    let mut s = new_sketch();
+    let arc = ids(&run(&mut s, "sketch.arc.center_point", json!({"center":[0,0],"start":[0,5],"end":[-5,0],"connect":false}))["curves"])[0].clone();
+    let line = ids(&run(&mut s, "sketch.line", json!({"points":[[-3,-1],[-3,-2]],"connect":false,"infer":false}))["curves"])[0].clone();
+
+    run(&mut s, "sketch.extend", json!({"curves": [arc, line], "at": [[-5, 0], [-3, -2]]}));
+
+    let sk = sketch(&s);
+    assert!(point_at(&sk, &format!("{arc}.end")).dist(Vec2::new(-3.0, -4.0)) < 1e-6, "the arc reaches the meeting point");
+    assert!(point_at(&sk, &format!("{line}.end")).dist(Vec2::new(-3.0, -4.0)) < 1e-6, "the line reaches it");
+    assert_eq!(coincident_count(&sk), 1, "one Coincident joins them");
+    let ci = sk.curve_index(&arc).expect("the arc");
+    assert!(sk.shape(ci).is_some_and(|sh| sh.dist(Vec2::new(-3.0, -4.0)) < 1e-6), "the arc stays on its circle");
+}
+
+#[test]
+fn extend_two_lines_grows_only_the_one_that_does_not_reach() {
+    // A already ends at (12,0), where B meets it: only B grows (2 to 0), and A keeps its end.
+    let mut s = new_sketch();
+    let a = ids(&run(&mut s, "sketch.line", json!({"points":[[0,0],[12,0]],"connect":false,"infer":false}))["curves"])[0].clone();
+    let b = ids(&run(&mut s, "sketch.line", json!({"points":[[12,6],[12,2]],"connect":false,"infer":false}))["curves"])[0].clone();
+    let before = sketch(&s);
+    let a_end = before.resolve_point(&format!("{a}.end")).expect("a's end");
+
+    run(&mut s, "sketch.extend", json!({"curves": [a, b]}));
+
+    let sk = sketch(&s);
+    assert_eq!(sk.resolve_point(&format!("{a}.end")), Some(a_end), "the line that already reaches keeps its end");
+    assert!(point_at(&sk, &format!("{b}.end")).dist(Vec2::new(12.0, 0.0)) < 1e-6, "only {b} grows");
+    assert_eq!(sk.points.len(), before.points.len(), "its end joins the point that is there");
+    assert_eq!(coincident_count(&sk), coincident_count(&before) + 1);
+}
+
+#[test]
+fn extend_two_lines_adds_a_line_when_an_end_is_held_by_other_geometry() {
+    // B's end (12,2) is joined to C (to (14,2)): it does not move, so B's growth is a new line from
+    // that end to the point A reaches, (12,0).
+    let mut s = new_sketch();
+    let a = ids(&run(&mut s, "sketch.line", json!({"points":[[0,0],[8,0]],"connect":false,"infer":false}))["curves"])[0].clone();
+    let bc = ids(&run(&mut s, "sketch.line", json!({"points":[[12,6],[12,2],[14,2]],"connect":false,"infer":false}))["curves"]);
+    let b = bc[0].clone();
+    let before = sketch(&s);
+    let (curves, points) = (before.curves.len(), before.points.len());
+
+    run(&mut s, "sketch.extend", json!({"curves": [a, b]}));
+
+    let sk = sketch(&s);
+    assert_eq!(sk.curves.len(), curves + 1, "the held end gets a new line");
+    assert_eq!(sk.points.len(), points, "the new line joins the point A reaches");
+    assert!(point_at(&sk, &format!("{b}.end")).dist(Vec2::new(12.0, 2.0)) < 1e-9, "the held end does not move");
+    let last = sk.curves.len() - 1;
+    let b_end = sk.resolve_point(&format!("{b}.end"));
+    let a_end = sk.resolve_point(&format!("{a}.end"));
+    assert!(
+        matches!(sk.curves[last].kind, CurveKind::Line { a: from, b: to } if Some(from) == b_end && Some(to) == a_end),
+        "the new line runs from the held end to the point A reaches"
+    );
+}
+
+#[test]
+fn extend_two_curves_refuses_what_cannot_meet_and_changes_nothing() {
+    let mut s = new_sketch();
+    let a = ids(&run(&mut s, "sketch.line", json!({"points":[[0,0],[8,0]],"connect":false,"infer":false}))["curves"])[0].clone();
+    let b = ids(&run(&mut s, "sketch.line", json!({"points":[[12,6],[12,2]],"connect":false,"infer":false}))["curves"])[0].clone();
+    let p = ids(&run(&mut s, "sketch.line", json!({"points":[[0,5],[8,5]],"connect":false,"infer":false}))["curves"])[0].clone();
+    let before = serde_json::to_value(sketch(&s)).unwrap();
+    let cases = [
+        (json!({"curves": [a, p]}), "parallel"),
+        (json!({"curves": [a, a]}), "twice"),
+        (json!({"curves": [a, "l99"]}), "unknown curve"),
+        (json!({"curve": a, "at": [8, 0], "curves": [a, b]}), "not both"),
+        (json!({"curves": [a]}), "exactly two"),
+        (json!({"curves": [a, b], "at": [[0, 0], [12, 6]]}), "shorten"),
+        (json!({"curves": [a, b], "at": [8, 0]}), "one point per curve"),
+    ];
+    for (params, expected) in cases {
+        let e = s.execute("sketch.extend", &params).unwrap_err().to_string();
+        assert!(e.contains(expected), "{params}: {e}");
+    }
+    assert_eq!(serde_json::to_value(sketch(&s)).unwrap(), before, "a refused extension changes nothing");
+}
+
+#[test]
+fn extend_two_curves_is_one_undo_step() {
+    let mut s = new_sketch();
+    let a = ids(&run(&mut s, "sketch.line", json!({"points":[[0,0],[8,0]],"connect":false,"infer":false}))["curves"])[0].clone();
+    let b = ids(&run(&mut s, "sketch.line", json!({"points":[[12,6],[12,2]],"connect":false,"infer":false}))["curves"])[0].clone();
+    let before = serde_json::to_value(sketch(&s)).unwrap();
+
+    run(&mut s, "sketch.extend", json!({"curves": [a, b]}));
+    assert_ne!(serde_json::to_value(sketch(&s)).unwrap(), before);
+    run(&mut s, "edit.undo", json!({}));
+    assert_eq!(serde_json::to_value(sketch(&s)).unwrap(), before, "one undo restores the sketch");
+}
+
+#[test]
+fn extend_two_curves_meeting_at_the_origin_returns_the_joined_end() {
+    // A runs right along y=0 from (-8,0) to (-4,0); B comes down x=0 from (0,4) to (0,2). They meet
+    // at the origin. `moved` is the joined end (one of their ends), not whichever point sits there.
+    let mut s = new_sketch();
+    let a = ids(&run(&mut s, "sketch.line", json!({"points":[[-8,0],[-4,0]],"connect":false,"infer":false}))["curves"])[0].clone();
+    let b = ids(&run(&mut s, "sketch.line", json!({"points":[[0,4],[0,2]],"connect":false,"infer":false}))["curves"])[0].clone();
+
+    let out = run(&mut s, "sketch.extend", json!({"curves": [a, b]}));
+
+    let sk = sketch(&s);
+    let moved = out["moved"].as_str().expect("the joined end's id");
+    assert_ne!(moved, "origin", "the joined end is not the origin point");
+    let joined = sk.point_index(moved).expect("the returned point");
+    assert!([format!("{a}.end"), format!("{b}.end")].iter().any(|r| sk.resolve_point(r) == Some(joined)), "{moved} is an end of {a} or {b}");
+    assert!(point_at(&sk, moved).dist(Vec2::new(0.0, 0.0)) < 1e-6);
+}
+
+#[test]
+fn extend_two_arcs_meet_at_the_one_point_both_reach() {
+    // Arc 1: centre (0,0), radius 5, from (5,0) to (0,5). Arc 2: centre (6,0), radius 5, from (11,0)
+    // to (6,5). The circles cross at (3,4) and (3,-4). From (3,4) arc 1 would run back past its own
+    // far end, so only (3,-4) is reached: arc 1 grows clockwise from (5,0) by 53.13 degrees (its
+    // circle angle goes from 0 to -53.13), arc 2 grows clockwise from (11,0) by 126.87 degrees.
+    let mut s = new_sketch();
+    let a1 = ids(&run(&mut s, "sketch.arc.center_point", json!({"center":[0,0],"start":[5,0],"end":[0,5],"connect":false}))["curves"])[0].clone();
+    let a2 = ids(&run(&mut s, "sketch.arc.center_point", json!({"center":[6,0],"start":[11,0],"end":[6,5],"connect":false}))["curves"])[0].clone();
+
+    run(&mut s, "sketch.extend", json!({"curves": [a1, a2]}));
+
+    let sk = sketch(&s);
+    assert!(point_at(&sk, &format!("{a1}.start")).dist(Vec2::new(3.0, -4.0)) < 1e-6, "arc 1 reaches (3,-4)");
+    assert!(point_at(&sk, &format!("{a2}.start")).dist(Vec2::new(3.0, -4.0)) < 1e-6, "arc 2 reaches (3,-4)");
+    assert_eq!(coincident_count(&sk), 1, "one Coincident joins them");
+    let ci = sk.curve_index(&a1).expect("arc 1");
+    assert!(sk.shape(ci).is_some_and(|sh| sh.dist(Vec2::new(3.0, -4.0)) < 1e-6), "arc 1 stays on its circle");
+}
+
+#[test]
+fn extend_two_arcs_take_the_meeting_point_with_the_least_growth() {
+    // Arc 1: centre (0,0), radius 5, angles -30 to 20. Arc 2: centre (6,0), radius 5, angles 150 to
+    // 210. Both crossings (3,4) and (3,-4) are reachable. At (3,4) arc 1 grows its end 20 -> 53.13
+    // (33.13 degrees) and arc 2 its start 150 -> 126.87 (23.13): 56.26 in all. At (3,-4) arc 1 grows
+    // its start -30 -> -53.13 (23.13) and arc 2 its end 210 -> 233.13 (23.13): 46.26. (3,-4) wins.
+    let mut s = new_sketch();
+    let a1 = ids(
+        &run(&mut s, "sketch.arc.center_point", json!({"center":[0,0],"start":[4.330127,-2.5],"end":[4.698463,1.710101],"connect":false}))["curves"]
+    )[0]
+    .clone();
+    let a2 =
+        ids(&run(&mut s, "sketch.arc.center_point", json!({"center":[6,0],"start":[1.669873,2.5],"end":[1.669873,-2.5],"connect":false}))["curves"])
+            [0]
+        .clone();
+    let a1_end = point_at(&sketch(&s), &format!("{a1}.end"));
+
+    run(&mut s, "sketch.extend", json!({"curves": [a1, a2]}));
+
+    let sk = sketch(&s);
+    assert!(point_at(&sk, &format!("{a1}.start")).dist(Vec2::new(3.0, -4.0)) < 1e-5, "arc 1 grows its start to (3,-4)");
+    assert!(point_at(&sk, &format!("{a2}.end")).dist(Vec2::new(3.0, -4.0)) < 1e-5, "arc 2 grows its end to (3,-4)");
+    assert!(point_at(&sk, &format!("{a1}.end")).dist(a1_end) < 1e-9, "arc 1's other end stays");
+    assert_eq!(coincident_count(&sk), 1, "one Coincident joins them");
+}
+
+#[test]
+fn extend_two_arcs_with_two_equal_meeting_points_is_refused() {
+    // Both arcs are symmetric about the x-axis: arc 1 from (4.330127,-2.5) to (4.330127,2.5) (circle
+    // angles -30 to 30), arc 2 centre (6,0) from (1.669873,2.5) to (1.669873,-2.5) (angles 150 to 210).
+    // Their circles cross at (3,4) and (3,-4), and each point takes 23.13 degrees from each arc: the
+    // same growth both ways, so there is no reason to choose, and the extension is refused.
+    let mut s = new_sketch();
+    let a1 =
+        ids(&run(&mut s, "sketch.arc.center_point", json!({"center":[0,0],"start":[4.330127,-2.5],"end":[4.330127,2.5],"connect":false}))["curves"])
+            [0]
+        .clone();
+    let a2 =
+        ids(&run(&mut s, "sketch.arc.center_point", json!({"center":[6,0],"start":[1.669873,2.5],"end":[1.669873,-2.5],"connect":false}))["curves"])
+            [0]
+        .clone();
+    let before = serde_json::to_value(sketch(&s)).unwrap();
+
+    let e = s.execute("sketch.extend", &json!({"curves": [a1, a2]})).unwrap_err().to_string();
+
+    assert!(e.contains("same growth"), "{e}");
+    assert_eq!(serde_json::to_value(sketch(&s)).unwrap(), before, "a refused extension changes nothing");
+}
+
+#[test]
+fn extend_a_held_arc_end_adds_a_new_arc_and_the_line_joins_it() {
+    // The arc's end (-5,0) carries a line running down from it, so the arc does not move: its growth
+    // is a new arc from (-5,0), 53.13 degrees round the circle, to (-3,-4). The line x=-3 grows to
+    // (-3,-4) and joins that new arc's end with one Coincident.
+    let mut s = new_sketch();
+    let arc = ids(&run(&mut s, "sketch.arc.center_point", json!({"center":[0,0],"start":[0,5],"end":[-5,0],"connect":false}))["curves"])[0].clone();
+    run(&mut s, "sketch.line", json!({"points":[[-5,0],[-5,-3]],"connect":true,"infer":false}));
+    let line = ids(&run(&mut s, "sketch.line", json!({"points":[[-3,-1],[-3,-2]],"connect":false,"infer":false}))["curves"])[0].clone();
+    let before = sketch(&s);
+    let (curves, coincident) = (before.curves.len(), coincident_count(&before));
+
+    run(&mut s, "sketch.extend", json!({"curves": [arc, line], "at": [[-5, 0], [-3, -2]]}));
+
+    let sk = sketch(&s);
+    assert_eq!(sk.curves.len(), curves + 1, "the held end gets a new arc");
+    assert!(point_at(&sk, &format!("{arc}.end")).dist(Vec2::new(-5.0, 0.0)) < 1e-9, "the held arc end does not move");
+    assert!(point_at(&sk, &format!("{line}.end")).dist(Vec2::new(-3.0, -4.0)) < 1e-6, "the line reaches the meeting point");
+    assert_eq!(coincident_count(&sk), coincident + 1, "one Coincident joins the line to the new arc");
+    let new = sk.curves.len() - 1;
+    assert!(matches!(sk.curves[new].kind, CurveKind::Arc { .. }), "the extension is an arc");
+    assert!(sk.shape(new).is_some_and(|sh| sh.dist(Vec2::new(-3.0, -4.0)) < 1e-6), "the new arc ends on the meeting point");
+}
+
+#[test]
+fn extend_two_curves_refuses_a_spline_and_an_infinite_line() {
+    let mut s = new_sketch();
+    let a = ids(&run(&mut s, "sketch.line", json!({"points":[[0,0],[8,0]],"connect":false,"infer":false}))["curves"])[0].clone();
+    let spline = ids(&run(&mut s, "sketch.spline.fit_point", json!({"points":[[12,-6],[14,-2],[16,0]],"connect":false}))["curves"])[0].clone();
+    let line = ids(&run(&mut s, "sketch.line", json!({"points":[[0,5],[8,5]],"connect":false,"infer":false}))["curves"])[0].clone();
+    run(&mut s, "sketch.infinite", json!({"curves": [line]}));
+    let before = serde_json::to_value(sketch(&s)).unwrap();
+
+    let e = s.execute("sketch.extend", &json!({"curves": [a, spline]})).unwrap_err().to_string();
+    assert!(e.contains("only lines and arcs"), "{e}");
+    let e = s.execute("sketch.extend", &json!({"curves": [a, line]})).unwrap_err().to_string();
+    assert!(e.contains("infinite"), "{e}");
+    assert_eq!(serde_json::to_value(sketch(&s)).unwrap(), before, "refused curves change nothing");
+}
+
+#[test]
+fn extend_two_collinear_lines_are_refused_as_collinear() {
+    // Two lines on y=0 with a gap between them: they lie on one line and never meet at a point.
+    let mut s = new_sketch();
+    let a = ids(&run(&mut s, "sketch.line", json!({"points":[[0,0],[8,0]],"connect":false,"infer":false}))["curves"])[0].clone();
+    let c = ids(&run(&mut s, "sketch.line", json!({"points":[[12,0],[16,0]],"connect":false,"infer":false}))["curves"])[0].clone();
+    let e = s.execute("sketch.extend", &json!({"curves": [a, c]})).unwrap_err().to_string();
+    assert!(e.contains("collinear"), "{e}");
+}
