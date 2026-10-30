@@ -166,6 +166,9 @@ pub struct TreeState {
     pub section_hidden: bool,
     /// What waits for the Capture Position question: a command id, or [`SAVE`].
     pub capture_prompt: Option<String>,
+    /// The design and visibility when the button last went down: a drag over the eyes merges the
+    /// steps it made into one (`eye_drag_frame`).
+    eye_press: Option<(Arc<Document>, solidcraft_engine::Visibility)>,
     /// The last row clicked (for Shift ranges).
     anchor: Option<String>,
     /// Row keys in drawing order this frame (for Shift ranges).
@@ -433,6 +436,28 @@ pub fn origin_items(app: &SolveApp) -> Vec<Item> {
 /// items keep their own state, and hiding or showing them never changes it.
 pub fn toggle_folder(app: &mut SolveApp, key: &str) {
     let _ = app.run("browser.visibility", json!({ "tree_folders": [key], "visible": app.session.folder_hidden(key) }));
+}
+
+/// A drag over the eyes is one undo step (#9680). When the button goes down the design and what is
+/// hidden are noted; when it comes up, the steps the drag made are merged into the first of them.
+pub(crate) fn eye_drag_frame(app: &mut SolveApp, ctx: &egui::Context) {
+    let (pressed, down) = ctx.input(|i| (i.pointer.primary_pressed(), i.pointer.primary_down()));
+    if pressed {
+        app.tree.eye_press = Some((app.session.doc.clone(), app.session.visibility.clone()));
+    }
+    if down {
+        return;
+    }
+    let dragged = ctx.data_mut(|d| d.remove_temp::<bool>(crate::ui_kit::eye_drag_id())).is_some();
+    let Some((doc, visibility)) = app.tree.eye_press.take().filter(|_| dragged) else { return };
+    // The drag's first step saved exactly this design and visibility. Every later step of the drag
+    // saved a different visibility, since each eye it touches moves towards the drag's target.
+    let undo = &mut app.session.undo;
+    if let Some(first) = undo.iter().rposition(|s| Arc::ptr_eq(&s.doc, &doc) && s.visibility == visibility)
+        && undo.len() - first > 1
+    {
+        undo.truncate(first + 1);
+    }
 }
 
 /// A folder shortcut target lasts until another click, Escape, or a change of design/model.
@@ -1441,15 +1466,9 @@ fn component_rows_inner(
     if r.radio {
         let _ = app.run("component.activate", json!({ "component": id }));
     }
-    if r.eye {
-        if visible {
-            app.session
-                .visibility
-                .hidden_bodies
-                .extend(bodies.iter().filter(|b| !app.session.visibility.hidden_bodies.contains(b)).cloned().collect::<Vec<_>>());
-        } else {
-            app.session.visibility.hidden_bodies.retain(|b| !bodies.contains(b));
-        }
+    // Through the command, so the eye is an undo step like a body's (#9680).
+    if r.eye && !bodies.is_empty() {
+        let _ = app.run("browser.visibility", json!({ "items": bodies, "visible": !visible }));
     }
     if r.clicked && !r.double {
         let names = bodies_of_component(app, id);
