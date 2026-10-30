@@ -2563,6 +2563,7 @@ impl SolveApp {
         self.drain_control(ctx);
         self.follow_view_request(true);
         agent_cursor::step(self, ctx);
+        browser::eye_drag_frame(self, ctx);
         if !self.synthetic.is_empty() {
             ctx.request_repaint();
         }

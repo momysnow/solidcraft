@@ -264,6 +264,7 @@ pub(crate) fn tree_row(ui: &mut egui::Ui, id: egui::Id, row: &Row) -> RowResp {
             out.eye = true;
         } else if let Some(p) = ui.input(|i| i.pointer.primary_down().then(|| i.pointer.hover_pos()).flatten())
             && at(p) == 2
+            && ui.rect_contains_pointer(eye_r)
             && let Some(target) = ui.data(|d| d.get_temp::<bool>(eye_drag_id()))
         {
             out.eye |= target != vis;

@@ -2917,7 +2917,6 @@ pub const ESCAPE_TWICE_S: f64 = 0.4;
 pub fn shortcuts(app: &mut SolveApp, ctx: &egui::Context) {
     crate::viewport_status::reconcile(app, ctx);
     crate::browser::update_folder_pick(app, ctx);
-    crate::browser::eye_drag_frame(app, ctx);
     if design_shown(app) {
         crate::navigation::step_key_hold(app, ctx);
     } else {

@@ -915,3 +915,28 @@ fn eye_drag_near_the_rows_bottom_edge_scrolls_them() {
     assert!(handle_at("row:Sketch34").is_some(), "the drag scrolled the list down to its last row");
     assert!(h.app.session.visibility.hidden_sketches.len() > 10, "the eyes the drag reached are hidden");
 }
+
+/// #9680: a drag from the Origin's eye over the plane eyes is one undo step of its own, and the show
+/// before it stays a step: one undo takes back only the drag. The Origin's eye is not an undo step (a
+/// click on it is not either), so that one undo leaves it as the drag set it.
+#[test]
+fn eye_drag_from_the_origin_is_its_own_undo_step_and_leaves_an_earlier_show_alone() {
+    let mut h = Harness::new();
+    h.app.run("solid.box", json!({"length":10,"width":10,"height":10,"body_name":"One"})).unwrap();
+    h.app.run("browser.visibility", json!({"items":["One"],"visible":false})).unwrap();
+    h.app.run("browser.visibility", json!({"items":["One"],"visible":true})).unwrap();
+    h.app.run("browser.expand_all", json!({})).unwrap();
+    h.settle();
+    let undo = h.app.session.undo.len();
+    h.step(&json!({"drag":[{"handle":"eye:Origin"},{"handle":"eye:YZ"}],"steps":40})).unwrap();
+    h.settle();
+    let origin_hidden = |h: &Harness| h.app.session.visibility.origin_hidden == Some(true);
+    assert!(origin_hidden(&h) && h.app.session.visibility.hidden_origin.iter().any(|k| k == "YZ"), "the drag hid the Origin and its planes");
+    assert_eq!(h.app.session.undo.len(), undo + 1, "the drag is one undo step");
+    h.app.run("edit.undo", json!({})).unwrap();
+    assert!(!body_hidden(&h, "One"), "one undo takes back only the drag: the show before it stays");
+    assert!(h.app.session.visibility.hidden_origin.is_empty(), "the planes the drag hid are shown again");
+    assert!(origin_hidden(&h), "the Origin's eye is not an undo step: it keeps what the drag set");
+    h.app.run("edit.undo", json!({})).unwrap();
+    assert!(body_hidden(&h, "One"), "the show is its own undo step: undoing it hides One again");
+}
