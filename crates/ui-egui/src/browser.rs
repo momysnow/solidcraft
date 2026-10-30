@@ -451,8 +451,9 @@ pub(crate) fn eye_drag_frame(app: &mut SolveApp, ctx: &egui::Context) {
     }
     let dragged = ctx.data_mut(|d| d.remove_temp::<bool>(crate::ui_kit::eye_drag_id())).is_some();
     let Some((doc, depth, visibility)) = app.tree.eye_press.take().filter(|_| dragged) else { return };
-    // shortcut: a drag longer than the history's room (200 steps) trims its own first steps from the
-    // front, so the step at `depth` is a later one; the visibility test then leaves it unmerged.
+    // shortcut: once the history is full (200 steps) its length stops growing, so the drag is left as
+    // separate steps, like the point-cloud and canvas drags; the visibility test keeps a trimmed front
+    // from being merged wrongly.
     let undo = &mut app.session.undo;
     if undo.len() > depth + 1 && undo.get(depth).is_some_and(|s| Arc::ptr_eq(&s.doc, &doc) && without_origin(s.visibility.clone()) == visibility) {
         undo.truncate(depth + 1);
