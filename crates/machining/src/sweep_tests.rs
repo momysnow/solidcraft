@@ -382,3 +382,32 @@ fn revolution_pieces_have_the_same_union_as_the_whole_arc() {
         assert_sets(&merge(union, 1e-9), &whole, 1e-6, "revolutions");
     }
 }
+
+#[test]
+fn xz_and_yz_arcs_match_the_dense_oracle_on_x_y_and_z_rays() {
+    // Arcs in the XZ and YZ planes (G18, G19) with a 2.5 mm tool and 3 mm of flute. The review's ray
+    // o = (-100, 0.3, 3.21) along X was empty before the windows reached these planes.
+    let tool = FlatTool::new(2.5, 3.0, Vec3::Z).expect("tool");
+    let xz = ArcFixedAxis::new(Vec3::new(60.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 60.0), Vec3::ZERO, Vec3::Y, true, 0, tool).expect("XZ arc");
+    let yz = ArcFixedAxis::new(Vec3::new(0.0, 60.0, 0.0), Vec3::new(0.0, 0.0, 60.0), Vec3::ZERO, Vec3::X, true, 0, tool).expect("YZ arc");
+    let mut rays: Vec<(Vec3, Vec3)> = vec![(Vec3::new(-100.0, 0.3, 3.21), Vec3::X)];
+    for k in 0..12 {
+        let v = -1.5 + 0.35 * k as f64;
+        rays.push((Vec3::new(-100.0, v, 3.21), Vec3::X));
+        rays.push((Vec3::new(v, -100.0, 3.21), Vec3::Y));
+        rays.push((Vec3::new(v, -100.0, 3.21), Vec3::X));
+        rays.push((Vec3::new(v, v * 0.7 + 0.3, -100.0), Vec3::Z));
+    }
+    let mut cut = 0;
+    for arc in [&xz, &yz] {
+        for (o, d) in &rays {
+            let want = merge(dense_arc(arc, *o, *d, WIDE, 400000), 2e-3);
+            let got = ray_set(arc, *o, *d, WIDE);
+            if !want.is_empty() {
+                cut += 1;
+            }
+            assert_sets(&got, &want, 2e-3, &format!("arc {:?} ray {o:?} {d:?}", arc.normal));
+        }
+    }
+    assert!(cut > 10, "rays cut: {cut}");
+}

@@ -328,8 +328,9 @@ impl LinearFixedAxis {
             }
             (0.0, 1.0)
         } else {
-            let sa = alpha0 / delta;
-            let sb = (alpha0 - len) / delta;
+            // The s values where the tip window is strictly inside the tool, with the same slack as above.
+            let sa = (alpha0 - EPS_MM) / delta;
+            let sb = (alpha0 - len + EPS_MM) / delta;
             (sa.min(sb).max(0.0), sa.max(sb).min(1.0))
         };
         // A plunge or ramp that ends exactly at the ray's height gives an empty s range: no cut.
@@ -379,9 +380,14 @@ struct Form {
     phi: f64,
 }
 
+/// A form that solves in closed form: a pure line or a pure sinusoid.
+fn solvable(form: &Form) -> bool {
+    form.amp == 0.0 || form.slope == 0.0
+}
+
 impl Form {
     fn value(&self, sign: f64, u: f64) -> f64 {
-        self.base + self.slope * u + self.amp * (sign * u - self.phi).cos()
+        self.base + self.slope * u + self.amp * det_math::cos(sign * u - self.phi)
     }
 
     /// The parameter values in `[a, b]` where the form equals `level`, appended to `out`.
@@ -399,7 +405,7 @@ impl Form {
         if c.abs() > 1.0 || self.slope != 0.0 {
             return;
         }
-        let alpha = c.acos();
+        let alpha = det_math::acos(c);
         for ang in [alpha, -alpha] {
             // sign * u - phi = +-alpha + 2 pi m, so u = sign * (phi +- alpha) modulo a turn.
             let u0 = (sign * (self.phi + ang)).rem_euclid(TAU);
@@ -547,30 +553,48 @@ impl ArcFixedAxis {
         }
     }
 
-    /// The constraints `lo < form < hi` that a tool must meet to cut the ray, as exact forms. Empty
-    /// when the windows cannot be solved in closed form (arcs outside the XY plane, oblique rays).
+    /// The constraints `lo < form < hi` that a tool must meet to cut the ray, as exact forms. Only
+    /// the forms that solve in closed form are used; an arc or ray with none falls back to sampling.
     fn constraints(&self, o: Vec3, d: Vec3) -> Vec<(Form, f64, f64)> {
-        if !self.axis_normal {
-            return Vec::new();
-        }
         let axis = self.tool.axis;
+        let r = self.tool.radius;
         let along = d.dot(axis).abs();
+        let mut out = Vec::new();
         if along > 1.0 - AXIS_EPS {
-            // Parallel: the footprint, a disc of radius R around the ray's foot, is the only limit.
-            let f = self.distance_sq_form(o);
-            vec![(f, f64::NEG_INFINITY, self.tool.radius * self.tool.radius)]
+            if self.axis_normal {
+                // Parallel, in the XY plane: the footprint, a disc of radius R about the ray's foot.
+                out.push((self.distance_sq_form(o), f64::NEG_INFINITY, r * r));
+            } else if self.normal.dot(axis).abs() < AXIS_EPS && self.lift.len() < 1e-12 {
+                // Parallel, in a plane that holds the axis, with no lift: the arc's projection is a
+                // segment, so the footprint is a band across it, of half-width sqrt(R^2 - dn^2).
+                let lateral = self.normal.cross(axis);
+                let dn = self.normal.dot(self.centre - o);
+                let rad2 = r * r - dn * dn;
+                if rad2 <= 0.0 {
+                    // The arc never comes within R of the ray: an empty band.
+                    out.push((Form { base: 0.0, slope: 0.0, amp: 0.0, phi: 0.0 }, 1.0, 0.0));
+                } else {
+                    let hw = rad2.sqrt();
+                    let c = lateral.dot(o);
+                    out.push((self.coordinate_form(lateral), c - hw, c + hw));
+                }
+            }
         } else if along < AXIS_EPS {
-            // Perpendicular: within R of the ray's line, and the ray at a height inside the tool.
-            let w = self.normal.cross(d);
-            let f = self.coordinate_form(w);
+            // Perpendicular: within R of the ray's line (its lateral direction is axis x d, which lies
+            // in every plane perpendicular to the ray), and the ray at a height inside the tool.
+            let w = axis.cross(d);
             let c = w.dot(o);
-            let h = self.coordinate_form(axis);
+            let f = self.coordinate_form(w);
+            if solvable(&f) {
+                out.push((f, c - r, c + r));
+            }
             let z0 = o.dot(axis);
-            let r = self.tool.radius;
-            vec![(f, c - r, c + r), (h, z0 - self.tool.length, z0)]
-        } else {
-            Vec::new()
+            let h = self.coordinate_form(axis);
+            if solvable(&h) {
+                out.push((h, z0 - self.tool.length, z0));
+            }
         }
+        out
     }
 }
 
