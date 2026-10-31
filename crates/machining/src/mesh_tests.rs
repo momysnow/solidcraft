@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use solidcraft_geom::{Mesh, Vec3};
 
-use super::chunk_meshes;
+use super::{Lattice, chunk_meshes, extract};
 use crate::dexel::Stock;
 use crate::sweep::{FlatTool, LinearFixedAxis};
 
@@ -32,7 +32,7 @@ fn weld(meshes: &[Mesh]) -> Mesh {
 }
 
 /// Every undirected edge is shared by exactly two triangles, and each directed edge appears once.
-fn assert_closed(m: &Mesh) {
+fn assert_manifold(m: &Mesh) {
     let mut count: HashMap<(u32, u32), u32> = HashMap::new();
     let mut directed: HashMap<(u32, u32), u32> = HashMap::new();
     for t in &m.triangles {
@@ -47,6 +47,28 @@ fn assert_closed(m: &Mesh) {
     assert!(!m.triangles.is_empty());
 }
 
+/// A synthetic lattice of `n` cells per axis, with material given by a predicate on nodes. The
+/// crossing of each edge is its midpoint, so tests check the topology and not the placement.
+struct Synthetic<F: Fn([i64; 3]) -> bool> {
+    n: i64,
+    material: F,
+}
+
+impl<F: Fn([i64; 3]) -> bool> Lattice for Synthetic<F> {
+    fn cell_counts(&self) -> [i64; 3] {
+        [self.n; 3]
+    }
+
+    fn inside(&self, node: [i64; 3]) -> bool {
+        node.iter().all(|&x| x >= 0 && x < self.n) && (self.material)(node)
+    }
+
+    fn crossing(&self, axis: usize, lower: [i64; 3]) -> Option<Vec3> {
+        let p: [f64; 3] = std::array::from_fn(|k| lower[k] as f64 + if k == axis { 0.5 } else { 0.0 });
+        Some(Vec3::from(p))
+    }
+}
+
 fn slot_stock(h: f64) -> Stock {
     let mut s = Stock::new_box(Vec3::new(0.0, 0.0, -10.0), Vec3::new(30.0, 30.0, 0.0), h, 1 << 32).expect("stock");
     let tool = FlatTool::new(2.5, 20.0, Vec3::Z).expect("tool");
@@ -58,9 +80,8 @@ fn slot_stock(h: f64) -> Stock {
 #[test]
 fn uncut_box_mesh_is_closed_and_its_volume_is_near_the_box() {
     let s = Stock::new_box(Vec3::new(0.0, 0.0, 0.0), Vec3::new(2.0, 2.0, 2.0), 0.25, 1 << 32).expect("stock");
-    let meshes = chunk_meshes(&s);
-    let m = weld(&meshes);
-    assert_closed(&m);
+    let m = weld(&chunk_meshes(&s));
+    assert_manifold(&m);
     let v = m.measure().volume;
     assert!(v > 0.0, "outward orientation: {v}");
     assert!((v - 8.0).abs() < 0.5, "box volume {v}");
@@ -68,12 +89,29 @@ fn uncut_box_mesh_is_closed_and_its_volume_is_near_the_box() {
 
 #[test]
 fn cut_stock_mesh_is_closed_across_chunk_seams() {
-    let h = 0.25;
-    let s = slot_stock(h);
+    let s = slot_stock(0.25);
     let meshes = chunk_meshes(&s);
     assert!(meshes.len() > 1, "more than one chunk");
-    let m = weld(&meshes);
-    assert_closed(&m);
+    assert_manifold(&weld(&meshes));
+}
+
+#[test]
+fn checkerboard_lattice_gives_a_manifold_surface() {
+    // Every face of every cell is a checkerboard: the hardest case for the pairing.
+    for n in [3, 4, 40] {
+        let lat = Synthetic { n, material: |node: [i64; 3]| (node[0] + node[1] + node[2]) % 2 == 0 };
+        let m = weld(&extract(&lat));
+        assert_manifold(&m);
+    }
+}
+
+#[test]
+fn diagonal_wall_lattice_gives_a_manifold_surface() {
+    // Material on one side of a diagonal plane: faces are checkerboards along the plane.
+    for n in [4, 40] {
+        let lat = Synthetic { n, material: |node: [i64; 3]| node[0] >= node[1] };
+        assert_manifold(&weld(&extract(&lat)));
+    }
 }
 
 #[test]
