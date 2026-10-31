@@ -5,7 +5,7 @@ use solidcraft_geom::Vec3;
 use super::Stock;
 use crate::SimError;
 use crate::gcode::{CodeTable, parse};
-use crate::sim::simulate;
+use crate::sim::{Cutter, simulate};
 use crate::sweep::{ArcFixedAxis, FlatTool, LinearFixedAxis};
 use crate::toolpath::{Program, Shape, Tool};
 
@@ -303,6 +303,26 @@ fn undefined_tool_is_reported() {
     let mut s = slot_stock(0.5);
     let diags = simulate(&program, &mut s).expect("simulate");
     assert!(diags.iter().any(|d| d.msg.contains("not defined")), "{diags:?}");
+}
+
+#[test]
+fn cutting_in_pieces_matches_one_run_and_reports_each_cause_once() {
+    let program = Program { tools: vec![flat_tool(0)], moves: pocket_program(), diags: Vec::new() };
+    let mut whole = slot_stock(0.25);
+    simulate(&program, &mut whole).expect("simulate");
+    let mut split = slot_stock(0.25);
+    let mut cutter = Cutter::new();
+    for k in 0..program.moves.len() {
+        cutter.cut(&program, &mut split, k..k + 1).expect("cut");
+    }
+    assert_eq!(whole.state_hash(), split.state_hash());
+    // The same undefined tool on every move is one diagnostic, however the moves are split.
+    let undefined = Program { tools: Vec::new(), ..program };
+    let mut pieces = Cutter::new();
+    let mut s = slot_stock(0.25);
+    pieces.cut(&undefined, &mut s, 0..2).expect("cut");
+    pieces.cut(&undefined, &mut s, 2..undefined.moves.len()).expect("cut");
+    assert_eq!(pieces.diags().len(), 1, "{:?}", pieces.diags());
 }
 
 #[test]
