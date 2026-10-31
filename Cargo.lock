@@ -4380,6 +4380,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "solidcraft-machining"
+version = "0.28.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "solidcraft-geom",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "solidcraft-mcp"
 version = "0.28.0"
 dependencies = [
