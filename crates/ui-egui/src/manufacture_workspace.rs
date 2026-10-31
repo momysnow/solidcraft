@@ -188,11 +188,21 @@ pub fn setup_shows_body(app: &SolveApp, name: &str) -> bool {
     setup.model_bodies.iter().any(|body| body == name)
 }
 
+/// Identifies which bodies the Manufacture setup shows, so a scene cache notices a change: leaving
+/// the workspace, another setup, or other body names with the same count all change it.
 pub fn setup_body_key(app: &SolveApp) -> u64 {
-    if let Some(state) = app.manufacture_workspace.setup_dialog.as_ref() {
-        return state.draft.model_bodies.len() as u64;
-    }
-    app.session.doc.cam.setup(&app.manufacture_workspace.active_setup).map(|s| s.model_bodies.len() as u64).unwrap_or(0)
+    use std::hash::{Hash, Hasher};
+    let state = &app.manufacture_workspace;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    active(app).hash(&mut h);
+    state.setup_dialog.is_some().hash(&mut h);
+    state.active_setup.hash(&mut h);
+    let bodies = match state.setup_dialog.as_ref() {
+        Some(dialog) => Some(&dialog.draft.model_bodies),
+        None => app.session.doc.cam.setup(&state.active_setup).map(|s| &s.model_bodies),
+    };
+    bodies.hash(&mut h);
+    h.finish()
 }
 
 #[cfg(test)]
