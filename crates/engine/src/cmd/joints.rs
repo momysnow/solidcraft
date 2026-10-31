@@ -1429,10 +1429,10 @@ fn edit(s: &mut Session, p: &Value) -> Result<Value> {
         suppress_joints(s.doc_mut(), &[id], x);
     }
     // A side moved without an angle turns B as joint.create would: the least turn from where it
-    // is now (a relation's angle is its tilt, which stays).
+    // is now (a relation's angle is its tilt, which stays; an angle expression keeps driving it).
     if sides
         && p.get("angle").is_none()
-        && let Some(j) = s.doc.assembly.joints.iter().find(|j| j.id == id).filter(|j| !j.kind.is_relation()).cloned()
+        && let Some(j) = s.doc.assembly.joints.iter().find(|j| j.id == id).filter(|j| !j.kind.is_relation() && j.exprs.angle.is_none()).cloned()
     {
         let turn = joints::least_turn_angle(&s.doc, &s.model.state(), &j);
         if let Some(j) = s.doc_mut().assembly.joints.iter_mut().find(|j| j.id == id) {
