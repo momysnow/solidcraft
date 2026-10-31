@@ -661,6 +661,8 @@ pub fn enter(app: &mut SolveApp, render: bool) -> Result<(), String> {
             return Err(crate::i18n::tr("render.error_finish_operation").into());
         }
         app.run("render.scene", json!({}))?;
+        // Render replaces Manufacture: both workspaces must not draw together.
+        crate::manufacture_workspace::exit(app);
         let entering = !active(app);
         if entering {
             app.render_workspace.design_camera = Some((app.cam, app.ui.perspective));
