@@ -197,26 +197,66 @@ fn position_is_unknown_after_home_so_the_next_move_is_a_jump() {
 }
 
 #[test]
-fn arc_turns_come_from_p_and_are_capped() {
+fn arc_turns_come_from_p_as_the_total_turns() {
+    // LinuxCNC: P is the total number of turns, so P2 is one extra turn; P1 is the plain arc.
     let p = run("G1 X10 Y0\nG3 X0 Y10 I-10 J0 P2");
     match &p.moves[1].kind {
-        MoveKind::Arc { turns, .. } => assert_eq!(*turns, 2),
+        MoveKind::Arc { turns, .. } => assert_eq!(*turns, 1),
         other => panic!("{other:?}"),
     }
-    let q = run("G1 X10 Y0\nG3 X0 Y10 I-10 J0 P1001");
-    assert!(errors(&q).iter().any(|d| d.msg.contains("turns over")), "{:?}", q.diags);
-    assert_eq!(q.moves.len(), 1);
+    let plain = run("G1 X10 Y0\nG3 X0 Y10 I-10 J0 P1");
+    match &plain.moves[1].kind {
+        MoveKind::Arc { turns, .. } => assert_eq!(*turns, 0),
+        other => panic!("{other:?}"),
+    }
+    let zero = run("G1 X10 Y0\nG3 X0 Y10 I-10 J0 P0");
+    assert!(errors(&zero).iter().any(|d| d.msg.contains("at least 1")), "{:?}", zero.diags);
+    let capped = run("G1 X10 Y0\nG3 X0 Y10 I-10 J0 P1002");
+    assert!(errors(&capped).iter().any(|d| d.msg.contains("turns over")), "{:?}", capped.diags);
+    assert_eq!(capped.moves.len(), 1);
 }
 
 #[test]
-fn canned_cycle_error_ignores_axis_words_until_g80() {
-    let p = run("G1 X1\nG81 X1 Y1 R1 Z-1\nX2 Y2\nG80\nG1 X3");
+fn canned_cycle_error_makes_the_named_axes_unknown_until_the_next_full_move() {
+    // The G81 line names X, Y and Z: they are unknown after it, so the later partial move makes no
+    // move, and the full move after G80 does.
+    let p = run("G1 X1\nG81 X1 Y1 R1 Z-1\nX2 Y2\nG80\nG1 X3\nG1 X3 Y0 Z0");
     let e = errors(&p);
     assert!(e.iter().any(|d| d.msg.contains("canned")), "{:?}", p.diags);
     assert!(e.iter().any(|d| d.msg.contains("axis words are ignored")), "{:?}", p.diags);
-    // Only the first and the last feed are moves; the hole lines are not.
     assert_eq!(p.moves.len(), 2, "{:?}", p.moves);
+    assert!(matches!(p.moves[1].kind, MoveKind::Jump), "{:?}", p.moves[1]);
     assert_close(p.moves[1].tip, [3.0, 0.0, 0.0]);
+}
+
+#[test]
+fn fusion_style_home_and_tool_length_sequence_has_no_errors() {
+    // G28 with a Z word homes Z only; X and Y keep their values. The first move that gives all three
+    // axes is a jump; G43 with a Z word supplies Z, as real posts write it.
+    let text = "G90 G94 G17 G49 G40 G80\nG28 G91 Z0.\nG90\nG0 X10. Y10.\nG43 Z15. H1\nG1 Z-5. F100\n";
+    let p = run(text);
+    assert!(errors(&p).is_empty(), "{:?}", p.diags);
+    assert_eq!(p.moves.len(), 2, "{:?}", p.moves);
+    assert!(matches!(p.moves[0].kind, MoveKind::Jump), "{:?}", p.moves[0]);
+    assert_close(p.moves[0].tip, [10.0, 10.0, 15.0]);
+    assert!(matches!(p.moves[1].kind, MoveKind::Feed));
+    assert_close(p.moves[1].tip, [10.0, 10.0, -5.0]);
+}
+
+#[test]
+fn incremental_move_on_an_unknown_axis_is_an_error() {
+    let p = run("G28 G91 Z0.\nG91 Z-1");
+    assert!(errors(&p).iter().any(|d| d.msg.contains("position is unknown")), "{:?}", p.diags);
+    assert!(p.moves.is_empty());
+}
+
+#[test]
+fn unknown_non_motion_codes_warn_and_motion_codes_error() {
+    let p = run("G90 G94 G95 G64 G61.1 G15 G50 G69 G67 G98 G80\nG1 X1\nG52 P1\nG33 X3 K1");
+    assert!(errors(&p).iter().any(|d| d.msg.contains("G33")), "{:?}", p.diags);
+    assert!(warnings(&p).iter().any(|d| d.msg.contains("G52")), "{:?}", p.diags);
+    assert!(!errors(&p).iter().any(|d| d.msg.contains("G94") || d.msg.contains("G98")), "{:?}", p.diags);
+    assert_eq!(p.moves.len(), 1);
 }
 
 #[test]
@@ -272,9 +312,7 @@ fn errors_have_line_and_column() {
 fn unsupported_codes_are_errors() {
     for (text, want) in [
         ("G1 X1 G81 X1 Y1 R1 Z-1", "canned"),
-        ("G98 G1 X1", "canned"),
         ("G10 X1", "G10 is not supported"),
-        ("G1.5 X1", "not supported"),
         ("G1 X1 [1+2]", "variables"),
         ("G1 X1 L2", "word L"),
         ("G1 A10", "rotary"),

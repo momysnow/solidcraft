@@ -1,5 +1,10 @@
 //! G-code: a streaming parser for the v1 subset, against a code table. Never panics: anything it
 //! cannot do becomes a [`Diag`] for its line, and the rest of the program still parses.
+//!
+//! The position is known per axis. After G28 or G30 the named axes (all of them when none is
+//! named) are unknown until a move gives them a value. A move is emitted once all three axes are
+//! known, and the first such move after an unknown position is a [`MoveKind::Jump`] (it sets the
+//! start of the next path and cuts nothing).
 
 use crate::sweep::MAX_ARC_TURNS;
 use crate::toolpath::{Diag, Interp, Move, MoveKind, Program};
@@ -45,6 +50,8 @@ pub struct CodeTable {
     pub set_offsets: u32,
     pub canned: [u32; 4],
     pub cycle_mode: [u32; 2],
+    /// Modal codes that change no motion (feed mode, path control, cutter modes): accepted silently.
+    pub ignored: Vec<u32>,
     /// A `/` at the start of a line skips the line when true; when false the slash is ignored.
     pub block_delete: bool,
 }
@@ -78,6 +85,10 @@ impl Default for CodeTable {
             set_offsets: 100,
             canned: [730, 810, 820, 830],
             cycle_mode: [980, 990],
+            // G94 feed per minute, G95 per revolution, G64 path blending, G61 and G61.1 exact stop
+            // and exact path, G15 polar off, G50 and G69 and G67 scaling and rotation off, G67
+            // macro call cancel.
+            ignored: vec![940, 950, 640, 610, 611, 150, 690, 500, 670],
             block_delete: false,
         }
     }
@@ -117,9 +128,10 @@ enum GKind {
     ToolLengthOff,
     Home,
     Canned,
-    CycleMode,
     CancelCycle,
     SetOffsets,
+    /// A modal code that changes no motion.
+    Ignored,
     Unknown,
 }
 
@@ -169,8 +181,8 @@ impl CodeTable {
             GKind::Home
         } else if self.canned.contains(&code) {
             GKind::Canned
-        } else if self.cycle_mode.contains(&code) {
-            GKind::CycleMode
+        } else if self.cycle_mode.contains(&code) || self.ignored.contains(&code) {
+            GKind::Ignored
         } else if code == self.cancel_cycle {
             GKind::CancelCycle
         } else if code == self.set_offsets {
@@ -188,10 +200,10 @@ struct Word {
     col: u32,
 }
 
+/// Machine state. Each axis is known or unknown on its own.
 #[derive(Clone, Copy, Debug)]
 struct State {
-    /// The tip, or `None` after G28 or G30 (the home position is not known to the program).
-    pos: Option<[f64; 3]>,
+    pos: [Option<f64>; 3],
     motion: Motion,
     plane: Plane,
     /// 1 for millimetres, 25.4 for inches.
@@ -205,6 +217,11 @@ struct State {
     pending_tool: u32,
     /// After an unsupported canned cycle, axis words are errors until G80.
     cycle_unsupported: bool,
+}
+
+/// All three values, or `None` when one axis is unknown.
+fn all_known(p: [Option<f64>; 3]) -> Option<[f64; 3]> {
+    Some([p[0]?, p[1]?, p[2]?])
 }
 
 /// Streams a program line by line. Call [`Parser::push_line`] for each line, then [`Parser::finish`].
@@ -239,7 +256,7 @@ impl<'a> Parser<'a> {
         Parser {
             codes,
             state: State {
-                pos: Some([0.0; 3]),
+                pos: [Some(0.0); 3],
                 motion: Motion::Rapid,
                 plane: Plane::Xy,
                 scale: 1.0,
@@ -450,6 +467,7 @@ impl<'a> Parser<'a> {
         let mut motion_col = 0u32;
         let mut skip_motion = false;
         let mut machine = false;
+        let mut home_seen = false;
         for (c, col) in gs {
             match self.codes.classify(c) {
                 GKind::Motion(m) => {
@@ -467,7 +485,7 @@ impl<'a> Parser<'a> {
                 GKind::Incremental => self.state.absolute = false,
                 GKind::ArcAbsolute => self.state.arc_absolute = true,
                 GKind::ArcIncremental => self.state.arc_absolute = false,
-                GKind::Offset | GKind::ToolLengthOff => {}
+                GKind::Offset | GKind::ToolLengthOff | GKind::Ignored => {}
                 GKind::Dwell => skip_motion = true,
                 GKind::CancelCycle => self.state.cycle_unsupported = false,
                 GKind::CutterOff => {}
@@ -488,9 +506,11 @@ impl<'a> Parser<'a> {
                 GKind::Home => {
                     self.warn(col, "G28 and G30 are skipped: the home position is unknown, the next move starts a new path");
                     skip_motion = true;
-                    self.state.pos = None;
+                    home_seen = true;
                 }
-                GKind::Canned | GKind::CycleMode => {
+                GKind::Canned => {
+                    // The named axes are unknown now, whatever the cycle would have done.
+                    self.forget_axes(axes);
                     self.err(col, "canned cycles are not supported yet; axis words are errors until G80");
                     self.state.cycle_unsupported = true;
                     return;
@@ -500,8 +520,22 @@ impl<'a> Parser<'a> {
                     return;
                 }
                 GKind::Unknown => {
-                    self.err(col, format!("G{} is not supported", c as f64 / 10.0));
-                    return;
+                    let code = c as f64 / 10.0;
+                    // Unknown motion codes (G33 threading, G38 probing) would move the tool: an error.
+                    if matches!(c / 10, 33 | 38) || (730..=899).contains(&c) {
+                        self.err(col, format!("G{code} is not supported"));
+                        return;
+                    }
+                    self.warn(col, format!("G{code} is not supported and is ignored"));
+                }
+            }
+        }
+        if home_seen {
+            // G28 and G30 name the axes that go home; with none named, every axis is unknown.
+            let named = axes.iter().any(|a| a.is_some());
+            for (k, a) in axes.iter().enumerate() {
+                if let Some(slot) = self.state.pos.get_mut(k).filter(|_| !named || a.is_some()) {
+                    *slot = None;
                 }
             }
         }
@@ -560,47 +594,64 @@ impl<'a> Parser<'a> {
                 if !has_axes && !has_arc_words {
                     return;
                 }
-                let turns = match turns {
+                // LinuxCNC's P is the total number of turns (at least one); the extra turns are P - 1.
+                let extra = match turns {
                     None => 0,
-                    Some((p, col)) => match self.int_of(&Word { letter: b'P', value: p, col }) {
-                        Some(t) if t <= MAX_ARC_TURNS => t,
-                        _ => {
-                            self.err(col, format!("arc turns over {MAX_ARC_TURNS} are not allowed"));
+                    Some((p, col)) => {
+                        let Some(total) = self.int_of(&Word { letter: b'P', value: p, col }) else { return };
+                        if total < 1 {
+                            self.err(col, "P is the number of turns and must be at least 1");
                             return;
                         }
-                    },
+                        let extra = total - 1;
+                        if extra > MAX_ARC_TURNS {
+                            self.err(col, format!("arc turns over {} are not allowed", MAX_ARC_TURNS + 1));
+                            return;
+                        }
+                        extra
+                    }
                 };
-                self.arc(m, axes, ijk, radius, machine, turns, motion_col);
+                self.arc(m, axes, ijk, radius, machine, extra, motion_col);
             }
         }
     }
 
-    /// The end point of a linear or arc move; a missing axis keeps the current position.
-    fn target(&mut self, axes: [Option<f64>; 3], machine: bool, col: u32) -> Option<[f64; 3]> {
-        let absolute = self.state.absolute || machine;
-        let mut tip = match self.state.pos {
-            Some(p) => p,
-            None => {
-                if axes.iter().any(|a| a.is_none()) {
-                    self.err(col, "after G28 or G30 give X, Y and Z: the position is unknown");
-                    return None;
-                }
-                if !absolute {
-                    self.err(col, "incremental move after G28 or G30: the position is unknown");
-                    return None;
-                }
-                [0.0; 3]
+    /// Marks the named axes as unknown (used when the program's motion can no longer be followed).
+    fn forget_axes(&mut self, axes: [Option<f64>; 3]) {
+        for (k, a) in axes.iter().enumerate() {
+            if let Some(slot) = self.state.pos.get_mut(k).filter(|_| a.is_some()) {
+                *slot = None;
             }
-        };
+        }
+    }
+
+    /// The end point of a linear or arc move, per axis: a missing axis keeps its position, which
+    /// may be unknown. An incremental move on an unknown axis is an error.
+    fn target(&mut self, axes: [Option<f64>; 3], machine: bool, col: u32) -> Option<[Option<f64>; 3]> {
+        let absolute = self.state.absolute || machine;
+        let mut tip = self.state.pos;
         for (k, a) in axes.iter().enumerate() {
             let Some(v) = *a else { continue };
             let v = v * self.state.scale;
-            let c = if absolute { v } else { tip[k] + v };
+            let base = tip.get(k).copied().flatten();
+            let c = if absolute {
+                v
+            } else {
+                match base {
+                    Some(b) => b + v,
+                    None => {
+                        self.err(col, "incremental move on an axis whose position is unknown after G28 or G30");
+                        return None;
+                    }
+                }
+            };
             if !c.is_finite() || c.abs() > MAX_POSITION {
                 self.err(col, "coordinate is out of range");
                 return None;
             }
-            tip[k] = c;
+            if let Some(slot) = tip.get_mut(k) {
+                *slot = Some(c);
+            }
         }
         Some(tip)
     }
@@ -611,12 +662,16 @@ impl<'a> Parser<'a> {
             Plane::Zx => (2, 0, 1),
             Plane::Yz => (1, 2, 0),
         };
-        let Some(start) = self.state.pos else {
+        let Some(start) = all_known(self.state.pos) else {
             self.err(col, "arc after G28 or G30: the start point is unknown");
             return;
         };
         let ccw = m == Motion::ArcCcw;
-        let Some(end) = self.target(axes, machine, col) else { return };
+        let Some(end_partial) = self.target(axes, machine, col) else { return };
+        let Some(end) = all_known(end_partial) else {
+            self.err(col, "arc after G28 or G30: give all three axes at its end");
+            return;
+        };
         let at = |p: [f64; 3], a: usize| p.get(a).copied().unwrap_or(0.0);
         let centre_uv: (f64, f64);
         if let Some(r) = radius {
@@ -682,10 +737,15 @@ impl<'a> Parser<'a> {
         if let Some(x) = normal.get_mut(n) {
             *x = 1.0;
         }
-        self.push_kind(MoveKind::Arc { centre, normal, ccw, turns }, end);
+        self.push_kind(MoveKind::Arc { centre, normal, ccw, turns }, end_partial);
     }
 
-    fn push_kind(&mut self, kind: MoveKind, tip: [f64; 3]) {
+    /// Records a move to `tip`. While any axis is unknown there is no move yet; the first full
+    /// tip after an unknown position is a jump.
+    fn push_kind(&mut self, kind: MoveKind, tip: [Option<f64>; 3]) {
+        let was_known = all_known(self.state.pos).is_some();
+        self.state.pos = tip;
+        let Some(full) = all_known(tip) else { return };
         if self.moves.len() >= MAX_MOVES {
             if !self.moves_full {
                 self.moves_full = true;
@@ -693,12 +753,11 @@ impl<'a> Parser<'a> {
             }
             return;
         }
-        // A move from an unknown start (after G28 or G30) only sets where the tool is.
-        let kind = if self.state.pos.is_none() && !matches!(kind, MoveKind::Arc { .. }) { MoveKind::Jump } else { kind };
+        let kind = if was_known { kind } else { MoveKind::Jump };
         let feeding = matches!(kind, MoveKind::Feed | MoveKind::Arc { .. });
         self.moves.push(Move {
             kind,
-            tip,
+            tip: full,
             axis: [0.0, 0.0, 1.0],
             joints: None,
             interp: Interp::Tcp,
@@ -707,7 +766,6 @@ impl<'a> Parser<'a> {
             spindle: if self.state.spindle_on { self.state.rpm } else { 0.0 },
             source: self.line,
         });
-        self.state.pos = Some(tip);
     }
 }
 
