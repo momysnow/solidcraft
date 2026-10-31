@@ -170,10 +170,12 @@ fn copies(d: &Dialog) -> bool {
     d.extra.get("copy").and_then(Value::as_bool).unwrap_or(false)
 }
 
-/// Whether a Move dialog with Create Copy ticked takes the components picked (not their bodies)
-/// into its bodies input: a click on a component in the component pick mode, or a Browser row.
+/// Whether a Move dialog takes the components picked (not their bodies) into its bodies input: a
+/// click on a component in the component pick mode, or a Browser row. Not when it edits a move
+/// that is already a feature (its picks stay bodies). Without Create Copy the components still
+/// move their bodies (`targets`).
 pub(crate) fn picks_components(app: &SolveApp) -> bool {
-    app.dialog.as_ref().is_some_and(|d| matches!(d.kind, Kind::Move { .. }) && copies(d) && d.active == 0)
+    app.dialog.as_ref().is_some_and(|d| matches!(d.kind, Kind::Move { .. }) && d.active == 0 && d.editing.is_none())
 }
 
 /// What a click picks in a Move dialog: with Create Copy ticked and the component pick mode on,

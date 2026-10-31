@@ -697,13 +697,34 @@ fn a_body_picked_with_create_copy_is_still_a_body_copy() {
 
 #[test]
 fn a_component_picked_without_create_copy_moves_its_bodies_as_before() {
-    let (h, _) = click_cube_in_move(true, false);
+    let (h, occurrence) = click_cube_in_move(true, false);
     let d = h.app.dialog.as_ref().unwrap();
-    assert!(matches!(d.inputs[0].items.as_slice(), [Sel::Body { .. }]), "{:?}", d.inputs[0].items);
+    assert_eq!(d.inputs[0].items, vec![Sel::Occurrence { path: vec![occurrence] }]);
     let p = crate::dialogs_move::params(&h.app, d).unwrap();
-    assert_eq!(p["bodies"].as_array().map(Vec::len), Some(1));
+    assert_eq!(p["bodies"].as_array().map(Vec::len), Some(1), "the component's body moves");
     assert!(p.get("occurrences").is_none());
     assert!(p.get("copy").is_none());
+}
+
+#[test]
+fn a_component_picked_before_create_copy_is_ticked_is_copied_as_a_component() {
+    let (mut h, occurrence) = click_cube_in_move(true, false);
+    h.app.dialog.as_mut().unwrap().extra.insert("copy".into(), json!(true));
+    let p = crate::dialogs_move::params(&h.app, h.app.dialog.as_ref().unwrap()).unwrap();
+    assert_eq!(p["occurrences"], json!([[occurrence]]));
+    let placements = h.app.session.doc.occurrences.len();
+    h.app.session.execute("solid.move", &p).unwrap();
+    assert_eq!(h.app.session.doc.occurrences.len(), placements + 1, "OK copies the component");
+}
+
+#[test]
+fn editing_a_move_never_takes_a_component_pick() {
+    let (mut h, _) = part_harness();
+    h.app.start("solid.move");
+    h.settle();
+    assert!(crate::dialogs_move::picks_components(&h.app), "a new move takes components in component mode");
+    h.app.dialog.as_mut().unwrap().editing = Some((1, None));
+    assert!(!crate::dialogs_move::picks_components(&h.app), "an edited move's picks stay bodies");
 }
 
 #[test]
