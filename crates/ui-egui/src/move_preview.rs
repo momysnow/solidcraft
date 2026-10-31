@@ -83,6 +83,11 @@ impl MovePreview {
         if bodies.is_empty() && components.is_empty() {
             return None;
         }
+        let copy = params.get("copy").and_then(Value::as_bool) == Some(true);
+        // Only a copy takes components (the engine refuses them otherwise).
+        if !components.is_empty() && !copy {
+            return None;
+        }
         let mut names = bodies.clone();
         for path in &components {
             names.extend(app.session.occurrence_bodies(path, true).ok()?);
@@ -99,7 +104,6 @@ impl MovePreview {
         let cache = self.cached.as_ref()?;
         // About the world origin, as the Move feature turns bodies (`kernel::transform`).
         let m = rigid(translate, Vec3::ZERO, axis, angle);
-        let copy = params.get("copy").and_then(Value::as_bool) == Some(true);
         let mut scene = GpuScene::default();
         let removed = scene.color(colors.removed);
         let mut bounds = Aabb3::EMPTY;
@@ -221,7 +225,7 @@ mod tests {
         let mut s = Session::default();
         s.execute("solid.box", &json!({"length": 20, "width": 10, "height": 5, "body_name": "Plate"})).unwrap();
         let made = s.execute("component.create", &json!({"name": "Part", "grounded": false})).unwrap();
-        s.execute("solid.box", &json!({"length": 20, "width": 10, "height": 5, "body_name": "Peg"})).unwrap();
+        s.execute("solid.box", &json!({"length": 20, "width": 10, "height": 15, "body_name": "Peg"})).unwrap();
         s.execute("component.activate", &json!({"component": "root"})).unwrap();
         let occurrence = made["occurrence"].as_u64().unwrap();
         let app = SolveApp::new(s, Services::default());
@@ -233,9 +237,11 @@ mod tests {
         assert!(built.replaced.is_empty(), "a copy keeps the original shown");
         assert!(near(Vec3::new(built.bounds.min.x, 0.0, 0.0), Vec3::new(50.0, 0.0, 0.0)), "{:?}", built.bounds);
         assert!(near(Vec3::new(built.bounds.max.x, 0.0, 0.0), Vec3::new(70.0, 0.0, 0.0)), "{:?}", built.bounds);
-        // With bodies listed too, the component's copy is drawn alongside the body's.
+        // With bodies listed too, the component's copy is drawn alongside the body's: the
+        // component's box is 15 mm tall, the Plate 5 mm, so the height shows it is there.
         let mixed = [("solid.move".to_string(), json!({"bodies": ["Plate"], "occurrences": [[occurrence]], "copy": true, "translate": [50, 0, 0]}))];
         let built = pv.compute(&app, &mixed, c).expect("taken here").expect("built");
         assert!(near(Vec3::new(built.bounds.min.x, 0.0, 0.0), Vec3::new(50.0, 0.0, 0.0)), "{:?}", built.bounds);
+        assert!(near(Vec3::new(0.0, 0.0, built.bounds.max.z), Vec3::new(0.0, 0.0, 15.0)), "{:?}", built.bounds);
     }
 }
