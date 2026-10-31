@@ -117,7 +117,6 @@ joint.cam
 joint.create
 joint.delete
 joint.drive
-joint.edit
 joint.gear
 joint.inspect
 joint.limits

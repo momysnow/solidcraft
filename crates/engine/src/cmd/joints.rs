@@ -13,7 +13,11 @@ use solidcraft_geom::{Aabb3, Vec3};
 
 use super::CommandSpec;
 use crate::params::{bad, bool_, num, str_, vec3};
+use crate::schema::joints::EditJointResult;
+use crate::schema::{TypedContract, output_schema_for};
 use crate::{EngineError, Result, Session};
+
+const EDIT_CONTRACT: TypedContract<crate::schema::joints::EditJointParams> = TypedContract::new();
 
 #[path = "joints_inspect.rs"]
 mod inspect;
@@ -75,9 +79,15 @@ pub static COMMANDS: &[CommandSpec] = &[
         "a: the cam's joint (revolute); b: the follower's joint, a slider (a translating follower) or a revolute (an oscillating one),          b driven by a; profile: {sketch: id|name, index?: the profile (default: the largest)} | {edges: [[x,y,z]…] (points on edges of          the cam's bodies forming one closed loop, world), occurrence?}: the cam's outline, in a plane square to its axis, read again          whenever the design changes; follower?: knife|roller|flat (default knife; flat: a face square to a slider's line); radius?: the          roller's radius (mm, an expression or {circle: [x,y,z], occurrence?}: the roller's round face, which is its tip too); tip?: a          joint origin where the follower touches: its knife's point or its roller's centre, such as {circle: [x,y,z]} on the roller          (needed for an oscillating follower; a translating one's line runs through it, by default along its slider's axis); flip?: bool (ride the cam from the other side          than the one the follower is on now); link?: index (replace that motion link) → link, lift: {min, max, rise, unit} (b's travel          over a turn of the cam), reverse (the side it rides from), follower_offset (mm: how far a translating follower's line passes          from the cam's axis); b keeps where it is, also when the link replaces another (at the current pose)",
     ),
     CommandSpec::new("joint.limits", "Joint Limits", limits).icon("joint").params("joint; index?: value index (default 0); min?, max? (omit both to clear)"),
-    CommandSpec::new("joint.edit", "Edit Joint", edit)
+    CommandSpec::new("joint.edit", "Edit Joint", crate::checked!("joint.edit", edit))
         .icon("edit")
-        .params("joint; type?, flip?, offset?, angle? (a number, or an expression the joint then follows), suppressed?, name?"),
+        .contract(&EDIT_CONTRACT)
+        .output(output_schema_for::<EditJointResult>)
+        .params(
+            "joint; a?, b?: joint origins as joint.create takes them (a side left out keeps its place; the two must stay on different occurrences); \
+             type?, flip?, offset?, angle? (a number, or an expression the joint then follows), suppressed?, name?; the joint re-solves, keeping \
+             its limits and expressions (a relation's values start again where its parts are)",
+        ),
     CommandSpec::new("joint.delete", "Delete Joint", delete).icon("delete").params("joint: id|name (or origin: name, link: index)"),
     CommandSpec::new("joint.list", "List Joints", list).icon("list").noundo().params(
         "→ joints (type, occurrences, values, limits; expressions: {offset?, angle?, values?} when they were typed as expressions), origins, links, degrees of freedom, conflicts, floating: [{occurrences, joints}] \
@@ -671,19 +681,24 @@ fn limits_param(s: &Session, p: &Value, kind: JointKind, cmd: &str) -> Result<Ve
     Ok(out)
 }
 
-fn add_joint(s: &mut Session, mut j: Joint, p: &Value) -> Result<Value> {
-    if s.doc.assembly.joints.len() >= 10_000 {
-        return Err(EngineError::Other("too many joints".into()));
-    }
-    // Several parts as bodies of one component (a multi-body STEP import, #1239): say how to
-    // get two components.
-    if j.a.occurrence == j.b.occurrence {
+/// A joint's two origins on different occurrences (joint.create and joint.edit). Several parts as
+/// bodies of one component (a multi-body STEP import, #1239) say how to get two components.
+fn check_sides(a: &JointOrigin, b: &JointOrigin, cmd: &str) -> Result<()> {
+    if a.occurrence == b.occurrence {
         return Err(bad(
-            "joint.create",
+            cmd,
             "a joint needs two different occurrences: both origins are on one component; give each part a component of its own first \
              (component.from_bodies)",
         ));
     }
+    Ok(())
+}
+
+fn add_joint(s: &mut Session, mut j: Joint, p: &Value) -> Result<Value> {
+    if s.doc.assembly.joints.len() >= 10_000 {
+        return Err(EngineError::Other("too many joints".into()));
+    }
+    check_sides(&j.a, &j.b, "joint.create")?;
     // It starts at its values inside its limits. A value moved to a limit moves the part as it
     // is joined, which the answer says.
     let mut q = j.values.clone();
@@ -1366,8 +1381,22 @@ fn edit(s: &mut Session, p: &Value) -> Result<Value> {
         Some(v) => Some(value(s, v, true, cmd)?),
         None => None,
     };
+    // The sides, read as joint.create reads them; a side left out keeps its place.
+    let a = p.get("a").map(|v| origin_param(s, Some(v), cmd)).transpose()?;
+    let b = p.get("b").map(|v| origin_param(s, Some(v), cmd)).transpose()?;
+    let sides = a.is_some() || b.is_some();
+    if sides {
+        let j = s.doc.assembly.joints.iter().find(|j| j.id == id).ok_or_else(|| bad(cmd, "joint"))?;
+        check_sides(a.as_ref().unwrap_or(&j.a), b.as_ref().unwrap_or(&j.b), cmd)?;
+    }
     let doc = s.doc_mut();
     let Some(j) = doc.assembly.joints.iter_mut().find(|j| j.id == id) else { return Err(bad(cmd, "joint")) };
+    if let Some(a) = a {
+        j.a = a;
+    }
+    if let Some(b) = b {
+        j.b = b;
+    }
     if let Some(k) = kind {
         let was = j.kind;
         j.kind = k;
@@ -1400,7 +1429,7 @@ fn edit(s: &mut Session, p: &Value) -> Result<Value> {
         suppress_joints(s.doc_mut(), &[id], x);
     }
     // A relation whose type, offset, tilt or flip changes starts again from where its parts are.
-    let reseat = kind.is_some() || offset.is_some() || angle.is_some() || p.get("flip").is_some();
+    let reseat = kind.is_some() || offset.is_some() || angle.is_some() || p.get("flip").is_some() || sides;
     if reseat {
         let edited = s.doc.assembly.joints.iter().find(|j| j.id == id).cloned();
         if let Some(q) = edited.and_then(|j| joints::relation_values(&s.doc, &s.model.state(), &j))

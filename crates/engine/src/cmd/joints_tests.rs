@@ -304,6 +304,84 @@ fn faces_mate_by_default() {
     assert!(near(place(&s, "B", Vec3::new(25.0, 5.0, 10.0)), Vec3::new(5.0, 5.0, 0.0)), "{:?}", place(&s, "B", Vec3::new(25.0, 5.0, 10.0)));
 }
 
+/// Edit Joint takes new sides as joint.create does: the joint moves its attachment to them, and
+/// keeps its limits, its drive and the expression its offset follows.
+#[test]
+fn edit_moves_a_side_and_keeps_limits_and_expressions() {
+    let mut s = two_cubes();
+    run(&mut s, "parameters.add", json!({"name": "gap", "expression": "2 mm"}));
+    run(
+        &mut s,
+        "joint.create",
+        json!({"type": "slider", "name": "Rail", "offset": "gap", "limits": [[0, 10]], "a": {"face": [5, 5, 10]}, "b": {"face": [25, 5, 0]}}),
+    );
+    run(&mut s, "joint.drive", json!({"joint": "Rail", "value": 4}));
+    // B's bottom centre rides 2 mm (the gap) plus 4 mm (the drive) above A's top centre.
+    assert!(near(place(&s, "B", Vec3::new(25.0, 5.0, 0.0)), Vec3::new(5.0, 5.0, 16.0)), "{:?}", place(&s, "B", Vec3::new(25.0, 5.0, 0.0)));
+    // B's top centre, where B is placed now, is the new side (`face` is a world point).
+    let top = place(&s, "B", Vec3::new(25.0, 5.0, 10.0));
+    let r = run(&mut s, "joint.edit", json!({"joint": "Rail", "b": {"occurrence": "B", "face": [top.x, top.y, top.z]}}));
+    assert_eq!(r["conflicts"].as_array().map(Vec::len), Some(0), "{r}");
+    assert!(near(place(&s, "B", Vec3::new(25.0, 5.0, 10.0)), Vec3::new(5.0, 5.0, 16.0)), "{:?}", place(&s, "B", Vec3::new(25.0, 5.0, 10.0)));
+    let j = s.doc.assembly.joints.first().cloned().unwrap_or_else(|| panic!("no joint"));
+    assert_eq!(j.limits, vec![Some((0.0, 10.0))]);
+    assert_eq!(j.exprs.offset.as_deref(), Some("gap"));
+    assert_eq!(j.values, vec![4.0]);
+    assert_eq!(j.name, "Rail");
+}
+
+/// Sides left out of joint.edit stay as they are; the other parameters still change.
+#[test]
+fn omitted_sides_stay() {
+    let mut s = two_cubes();
+    run(&mut s, "joint.create", json!({"type": "rigid", "name": "Stack", "a": {"face": [5, 5, 10]}, "b": {"face": [25, 5, 0]}}));
+    let before = s.doc.assembly.joints[0].clone();
+    run(&mut s, "joint.edit", json!({"joint": "Stack", "flip": true, "name": "Flipped"}));
+    let after = &s.doc.assembly.joints[0];
+    assert_eq!((&after.a, &after.b), (&before.a, &before.b));
+    assert!(after.flip && after.name == "Flipped");
+}
+
+/// One undo step puts the sides back, and the parts with them.
+#[test]
+fn one_undo_restores_the_old_sides() {
+    let mut s = two_cubes();
+    run(&mut s, "joint.create", json!({"type": "rigid", "name": "Stack", "a": {"face": [5, 5, 10]}, "b": {"face": [25, 5, 0]}}));
+    let before = s.doc.assembly.joints[0].clone();
+    let top = place(&s, "B", Vec3::new(25.0, 5.0, 10.0));
+    run(&mut s, "joint.edit", json!({"joint": "Stack", "b": {"occurrence": "B", "face": [top.x, top.y, top.z]}}));
+    assert!(near(place(&s, "B", Vec3::new(25.0, 5.0, 10.0)), Vec3::new(5.0, 5.0, 10.0)), "{:?}", place(&s, "B", Vec3::new(25.0, 5.0, 10.0)));
+    run(&mut s, "edit.undo", json!({}));
+    assert_eq!(s.doc.assembly.joints[0], before);
+    assert!(near(place(&s, "B", Vec3::new(25.0, 5.0, 0.0)), Vec3::new(5.0, 5.0, 10.0)));
+}
+
+/// A side that makes no joint is refused, and the joint is left as it was: a side on the other
+/// side's component, a side that is not a joint origin, an unknown occurrence.
+#[test]
+fn an_invalid_side_is_refused_and_the_joint_is_kept() {
+    let mut s = two_cubes();
+    run(&mut s, "joint.create", json!({"type": "rigid", "name": "Stack", "a": {"face": [5, 5, 10]}, "b": {"face": [25, 5, 0]}}));
+    let before = s.doc.assembly.joints[0].clone();
+    // A is a's occurrence and B is b's: each side is tried on the other's occurrence, and with
+    // the faults every side can have.
+    let cases = [
+        ("a", json!({"occurrence": "B", "face": [25, 5, 10]})),
+        ("a", json!({"occurrence": "Nope", "face": [5, 5, 10]})),
+        ("a", json!({"occurrence": "A"})),
+        ("a", json!(5)),
+        ("b", json!({"occurrence": "A", "face": [5, 5, 0]})),
+        ("b", json!({"occurrence": "Nope", "face": [25, 5, 0]})),
+        ("b", json!({"occurrence": "B"})),
+        ("b", json!("NoSuchOrigin")),
+    ];
+    for (key, side) in cases {
+        let r = s.execute("joint.edit", &json!({"joint": "Stack", key: side.clone()}));
+        assert!(r.is_err(), "{key}: {side} should be refused");
+        assert_eq!(s.doc.assembly.joints[0], before, "{key}: {side} changed the joint");
+    }
+}
+
 /// A move of a jointed part that the joint takes back: the model is evaluated for the
 /// placements the solve leaves, so a mirror of the part's body, made from the root, is where a
 /// fresh evaluation of the design puts it. The model was the one evaluated for the move before
