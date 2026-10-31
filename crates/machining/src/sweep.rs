@@ -3,12 +3,14 @@
 //!
 //! The tool is a flat cylinder: radius R, cutting from the tip up the axis to the flute length L.
 //! Linear moves use closed forms for rays parallel and perpendicular to the axis, and an envelope
-//! over the move for other rays. Arcs use an envelope over pieces that split at quarter turns and
-//! at the angles where each world coordinate of the tip peaks, so each piece is monotone in every
-//! constraint.
+//! over the move for other rays. Arcs in a plane perpendicular to the tool axis (G17) use exact
+//! windows: the arc's distance to the ray and its height are sinusoids and linear functions of the
+//! arc angle, so the parameter values where the tool can touch the ray are solved in closed form,
+//! and the envelope runs only inside them.
 //!
-//! One tie rule throughout: the tool's footprint is an open set. A ray exactly on the tool's
-//! boundary (a wall at exactly R) is not cut, and neither is a ray that only touches it.
+//! One tie rule throughout: the footprint and the height window are open sets, with an absolute
+//! slack of [`EPS_MM`]. A ray exactly on the tool's boundary (a wall at exactly R, a floor at
+//! exactly the tip) is not cut, and neither is a ray that only touches it.
 
 use std::f64::consts::{FRAC_PI_2, PI, TAU};
 
@@ -18,6 +20,9 @@ use crate::det_math;
 
 /// Arcs with more extra turns than this are refused (a `Move` can come from any source).
 pub const MAX_ARC_TURNS: u32 = 1000;
+
+/// The one slack, in millimetres, of every strict comparison in this module.
+pub const EPS_MM: f64 = 1e-9;
 
 /// The ray-intersection interface the dexel stock is cut with.
 pub trait Sweep {
@@ -46,8 +51,6 @@ impl FlatTool {
 
 /// `|d . axis|` within this of 1 is parallel, within it of 0 is perpendicular.
 const AXIS_EPS: f64 = 1e-12;
-/// Relative slack of the open-set tie rule: `dist < r (1 - TIE)` counts as inside.
-const TIE: f64 = 1e-12;
 /// Brent evaluation budget per minimisation.
 const BRENT_EVALS: usize = 25;
 /// Penalty for "no tool here" in the minimisations. Far outside any real coordinate.
@@ -59,16 +62,17 @@ fn perp(v: Vec3, u: Vec3) -> Vec3 {
     v - u * v.dot(u)
 }
 
-/// The open interval of `t` where `|w + t v| < r`. Lagrange form: the minimum squared distance is
-/// `|w x v|^2 / |v|^2`, so a ray exactly tangent to the circle has a zero discriminant and no
-/// interval, with no rounding in the decision.
+/// The open interval of `t` where `|w + t v| < r - EPS_MM`. Lagrange form: the minimum squared
+/// distance is `|w x v|^2 / |v|^2`, so a ray exactly tangent to the circle has a non-positive
+/// discriminant and no interval, with no rounding in the decision.
 fn chord_open(w: Vec3, v: Vec3, r: f64) -> Option<(f64, f64)> {
     let vv = v.len2();
     if vv < 1e-24 {
-        return (w.len2() < r * r).then_some((-BIG, BIG));
+        return (w.len() < r - EPS_MM).then_some((-BIG, BIG));
     }
     let disc = vv * r * r - w.cross(v).len2();
-    if disc <= TIE * vv * r * r {
+    // r^2 - dist^2 > 2 r EPS  is  r - dist > EPS, to first order.
+    if disc <= 2.0 * r * EPS_MM * vv {
         return None;
     }
     let c = -w.dot(v) / vv;
@@ -85,7 +89,7 @@ fn fiber(o: Vec3, d: Vec3, p: Vec3, tool: &FlatTool) -> Option<(f64, f64)> {
     let beta = d.dot(u);
     let (mut lo, mut hi) = (-BIG, BIG);
     if beta.abs() < AXIS_EPS {
-        if !(alpha > 0.0 && alpha < tool.length) {
+        if !(alpha > EPS_MM && alpha < tool.length - EPS_MM) {
             return None;
         }
     } else {
@@ -100,11 +104,11 @@ fn fiber(o: Vec3, d: Vec3, p: Vec3, tool: &FlatTool) -> Option<(f64, f64)> {
     (lo <= hi).then_some((lo, hi))
 }
 
-/// Interval of `t` where `a0 + t a1` lies in `[lo, hi]`. A ray parallel to the strip (`a1` zero)
-/// is in it only strictly inside, so a ray exactly on the strip's edge is not cut.
+/// Interval of `t` where `a0 + t a1` lies strictly inside `(lo, hi)`. With `a1` zero the answer is
+/// all or nothing, decided with the slack, so a ray exactly on the strip's edge is not cut.
 fn linear_window(a0: f64, a1: f64, lo: f64, hi: f64) -> Option<(f64, f64)> {
     if a1.abs() < AXIS_EPS {
-        return (a0 > lo && a0 < hi).then_some((-BIG, BIG));
+        return (a0 > lo + EPS_MM && a0 < hi - EPS_MM).then_some((-BIG, BIG));
     }
     let t1 = (lo - a0) / a1;
     let t2 = (hi - a0) / a1;
@@ -229,9 +233,11 @@ fn brent_min(f: &dyn Fn(f64) -> f64, ax: f64, bx: f64, tol: f64, max_eval: usize
 /// Extremes over a parameter range of the removed interval `(lo, hi)` at each parameter value:
 /// the least `lo` and the greatest `hi`. Samples first, then Brent around the best sample on each
 /// side. A `None` fiber means the tool is not on the ray at that parameter.
-/// shortcut: the sampled envelope is the general path for oblique rays. A feasible window narrower
-/// than one sample step can be missed (a grazing sliver), and it costs up to 16 + 2 x 25 evaluations.
-/// Replace with closed forms for oblique rays when 5-axis motion needs them.
+///
+/// shortcut: this sampled envelope is the general path, used for oblique rays and for arcs outside
+/// the XY plane. Its samples can miss a window narrower than one step, so a full crossing of a thin
+/// feature on an oblique path can be missed, not only a grazing sliver. It costs up to 16 plus
+/// 2 x 25 evaluations. NOT NOW: replace it with closed forms for oblique rays when 5-axis needs them.
 fn envelope(fib: &dyn Fn(f64) -> Option<(f64, f64)>, a: f64, b: f64, samples: usize, tol: f64) -> Option<(f64, f64)> {
     let x_of = |k: usize| a + (b - a) * (k as f64) / (samples as f64);
     let mut best_lo: Option<(usize, f64)> = None;
@@ -290,7 +296,8 @@ impl LinearFixedAxis {
         let g = perp(o - self.from, u);
         let (sa, sb) = chord_open(g, -perp(path, u), self.tool.radius)?;
         let (s0, s1) = (sa.max(0.0), sb.min(1.0));
-        if s0 > s1 {
+        // A window touching [0, 1] only at one end is a tangent contact, not a cut.
+        if s1 - s0 <= 1e-12 {
             return None;
         }
         // The ray runs along the axis, so the height along it changes by +-1 per unit t.
@@ -316,7 +323,7 @@ impl LinearFixedAxis {
         let alpha0 = (o - self.from).dot(u);
         let delta = path.dot(u);
         let (s0, s1) = if delta.abs() < AXIS_EPS {
-            if !(alpha0 > 0.0 && alpha0 < len) {
+            if !(alpha0 > EPS_MM && alpha0 < len - EPS_MM) {
                 return None;
             }
             (0.0, 1.0)
@@ -325,7 +332,8 @@ impl LinearFixedAxis {
             let sb = (alpha0 - len) / delta;
             (sa.min(sb).max(0.0), sa.max(sb).min(1.0))
         };
-        if s0 > s1 {
+        // A plunge or ramp that ends exactly at the ray's height gives an empty s range: no cut.
+        if s0 >= s1 {
             return None;
         }
         let q0 = perp(self.from + path * s0, u);
@@ -360,18 +368,67 @@ impl Sweep for LinearFixedAxis {
     }
 }
 
+/// `base + slope * u + amp * cos(sign * u - phi)` as a function of the arc parameter `u`: the
+/// shape of every coordinate and distance of a tip on an arc in a plane perpendicular to the tool
+/// axis. Its level sets are solved in closed form when either `slope` or `amp` is zero.
+#[derive(Clone, Copy, Debug)]
+struct Form {
+    base: f64,
+    slope: f64,
+    amp: f64,
+    phi: f64,
+}
+
+impl Form {
+    fn value(&self, sign: f64, u: f64) -> f64 {
+        self.base + self.slope * u + self.amp * (sign * u - self.phi).cos()
+    }
+
+    /// The parameter values in `[a, b]` where the form equals `level`, appended to `out`.
+    fn roots(&self, sign: f64, level: f64, a: f64, b: f64, out: &mut Vec<f64>) {
+        if self.amp == 0.0 {
+            if self.slope != 0.0 {
+                let u = (level - self.base) / self.slope;
+                if u >= a && u <= b {
+                    out.push(u);
+                }
+            }
+            return;
+        }
+        let c = (level - self.base) / self.amp;
+        if c.abs() > 1.0 || self.slope != 0.0 {
+            return;
+        }
+        let alpha = c.acos();
+        for ang in [alpha, -alpha] {
+            // sign * u - phi = +-alpha + 2 pi m, so u = sign * (phi +- alpha) modulo a turn.
+            let u0 = (sign * (self.phi + ang)).rem_euclid(TAU);
+            let mut u = u0 + TAU * ((a - u0) / TAU).ceil().max(0.0);
+            if u < a {
+                u += TAU;
+            }
+            while u <= b {
+                out.push(u);
+                u += TAU;
+            }
+        }
+    }
+}
+
 /// A flat end mill on a circular or helical arc: centre, plane normal, sweep and lift. The tool
 /// axis is fixed; the arc's plane may be any plane.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ArcFixedAxis {
-    /// Arc centre at the start height.
+    /// Arc centre at this piece's start height.
     centre: Vec3,
     e1: Vec3,
     e2: Vec3,
+    /// Angle of this piece's start, from `e1`.
+    theta0: f64,
     r: f64,
     /// Signed sweep, radians: positive is counter-clockwise about the normal.
     sweep: f64,
-    /// Total change along the normal from start to end.
+    /// Change along the normal over this piece.
     lift: Vec3,
     tool: FlatTool,
     /// The arc plane is perpendicular to the tool axis (the common G17 case).
@@ -410,29 +467,62 @@ impl ArcFixedAxis {
         let extra = TAU * f64::from(turns);
         let sweep = if ccw { base + extra } else { base - extra };
         let lift = n * (end - start).dot(n);
-        Some(ArcFixedAxis { centre, e1, e2, r, sweep, lift, tool, axis_normal: n.dot(tool.axis).abs() > 1.0 - AXIS_EPS, normal: n })
+        Some(ArcFixedAxis { centre, e1, e2, theta0: 0.0, r, sweep, lift, tool, axis_normal: n.dot(tool.axis).abs() > 1.0 - AXIS_EPS, normal: n })
+    }
+
+    /// The arc cut into pieces of at most one revolution each, with the same union. The sim applies
+    /// them one after another under one move tag, so a long arc can be pumped between revolutions.
+    pub fn revolutions(&self) -> Vec<ArcFixedAxis> {
+        let total = self.sweep.abs();
+        if !(total > 0.0) {
+            return Vec::new();
+        }
+        let sign = self.sweep.signum();
+        let count = (total / TAU).ceil().max(1.0) as usize;
+        (0..count)
+            .map(|k| {
+                let start_u = k as f64 * TAU;
+                let len = (total - start_u).min(TAU);
+                ArcFixedAxis {
+                    centre: self.centre + self.lift * (start_u / total),
+                    theta0: self.theta0 + sign * start_u,
+                    sweep: sign * len,
+                    lift: self.lift * (len / total),
+                    ..*self
+                }
+            })
+            .collect()
     }
 
     /// The tool tip at arc parameter `u` (radians swept so far, `0..=|sweep|`).
     fn tip(&self, u: f64) -> Vec3 {
         let total = self.sweep.abs();
         let s = if total > 0.0 { u / total } else { 0.0 };
-        let (sn, cs) = det_math::sin_cos(self.sweep.signum() * u);
+        let (sn, cs) = det_math::sin_cos(self.theta0 + self.sweep.signum() * u);
         self.centre + self.lift * s + (self.e1 * cs + self.e2 * sn) * self.r
     }
 
-    /// Arc parameters at which the in-plane offset along `w` peaks or troughs: every turn of
-    /// both extremes, kept inside `0..total`.
-    fn feet(&self, w: Vec3, total: f64, pts: &mut Vec<f64>) {
-        let theta = det_math::atan2(w.dot(self.e2), w.dot(self.e1));
-        for th in [theta, theta + PI] {
-            let mut u = (self.sweep.signum() * th).rem_euclid(TAU);
-            while u < total {
-                if u > 0.0 {
-                    pts.push(u);
-                }
-                u += TAU;
-            }
+    /// The form of `w . tip(u)` for a vector `w` perpendicular to the arc normal.
+    fn coordinate_form(&self, w: Vec3) -> Form {
+        let total = self.sweep.abs().max(1e-300);
+        let wp = (w.dot(self.e1), w.dot(self.e2));
+        let amp = self.r * (wp.0 * wp.0 + wp.1 * wp.1).sqrt();
+        let phi = det_math::atan2(wp.1, wp.0) - self.theta0;
+        let slope = w.dot(self.lift) / total;
+        // Rounding leaves a tiny amplitude in a coordinate with no in-plane part: that is none.
+        let amp = if amp < 1e-12 { 0.0 } else { amp };
+        Form { base: w.dot(self.centre), slope: if slope.abs() < 1e-12 { 0.0 } else { slope }, amp, phi }
+    }
+
+    /// The form of the squared distance from `q` to the tip, in the plane perpendicular to the axis.
+    fn distance_sq_form(&self, q: Vec3) -> Form {
+        let v = perp(self.centre - q, self.tool.axis);
+        let vp = (v.dot(self.e1), v.dot(self.e2));
+        Form {
+            base: v.len2() + self.r * self.r,
+            slope: 0.0,
+            amp: 2.0 * self.r * (vp.0 * vp.0 + vp.1 * vp.1).sqrt(),
+            phi: det_math::atan2(vp.1, vp.0) - self.theta0,
         }
     }
 
@@ -456,6 +546,32 @@ impl ArcFixedAxis {
             false
         }
     }
+
+    /// The constraints `lo < form < hi` that a tool must meet to cut the ray, as exact forms. Empty
+    /// when the windows cannot be solved in closed form (arcs outside the XY plane, oblique rays).
+    fn constraints(&self, o: Vec3, d: Vec3) -> Vec<(Form, f64, f64)> {
+        if !self.axis_normal {
+            return Vec::new();
+        }
+        let axis = self.tool.axis;
+        let along = d.dot(axis).abs();
+        if along > 1.0 - AXIS_EPS {
+            // Parallel: the footprint, a disc of radius R around the ray's foot, is the only limit.
+            let f = self.distance_sq_form(o);
+            vec![(f, f64::NEG_INFINITY, self.tool.radius * self.tool.radius)]
+        } else if along < AXIS_EPS {
+            // Perpendicular: within R of the ray's line, and the ray at a height inside the tool.
+            let w = self.normal.cross(d);
+            let f = self.coordinate_form(w);
+            let c = w.dot(o);
+            let h = self.coordinate_form(axis);
+            let z0 = o.dot(axis);
+            let r = self.tool.radius;
+            vec![(f, c - r, c + r), (h, z0 - self.tool.length, z0)]
+        } else {
+            Vec::new()
+        }
+    }
 }
 
 impl Sweep for ArcFixedAxis {
@@ -476,7 +592,7 @@ impl Sweep for ArcFixedAxis {
             return;
         }
         // Pieces of at most a quarter turn, cut where each world coordinate of the tip peaks, so
-        // every constraint is monotone within a piece and its removed part is one interval.
+        // the envelope's pieces are monotone in every coordinate.
         let mut pts = vec![0.0, total];
         let mut k = 1.0f64;
         while k * FRAC_PI_2 < total {
@@ -496,11 +612,55 @@ impl Sweep for ArcFixedAxis {
         }
         pts.sort_by(|a, b| a.total_cmp(b));
         pts.dedup_by(|a, b| (*a - *b).abs() < 1e-12);
+        let constraints = self.constraints(o, d);
+        let sign = self.sweep.signum();
         let tol = 1e-6 / self.r.max(1e-3);
         let fib = |u: f64| fiber(o, d, self.tip(u), &self.tool);
+        let mut roots: Vec<f64> = Vec::new();
         for pair in pts.windows(2) {
-            if let Some(iv) = envelope(&fib, pair[0], pair[1], 8, tol) {
-                push_clipped(Some(iv), t_range, out);
+            let (a, b) = (pair[0], pair[1]);
+            // The windows are exact: the breakpoints are every root of every constraint in the piece,
+            // and each sub-interval between them is inside or outside by its midpoint.
+            roots.clear();
+            for (f, lo, hi) in &constraints {
+                if lo.is_finite() {
+                    f.roots(sign, *lo, a, b, &mut roots);
+                }
+                if hi.is_finite() {
+                    f.roots(sign, *hi, a, b, &mut roots);
+                }
+            }
+            roots.push(a);
+            roots.push(b);
+            roots.sort_by(|x, y| x.total_cmp(y));
+            roots.dedup_by(|x, y| (*x - *y).abs() < 1e-15);
+            for seg in roots.windows(2) {
+                let (p, q) = (seg[0], seg[1]);
+                let mid = 0.5 * (p + q);
+                let inside = constraints.iter().all(|(f, lo, hi)| {
+                    let g = f.value(sign, mid);
+                    g > *lo && g < *hi
+                });
+                if inside && let Some(iv) = envelope(&fib, p, q, 8, tol) {
+                    push_clipped(Some(iv), t_range, out);
+                }
+            }
+        }
+    }
+}
+
+impl ArcFixedAxis {
+    /// Arc parameters at which the in-plane offset along `w` peaks or troughs: every turn of both
+    /// extremes, kept inside `0..total`.
+    fn feet(&self, w: Vec3, total: f64, pts: &mut Vec<f64>) {
+        let theta = det_math::atan2(w.dot(self.e2), w.dot(self.e1)) - self.theta0;
+        for th in [theta, theta + PI] {
+            let mut u = (self.sweep.signum() * th).rem_euclid(TAU);
+            while u < total {
+                if u > 0.0 {
+                    pts.push(u);
+                }
+                u += TAU;
             }
         }
     }

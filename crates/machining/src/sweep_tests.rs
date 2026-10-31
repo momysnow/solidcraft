@@ -4,7 +4,7 @@ use super::{ArcFixedAxis, FlatTool, LinearFixedAxis, MAX_ARC_TURNS, Sweep, brent
 
 const R: f64 = 2.5;
 const L: f64 = 10.0;
-const WIDE: (f64, f64) = (-100.0, 100.0);
+const WIDE: (f64, f64) = (-1000.0, 1000.0);
 
 fn tool() -> FlatTool {
     FlatTool::new(R, L, Vec3::Z).expect("valid tool")
@@ -295,4 +295,90 @@ fn degenerate_arcs_are_refused() {
     let p = Vec3::new(5.0, 0.0, 0.0);
     assert!(ArcFixedAxis::new(p, p, p, Vec3::Z, true, 0, tool()).is_none(), "zero radius");
     assert!(ArcFixedAxis::new(p, p, Vec3::ZERO, Vec3::ZERO, true, 0, tool()).is_none(), "zero normal");
+}
+
+/// A quarter arc (r, 0) to (0, r) counter-clockwise about the origin, at height 0.
+fn quarter(r: f64, tool_r: f64) -> ArcFixedAxis {
+    let t = FlatTool::new(tool_r, 10.0, Vec3::Z).expect("tool");
+    ArcFixedAxis::new(Vec3::new(r, 0.0, 0.0), Vec3::new(0.0, r, 0.0), Vec3::ZERO, Vec3::Z, true, 0, t).expect("quarter arc")
+}
+
+#[test]
+fn x_ray_through_a_quarter_arc_is_never_missed() {
+    // The review's example: a G3 quarter of radius 40 with a 6 mm tool. The X ray at y = 22.22 is cut
+    // over a window of about 0.18 rad, between two of the nine envelope samples.
+    let arc = quarter(40.0, 3.0);
+    let o = Vec3::new(-100.0, 22.22, 5.0);
+    let d = Vec3::X;
+    let set = ray_set(&arc, o, d, WIDE);
+    assert_eq!(set.len(), 1, "one chord: the quarter arc crosses the ray once: {set:?}");
+    let want = merge(dense_arc(&arc, o, d, WIDE, 400000), 2e-3);
+    assert_sets(&set, &want, 2e-3, "example");
+}
+
+#[test]
+fn large_arc_windows_match_the_dense_oracle_for_many_rays() {
+    // Radius 60, 2.5 mm tool: a window is about 2 x 2.5 / (60 cos u) wide in u, far narrower than
+    // a sample step. Every X and Y ray across the arc must still match the oracle.
+    let arc = quarter(60.0, 2.5);
+    let mut checked = 0;
+    let mut y = 0.05;
+    while y < 60.0 {
+        let o_x = Vec3::new(-100.0, y, 5.0);
+        let want = merge(dense_arc(&arc, o_x, Vec3::X, WIDE, 60000), 2e-3);
+        assert_sets(&ray_set(&arc, o_x, Vec3::X, WIDE), &want, 2e-3, "X ray");
+        let o_y = Vec3::new(y, -100.0, 5.0);
+        let want = merge(dense_arc(&arc, o_y, Vec3::Y, WIDE, 60000), 2e-3);
+        assert_sets(&ray_set(&arc, o_y, Vec3::Y, WIDE), &want, 2e-3, "Y ray");
+        checked += 1;
+        y += 1.37;
+    }
+    assert!(checked > 40, "checked {checked} rays");
+}
+
+#[test]
+fn a_ray_exactly_tangent_to_the_end_circle_is_not_cut() {
+    // The slot from (10, 10) to (50, 10) with a 2.5 mm tool: the start circle reaches x = 7.5 exactly.
+    let slot = line(Vec3::new(10.0, 10.0, -4.0), Vec3::new(50.0, 10.0, -4.0));
+    assert!(ray_set(&slot, Vec3::new(7.5, 10.0, 0.0), Vec3::Z, WIDE).is_empty(), "tangent to the end circle");
+    // A hair inside, the ray is cut over the whole height window.
+    let inside = ray_set(&slot, Vec3::new(7.5 + 1e-6, 10.0, 0.0), Vec3::Z, WIDE);
+    assert_eq!(inside.len(), 1, "{inside:?}");
+    assert!((inside[0].0 + 4.0).abs() < 1e-6 && (inside[0].1 - 6.0).abs() < 1e-6, "{inside:?}");
+}
+
+#[test]
+fn a_plunge_ending_at_the_ray_height_cuts_nothing() {
+    // The tool plunges from z = 5 to z = -4 at the origin. An X ray lying exactly on the floor
+    // (the tip's height) sees only the tip, so it is not cut.
+    let plunge = LinearFixedAxis { from: Vec3::new(0.0, 0.0, 5.0), to: Vec3::new(0.0, 0.0, -4.0), tool: tool() };
+    assert!(ray_set(&plunge, Vec3::new(-50.0, 0.5, -4.0), Vec3::X, WIDE).is_empty(), "on the floor");
+    // Just above the floor the ray is cut.
+    assert!(!ray_set(&plunge, Vec3::new(-50.0, 0.5, -3.9), Vec3::X, WIDE).is_empty(), "just above the floor");
+}
+
+#[test]
+fn an_arc_wall_tangent_ray_is_not_cut() {
+    // A full circle of radius 7.5 about (30, 30) with a 2.5 mm tool: the outer wall is at y = 40.
+    let arc = full_circle(Vec3::new(30.0, 30.0, -4.0), 7.5, -4.0);
+    assert!(ray_set(&arc, Vec3::new(0.0, 40.0, -2.0), Vec3::X, WIDE).is_empty(), "tangent to the wall");
+    let inside = ray_set(&arc, Vec3::new(0.0, 39.999999, -2.0), Vec3::X, WIDE);
+    assert!(!inside.is_empty(), "a hair inside the wall is cut");
+}
+
+#[test]
+fn revolution_pieces_have_the_same_union_as_the_whole_arc() {
+    let t = tool();
+    let arc =
+        ArcFixedAxis::new(Vec3::new(37.5, 30.0, -4.0), Vec3::new(30.0, 37.5, -4.0), Vec3::new(30.0, 30.0, -4.0), Vec3::Z, true, 2, t).expect("arc");
+    let pieces = arc.revolutions();
+    assert_eq!(pieces.len(), 3, "2.25 + ... turns make three revolution pieces");
+    for (o, d) in [(Vec3::new(0.0, 33.0, -3.0), Vec3::X), (Vec3::new(36.0, 33.0, 0.0), Vec3::Z)] {
+        let whole = ray_set(&arc, o, d, (-20.0, 80.0));
+        let mut union = Vec::new();
+        for p in &pieces {
+            p.ray(o, d, (-20.0, 80.0), &mut union);
+        }
+        assert_sets(&merge(union, 1e-9), &whole, 1e-6, "revolutions");
+    }
 }
