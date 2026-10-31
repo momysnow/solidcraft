@@ -6,22 +6,29 @@
 //! sign changes pairs them; a checkerboard face with four pairs the edges around each outside
 //! corner), and the pairs join into groups. Each group gets one vertex, at the mean of its
 //! crossings. Each quad of the surface takes, from each of its four cells, the vertex of the group
-//! holding its edge. The surface is manifold: every edge is shared by exactly two triangles, even
-//! where two inside corners of a cell touch only at a vertex.
+//! holding its edge.
+//!
+//! The result is closed and oriented: every edge is shared by an even number of triangles, two in
+//! the usual case. Where one group holds both pairs of a checkerboard face, the edge can be shared
+//! by four. That is not a manifold surface there, and it is not claimed to be.
 //!
 //! Edges are owned by their lower node, so each quad is emitted once, by the chunk that owns it,
-//! and the chunks share their cell vertices bit for bit.
+//! and the chunks share their cell vertices bit for bit. Each chunk caches the inside or outside
+//! state of its nodes once, instead of evaluating each node about twenty times.
 //!
 //! shortcut: a group's vertex is the mean of its crossings, so sharp edges are rounded by up to one
 //! cell size; upgrade to a QEF with the tags' normals in S8.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use solidcraft_geom::{Mesh, Vec3};
 
 use crate::dexel::Stock;
 
-const CHUNK: i64 = 32;
+pub const CHUNK: i64 = 32;
+/// The lowest lower node the mesher walks. Nodes below it are taken as air: the stock never has
+/// material there, and a general lattice must keep its material above it.
+const LOWEST: i64 = -2;
 
 /// What the mesher needs of a lattice: its cell counts, which nodes are material, and where each
 /// sign-changing edge crosses the boundary. Node indices run from `-1` to `n` on each axis.
@@ -45,6 +52,11 @@ impl Lattice for Stock {
     }
 }
 
+/// Chunks along each axis: the nodes run from `-1` to `n`, so `n + 2` of them.
+fn chunk_counts<L: Lattice>(lat: &L) -> [i64; 3] {
+    lat.cell_counts().map(|x| (x - LOWEST + 1 + CHUNK - 1) / CHUNK)
+}
+
 /// The surface of the cut stock, one mesh per non-empty chunk, in chunk order.
 pub fn chunk_meshes(stock: &Stock) -> Vec<Mesh> {
     extract(stock)
@@ -52,23 +64,81 @@ pub fn chunk_meshes(stock: &Stock) -> Vec<Mesh> {
 
 /// The surface of any lattice, one mesh per non-empty chunk, in chunk order.
 pub fn extract<L: Lattice>(lat: &L) -> Vec<Mesh> {
-    let n = lat.cell_counts();
-    let chunks = n.map(|x| (x + 2 + CHUNK - 1) / CHUNK);
+    let counts = chunk_counts(lat);
     let mut out = Vec::new();
-    for cz in 0..chunks[2] {
-        for cy in 0..chunks[1] {
-            for cx in 0..chunks[0] {
-                let first = [cx * CHUNK - 1, cy * CHUNK - 1, cz * CHUNK - 1];
-                let mut builder = Builder { lat, n, cells: HashMap::new(), positions: Vec::new(), triangles: Vec::new() };
-                builder.chunk(first);
-                if builder.triangles.is_empty() {
-                    continue;
+    for cz in 0..counts[2] {
+        for cy in 0..counts[1] {
+            for cx in 0..counts[0] {
+                if let Some(m) = chunk_mesh_of(lat, [cx, cy, cz]) {
+                    out.push(m);
                 }
-                out.push(builder.finish());
             }
         }
     }
     out
+}
+
+/// The mesh of one chunk of the cut stock, or `None` when the chunk has no surface. The index is
+/// the chunk's position along each axis, as [`dirty_chunks`] reports it.
+pub fn chunk_mesh(stock: &Stock, idx: [usize; 3]) -> Option<Mesh> {
+    chunk_mesh_of(stock, idx.map(|x| x as i64))
+}
+
+/// The chunks whose surface can change after the tiles in [`Stock::dirty_tiles`] were cut. A tile
+/// changes the nodes whose rays it holds, so the chunks near those nodes are dirty: a tile's chunks
+/// are the ones at its position, two either side, and every chunk along the tile's own axis.
+pub fn dirty_chunks(stock: &Stock) -> Vec<[usize; 3]> {
+    let counts = chunk_counts(stock);
+    let mut set: BTreeSet<[usize; 3]> = BTreeSet::new();
+    for &(a, tidx) in stock.dirty_tiles() {
+        let (u, v) = ((a + 1) % 3, (a + 2) % 3);
+        let (tu, tv) = stock.tile_coords(a, tidx);
+        let span = |k: usize, centre: i64| -> Vec<i64> {
+            let (lo, hi) = if k == a { (0, counts[k] - 1) } else { ((centre - 2).max(0), (centre + 2).min(counts[k] - 1)) };
+            (lo..=hi).collect()
+        };
+        let ranges: [Vec<i64>; 3] = std::array::from_fn(|k| {
+            let centre = if k == u {
+                tu as i64
+            } else if k == v {
+                tv as i64
+            } else {
+                0
+            };
+            span(k, centre)
+        });
+        for &x in &ranges[0] {
+            for &y in &ranges[1] {
+                for &z in &ranges[2] {
+                    if x >= 0 && y >= 0 && z >= 0 && x < counts[0] && y < counts[1] && z < counts[2] {
+                        set.insert([x as usize, y as usize, z as usize]);
+                    }
+                }
+            }
+        }
+    }
+    set.into_iter().collect()
+}
+
+/// The volume of the cut stock from its surface, by the divergence theorem. The chunk meshes share
+/// their boundary vertices exactly, so their signed volumes add. It is not uniformly more precise than
+/// [`Stock::volume`]: its vertices are cell means, which round sharp edges by up to a cell.
+pub fn mesh_volume(stock: &Stock) -> f64 {
+    chunk_meshes(stock).iter().map(|m| m.measure().volume).sum()
+}
+
+fn chunk_mesh_of<L: Lattice>(lat: &L, idx: [i64; 3]) -> Option<Mesh> {
+    let counts = chunk_counts(lat);
+    if idx.iter().zip(counts.iter()).any(|(i, c)| *i < 0 || i >= c) {
+        return None;
+    }
+    let first = idx.map(|i| i * CHUNK + LOWEST);
+    let mut builder = Builder::new(lat, lat.cell_counts(), first);
+    builder.chunk(first);
+    if builder.triangles.is_empty() {
+        return None;
+    }
+    Some(builder.finish())
 }
 
 /// Edge index within a cell: the axis, then the offsets (0 or 1) along the other two axes.
@@ -102,28 +172,74 @@ fn join(parent: &mut [usize; 12], a: usize, b: usize) {
     }
 }
 
-/// The corners of a cell, with the signs of their nodes: index `x + 2 y + 4 z`.
+/// The offsets of corner `c` of a cell: index `x + 2 y + 4 z`.
 fn corner_offset(c: usize) -> [i64; 3] {
     [(c & 1) as i64, ((c >> 1) & 1) as i64, ((c >> 2) & 1) as i64]
+}
+
+/// The inside or outside state of a box of nodes, evaluated once.
+struct NodeCache {
+    origin: [i64; 3],
+    dims: [i64; 3],
+    inside: Vec<bool>,
+}
+
+impl NodeCache {
+    fn build<L: Lattice>(lat: &L, origin: [i64; 3], dims: [i64; 3]) -> NodeCache {
+        let total = (dims[0] * dims[1] * dims[2]).max(0) as usize;
+        let mut inside = Vec::with_capacity(total);
+        for x in 0..dims[0] {
+            for y in 0..dims[1] {
+                for z in 0..dims[2] {
+                    inside.push(lat.inside([origin[0] + x, origin[1] + y, origin[2] + z]));
+                }
+            }
+        }
+        NodeCache { origin, dims, inside }
+    }
+
+    fn get<L: Lattice>(&self, lat: &L, node: [i64; 3]) -> bool {
+        let rel: [i64; 3] = std::array::from_fn(|k| node[k] - self.origin[k]);
+        if rel.iter().zip(self.dims.iter()).all(|(r, d)| *r >= 0 && r < d) {
+            let i = ((rel[0] * self.dims[1] + rel[1]) * self.dims[2] + rel[2]) as usize;
+            if let Some(v) = self.inside.get(i) {
+                return *v;
+            }
+        }
+        lat.inside(node)
+    }
 }
 
 struct Builder<'a, L: Lattice> {
     lat: &'a L,
     n: [i64; 3],
+    nodes: NodeCache,
     /// Per cell: the vertex of each sign-changing edge of the cell, by edge index.
     cells: HashMap<[i64; 3], [Option<u32>; 12]>,
     positions: Vec<Vec3>,
     triangles: Vec<[u32; 3]>,
 }
 
-impl<L: Lattice> Builder<'_, L> {
+impl<'a, L: Lattice> Builder<'a, L> {
+    /// A builder for the chunk whose first lower node is `first`. Quads and cell patches of the
+    /// chunk read nodes from `first - 2` to `first + CHUNK + 1` on each axis, so the cache covers that.
+    fn new(lat: &'a L, n: [i64; 3], first: [i64; 3]) -> Self {
+        let origin = first.map(|f| f - 2);
+        let nodes = NodeCache::build(lat, origin, [CHUNK + 4; 3]);
+        Builder { lat, n, nodes, cells: HashMap::new(), positions: Vec::new(), triangles: Vec::new() }
+    }
+
+    fn inside(&self, node: [i64; 3]) -> bool {
+        self.nodes.get(self.lat, node)
+    }
+
     /// Emits the quads of the edges owned by the chunk whose first lower node is `first`.
     fn chunk(&mut self, first: [i64; 3]) {
         let hi: [i64; 3] = std::array::from_fn(|k| (first[k] + CHUNK).min(self.n[k] + 1));
         for a in 0..3 {
-            for l0 in first[0].max(-1)..hi[0] {
-                for l1 in first[1].max(-1)..hi[1] {
-                    for l2 in first[2].max(-1)..hi[2] {
+            for l0 in first[0].max(LOWEST)..hi[0] {
+                for l1 in first[1].max(LOWEST)..hi[1] {
+                    for l2 in first[2].max(LOWEST)..hi[2] {
                         let lower = [l0, l1, l2];
                         if lower[a] > self.n[a] - 1 {
                             continue;
@@ -139,8 +255,8 @@ impl<L: Lattice> Builder<'_, L> {
     fn edge(&mut self, a: usize, lower: [i64; 3]) {
         let mut upper = lower;
         upper[a] += 1;
-        let inside = self.lat.inside(lower);
-        if inside == self.lat.inside(upper) {
+        let inside = self.inside(lower);
+        if inside == self.inside(upper) {
             return;
         }
         let (u, v) = ((a + 1) % 3, (a + 2) % 3);
@@ -177,7 +293,7 @@ impl<L: Lattice> Builder<'_, L> {
         let mut sign = [false; 8];
         for (c, s) in sign.iter_mut().enumerate() {
             let off = corner_offset(c);
-            *s = self.lat.inside(std::array::from_fn(|k| cell[k] + off[k]));
+            *s = self.inside(std::array::from_fn(|k| cell[k] + off[k]));
         }
         let corner = |off: [i64; 3]| (off[0] + 2 * off[1] + 4 * off[2]) as usize;
         let mut change = [false; 12];

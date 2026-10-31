@@ -78,6 +78,8 @@ pub struct Stock {
     /// Bytes the grids take (tiles counted as if none were shared), and the budget they must fit.
     used: u64,
     budget: u64,
+    /// Tiles changed since the last [`Stock::clear_dirty`]: (axis, tile index), in apply order.
+    dirty: Vec<(usize, usize)>,
 }
 
 /// Bytes of a tile's contents: a segment is 16 bytes, a start 4.
@@ -112,14 +114,17 @@ impl Stock {
         }
         let mut need = 0u64;
         for axis in 0..3 {
-            let rays = (n_at(&n, (axis + 1) % 3) as u64).saturating_mul(n_at(&n, (axis + 2) % 3) as u64);
-            need = need.saturating_add(rays.saturating_mul(BYTES_PER_RAY));
+            let (nu, nv) = (n_at(&n, (axis + 1) % 3), n_at(&n, (axis + 2) % 3));
+            let rays = (nu as u64).saturating_mul(nv as u64);
+            // The per-ray estimate, plus the start sentinel of each tile (4 bytes).
+            let tiles = (nu.div_ceil(TILE) as u64).saturating_mul(nv.div_ceil(TILE) as u64);
+            need = need.saturating_add(rays.saturating_mul(BYTES_PER_RAY)).saturating_add(tiles.saturating_mul(4));
         }
         if need > budget_bytes {
             return Err(SimError::Budget { need, budget: budget_bytes });
         }
         let grids = [build_grid(0, &n, &lo, &hi), build_grid(1, &n, &lo, &hi), build_grid(2, &n, &lo, &hi)];
-        Ok(Stock { min: lo, max: hi, cell, n, grids, used: need, budget: budget_bytes })
+        Ok(Stock { min: lo, max: hi, cell, n, grids, used: need, budget: budget_bytes, dirty: Vec::new() })
     }
 
     /// Cuts the stock with a sweep. Only rays the sweep can reach are visited. `tag` is recorded on
@@ -169,11 +174,13 @@ impl Stock {
                             sweep.ray(Vec3::from(o), Vec3::from(d), (self.min[a], self.max[a]), &mut out);
                             // Stored coordinates are relative to the stock's minimum on each axis.
                             let base = self.min[a];
+                            // A cut that is empty once stored as f32 is skipped: it would split nothing.
                             let kept: Vec<(f64, f64)> = out
                                 .iter()
                                 .copied()
-                                .filter(|(x, y)| x.is_finite() && y.is_finite() && y > x)
+                                .filter(|(x, y)| x.is_finite() && y.is_finite())
                                 .map(|(x, y)| (x - base, y - base))
+                                .filter(|(x, y)| (*y as f32) > (*x as f32))
                                 .collect();
                             if !kept.is_empty() {
                                 cuts.push((lv * w + lu, kept));
@@ -203,10 +210,29 @@ impl Stock {
         for (a, tidx, tile) in staged {
             if let Some(slot) = self.grids[a].tiles.get_mut(tidx) {
                 *slot = Arc::new(tile);
+                self.dirty.push((a, tidx));
             }
         }
         self.used = used;
         Ok(())
+    }
+
+    /// The tiles changed since the last [`Stock::clear_dirty`], as (axis, tile index).
+    pub fn dirty_tiles(&self) -> &[(usize, usize)] {
+        &self.dirty
+    }
+
+    /// Forgets the changed tiles (after the caller has remeshed what they touch).
+    pub fn clear_dirty(&mut self) {
+        self.dirty.clear();
+    }
+
+    /// The tile of a grid as (tile column along u, tile row along v).
+    pub(crate) fn tile_coords(&self, axis: usize, tidx: usize) -> (usize, usize) {
+        match self.grids.get(axis) {
+            Some(g) if g.tu > 0 => (tidx % g.tu, tidx / g.tu),
+            _ => (0, 0),
+        }
     }
 
     /// Bytes the grids take now, against the budget they were created with.
@@ -214,8 +240,11 @@ impl Stock {
         (self.used, self.budget)
     }
 
-    /// Material volume in mm^3: the average of the three grids' estimates (each is the sum of its
-    /// ray lengths times its cell area). Converges as the cell size falls.
+    /// Material volume in mm^3, the cheap midpoint estimate: the average of the three grids (each is
+    /// the sum of its ray lengths times its cell area). A wall that lies on a ray row loses half a row
+    /// per wall, so the error is bounded by about one cell size times the wall area, and it falls as
+    /// the cell size falls. [`crate::mesh::mesh_volume`] is the same quantity from the surface, which
+    /// rounds sharp edges by up to a cell instead.
     pub fn volume(&self) -> f64 {
         let mut total = 0.0;
         for a in 0..3 {
@@ -418,6 +447,9 @@ fn rebuild(old: &Tile, cuts: &[(usize, Vec<(f64, f64)>)], tag: u32) -> Result<Ti
         }
     }
     start.push(index_u32(segs.len())?);
+    // The old tile's buffers may be larger than the cut tile needs: give back the slack.
+    start.shrink_to_fit();
+    segs.shrink_to_fit();
     Ok(Tile { start, segs })
 }
 

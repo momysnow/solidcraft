@@ -10,11 +10,14 @@ use crate::sweep::{ArcFixedAxis, FlatTool, LinearFixedAxis};
 use crate::toolpath::{Program, Shape, Tool};
 
 const R: f64 = 2.5;
+/// The slot's centreline. Off the ray rows of h = 0.2, 0.1 and 0.05, so the walls (SLOT_Y -+ R) are never
+/// exactly on a row and the midpoint volume is not biased by a half-row (see `volume()`).
+const SLOT_Y: f64 = 10.03;
 const L: f64 = 20.0;
 const BUDGET: u64 = 1 << 32;
-/// Volume tolerance as a fraction of perimeter times h times depth. A midpoint sample that lands on a
-/// wall loses half a ray row: at h = 0.2 that is about 0.29 of this bound for the test slot.
-const TOL_FACTOR: f64 = 0.3;
+/// Volume tolerance as a fraction of perimeter times h times depth. The test slot is off the ray rows,
+/// so the midpoint error is far below this (about 0.4 mm^3 at h = 0.2); a 0.1 mm radius error is 38 mm^3.
+const TOL_FACTOR: f64 = 0.1;
 
 fn tool() -> FlatTool {
     FlatTool::new(R, L, Vec3::Z).expect("valid tool")
@@ -22,7 +25,7 @@ fn tool() -> FlatTool {
 
 /// A 40 mm slot, 4 mm deep, centred on y = 10, cut from the top (z = 0) down to z = -4.
 fn slot() -> LinearFixedAxis {
-    LinearFixedAxis { from: Vec3::new(10.0, 10.0, -4.0), to: Vec3::new(50.0, 10.0, -4.0), tool: tool() }
+    LinearFixedAxis { from: Vec3::new(10.0, SLOT_Y, -4.0), to: Vec3::new(50.0, SLOT_Y, -4.0), tool: tool() }
 }
 
 fn slot_volume_analytic() -> f64 {
@@ -52,7 +55,7 @@ fn slot_floor_is_exact_on_every_interior_z_ray() {
         for iv in 0..n[1] {
             let (x, y) = (s.pos(0, iu as i64), s.pos(1, iv as i64));
             let segs = s.ray_segs(2, iu, iv);
-            if x > 10.5 && x < 49.5 && (y - 10.0).abs() < 2.0 {
+            if x > 10.5 && x < 49.5 && (y - SLOT_Y).abs() < 2.0 {
                 assert_eq!(segs.len(), 1, "one interval left at ({x}, {y})");
                 let floor = abs(&s, 2, segs[0].hi);
                 assert!((floor + 4.0).abs() < 1e-5, "floor {floor} at ({x}, {y})");
@@ -78,7 +81,7 @@ fn slot_walls_are_exact_on_x_and_y_rays() {
     for iy in 0..n[1] {
         for iz in 0..n[2] {
             let (y, z) = (s.pos(1, iy as i64), s.pos(2, iz as i64));
-            let dy = (y - 10.0).abs();
+            let dy = (y - SLOT_Y).abs();
             if dy > 0.05 && dy < R - 0.05 && z > -3.5 && z < -0.5 {
                 let h = (R * R - dy * dy).sqrt();
                 let segs = s.ray_segs(0, iy, iz);
@@ -100,8 +103,8 @@ fn slot_walls_are_exact_on_x_and_y_rays() {
             if x > 10.5 && x < 49.5 && z > -3.5 && z < -0.5 {
                 let segs = s.ray_segs(1, iz, ix);
                 assert_eq!(segs.len(), 2, "two material pieces at ({x}, {z})");
-                assert!((abs(&s, 1, segs[0].hi) - 7.5).abs() < 1e-5, "near wall at x={x}");
-                assert!((abs(&s, 1, segs[1].lo) - 12.5).abs() < 1e-5, "far wall at x={x}");
+                assert!((abs(&s, 1, segs[0].hi) - (SLOT_Y - R)).abs() < 1e-5, "near wall at x={x}");
+                assert!((abs(&s, 1, segs[1].lo) - (SLOT_Y + R)).abs() < 1e-5, "far wall at x={x}");
                 y_checked += 1;
             }
         }
@@ -208,8 +211,9 @@ fn stock_refuses_bad_sizes_and_budgets() {
 #[test]
 fn budget_is_enforced_as_cuts_split_rays() {
     // A 1 mm cube at h = 1 is 3 rays of 20 bytes. A cut that splits a ray adds bytes, so a budget
-    // with only 8 bytes to spare refuses it, and the stock is unchanged.
-    let mut s = Stock::new_box(Vec3::ZERO, Vec3::new(1.0, 1.0, 1.0), 1.0, 60 + 8).expect("stock fits");
+    // with only 8 bytes to spare refuses it, and the stock is unchanged. The estimate is 72 bytes:
+    // 3 rays of 20 bytes and 3 tile sentinels of 4.
+    let mut s = Stock::new_box(Vec3::ZERO, Vec3::new(1.0, 1.0, 1.0), 1.0, 72 + 8).expect("stock fits");
     let hole =
         LinearFixedAxis { from: Vec3::new(0.5, 0.5, 0.4), to: Vec3::new(0.5, 0.5, 0.401), tool: FlatTool::new(0.1, 0.001, Vec3::Z).expect("tool") };
     let (segs, hash) = (s.segments(), s.state_hash());
@@ -254,7 +258,7 @@ fn bad_sweep_bounds_do_not_panic() {
 
 #[test]
 fn g_code_slot_simulates_to_the_analytic_floor() {
-    let text = "G0 X10 Y10 Z5\nG1 Z-4 F100\nG1 X50\nG0 Z5\nG0 X10 Y10";
+    let text = "G0 X10 Y10.03 Z5\nG1 Z-4 F100\nG1 X50\nG0 Z5\nG0 X10 Y10.03";
     let program = parse(text, &CodeTable::default());
     assert!(program.diags.is_empty());
     let program = Program { tools: vec![flat_tool(0)], ..program };
@@ -364,4 +368,33 @@ fn arc_sweep_on_the_stock_matches_a_full_circle_pocket_ring() {
     let analytic = 4.0 * std::f64::consts::PI * (10.0 * 10.0 - 5.0 * 5.0);
     eprintln!("ring h=0.4: removed {removed:.3}, analytic {analytic:.3}");
     assert!((removed - analytic).abs() < 0.1 * analytic, "removed {removed}");
+}
+
+#[test]
+fn a_non_finite_position_is_a_diagnostic_not_a_cut() {
+    let mut program = parse("G0 X10 Y10 Z5\nG1 Z-4\nG1 X20", &CodeTable::default());
+    program.tools = vec![flat_tool(0)];
+    program.moves[1].tip[0] = f64::NAN;
+    let mut s = slot_stock(0.5);
+    let diags = simulate(&program, &mut s).expect("simulate");
+    assert!(diags.iter().any(|d| d.msg.contains("non-finite")), "{diags:?}");
+}
+
+#[test]
+fn radius_60_arc_move_timing_for_the_report() {
+    // A quarter arc of radius 60 with a 5 mm tool, 4 mm deep, at h = 0.1 on a 140 mm square stock.
+    let mut s = Stock::new_box(Vec3::new(-70.0, -70.0, -10.0), Vec3::new(70.0, 70.0, 0.0), 0.1, 1 << 34).expect("stock");
+    let t = FlatTool::new(2.5, 10.0, Vec3::Z).expect("tool");
+    let arc = ArcFixedAxis::new(Vec3::new(60.0, 0.0, -4.0), Vec3::new(0.0, 60.0, -4.0), Vec3::new(0.0, 0.0, -4.0), Vec3::Z, true, 0, t).expect("arc");
+    let before = s.volume();
+    let t0 = Instant::now();
+    for piece in arc.revolutions() {
+        s.apply(&piece, 1).expect("cut");
+    }
+    let elapsed = t0.elapsed();
+    let removed = before - s.volume();
+    // A quarter annulus between radii 57.5 and 62.5, plus the two end caps (one full disc in all).
+    let analytic = 4.0 * (std::f64::consts::FRAC_PI_4 * (62.5f64.powi(2) - 57.5f64.powi(2)) + std::f64::consts::PI * 2.5 * 2.5);
+    eprintln!("R=60 quarter arc h=0.1: {elapsed:?}, removed {removed:.2}, analytic {analytic:.2}");
+    assert!((removed - analytic).abs() < 0.01 * analytic, "removed {removed} vs {analytic}");
 }

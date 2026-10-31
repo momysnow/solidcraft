@@ -10,8 +10,13 @@ use crate::toolpath::{Diag, MoveKind, Program, Shape};
 
 const MAX_DIAGS: usize = 1000;
 
+fn finite(p: &[f64; 3]) -> bool {
+    p.iter().all(|x| x.is_finite())
+}
+
 /// Cuts every move into `stock`, move `i` tagged `i + 1`. The first move and every `Jump` only set
-/// where the tool is. Returns what could not be simulated, one line per cause.
+/// where the tool is. An arc is cut one revolution at a time under the same tag. Returns what could
+/// not be simulated, one line per cause.
 pub fn simulate(program: &Program, stock: &mut Stock) -> Result<Vec<Diag>, SimError> {
     let mut diags: Vec<Diag> = Vec::new();
     let mut reported: Vec<(u32, &'static str)> = Vec::new();
@@ -27,6 +32,16 @@ pub fn simulate(program: &Program, stock: &mut Stock) -> Result<Vec<Diag>, SimEr
         let tag = u32::try_from(i + 1).map_err(|_| SimError::TooManyMoves { max: u32::MAX as usize })?;
         let Some(start) = start else { continue };
         if m.kind == MoveKind::Jump {
+            continue;
+        }
+        if !finite(&start) || !finite(&m.tip) {
+            push(&mut diags, m.tool, m.source, "finite", format!("non-finite position at line {} skipped", m.source));
+            continue;
+        }
+        if let MoveKind::Arc { centre, normal, .. } = &m.kind
+            && (!finite(centre) || !finite(normal))
+        {
+            push(&mut diags, m.tool, m.source, "finite", format!("non-finite arc at line {} skipped", m.source));
             continue;
         }
         let Some(tool) = program.tools.iter().find(|t| t.id == m.tool) else {
@@ -62,7 +77,16 @@ pub fn simulate(program: &Program, stock: &mut Stock) -> Result<Vec<Diag>, SimEr
                     continue;
                 }
                 match ArcFixedAxis::new(Vec3::from(start), Vec3::from(m.tip), Vec3::from(*centre), Vec3::from(*normal), *ccw, *turns, flat) {
-                    Some(arc) => stock.apply(&arc, tag),
+                    Some(arc) => {
+                        let mut result = Ok(());
+                        for piece in arc.revolutions() {
+                            result = stock.apply(&piece, tag);
+                            if result.is_err() {
+                                break;
+                            }
+                        }
+                        result
+                    }
                     None => {
                         push(&mut diags, m.tool, m.source, "arc", format!("degenerate arc at line {} skipped", m.source));
                         continue;
