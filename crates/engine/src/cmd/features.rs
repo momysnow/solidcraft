@@ -167,7 +167,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .icon("presspull")
         .key("Q")
         .params("face: [x,y,z] and distance: expr (positive adds material, negative cuts), or edges: [[x,y,z]…] and distance (a fillet)"),
-    CommandSpec::new("solid.move", "Move/Copy", move_bodies).at("SOLID", "MODIFY").icon("move").key("M").enabled(not_in_sketch).params("bodies: [names]; translate?: [x,y,z] (exprs or numbers); axis?: [x,y,z]; angle?: expr; copy?: bool (default false: keeps the original bodies and transforms a new copy instead of moving them in place)"),
+    CommandSpec::new("solid.move", "Move/Copy", move_bodies).at("SOLID", "MODIFY").icon("move").key("M").enabled(not_in_sketch).params("bodies: [names]; translate?: [x,y,z] (exprs or numbers); axis?: [x,y,z]; angle?: expr; copy?: bool (default false: keeps the original bodies and transforms a new copy instead of moving them in place); occurrences?: [occurrence paths, root first] (only with copy: each component is copied as an independent component, as Paste New copies it, and the copy moves by the same translate, axis and angle in the world; the reply lists the copies in occurrences)"),
 ];
 
 /// Where an extrude starts and which way is positive: a point inside the (first) profile or
@@ -1874,6 +1874,14 @@ fn copy_components(s: &mut Session, p: &Value, paths: Vec<Vec<u64>>) -> Result<V
     });
     let all = paths.clone();
     paths.retain(|p| !all.iter().any(|q| q.len() < p.len() && p.starts_with(q)));
+    // The bodies are given in the world; their own component's frame turns them, as a move of bodies
+    // alone is turned, so they are mapped the same way, before any copy is made.
+    let has_bodies = p.get("bodies").and_then(Value::as_array).is_some_and(|b| !b.is_empty());
+    let mut rest = p.clone();
+    if let Some(object) = rest.as_object_mut() {
+        object.remove("occurrences");
+    }
+    let bodies = has_bodies.then(|| crate::frames::to_local(s, cmd, &rest).unwrap_or_else(|| rest.clone()));
     let mut copies = Vec::new();
     for path in &paths {
         let Some(&source) = path.last() else { continue };
@@ -1894,17 +1902,13 @@ fn copy_components(s: &mut Session, p: &Value, paths: Vec<Vec<u64>>) -> Result<V
         mover.run_nested(s, &q)?;
         copies.push(copy);
     }
-    let mut out = json!({"occurrences": copies});
-    let has_bodies = p.get("bodies").and_then(Value::as_array).is_some_and(|b| !b.is_empty());
-    if has_bodies {
-        // The bodies are given in the world; their own component's frame turns them, as a move of
-        // bodies alone is turned, so they are mapped the same way here.
-        let mut rest = p.clone();
-        if let Some(object) = rest.as_object_mut() {
-            object.remove("occurrences");
-        }
-        let local = crate::frames::to_local(s, cmd, &rest).unwrap_or(rest);
-        out["bodies"] = move_body_feature(s, &local)?;
+    // The reply is a solid.move reply: the bodies' feature reply, with the copies made alongside.
+    let mut out = match bodies {
+        Some(local) => move_body_feature(s, &local)?,
+        None => json!({}),
+    };
+    if let Some(object) = out.as_object_mut() {
+        object.insert("occurrences".into(), json!(copies));
     }
     Ok(out)
 }

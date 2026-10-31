@@ -244,9 +244,23 @@ fn bodies_and_a_component_copied_together_are_one_undo_step() {
     let count = s.model.state().bodies.len();
     let reply = run(&mut s, "solid.move", json!({"bodies": ["Top"], "occurrences": [[occurrence]], "copy": true, "translate": [50, 0, 0]}));
     assert_eq!(reply["occurrences"].as_array().map(Vec::len), Some(1));
+    assert!(reply.get("feature").is_some(), "the reply is a solid.move reply: the body feature's, with the copies alongside");
     assert_eq!(s.model.state().bodies.len(), count + 2, "a copy of the body and of the component");
     run(&mut s, "edit.undo", json!({}));
     assert_eq!(s.doc, before, "one undo removes both copies");
+}
+
+#[test]
+fn a_copy_that_fails_part_way_changes_nothing() {
+    let mut s = Session::default();
+    let (_, occurrence) = part_with_cube(&mut s);
+    let before = s.doc.clone();
+    let undo = s.undo.len();
+    // The first component copies; the second names no occurrence, so the whole move is refused.
+    let error = s.execute("solid.move", &json!({"bodies": [], "occurrences": [[occurrence], [999_999]], "copy": true, "translate": [50, 0, 0]}));
+    assert!(error.is_err());
+    assert_eq!(s.doc, before, "the first copy is rolled back with the rest");
+    assert_eq!(s.undo.len(), undo, "a refused move leaves no undo step");
 }
 
 #[test]
