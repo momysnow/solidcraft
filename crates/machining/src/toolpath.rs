@@ -34,6 +34,9 @@ pub struct Move {
 pub enum MoveKind {
     Rapid,
     Feed,
+    /// The tool is placed at `tip` without cutting: the path from where it was is not known (after
+    /// G28 or G30). The next move starts from `tip`.
+    Jump,
     /// A circular or helical arc from the previous tip to `tip`, about `centre` with `normal`
     /// (seen from its tip, counter-clockwise when `ccw`). `turns` counts whole extra revolutions
     /// on top of the arc itself; the G-code subset always writes 0.
@@ -76,24 +79,31 @@ pub enum Shape {
     Profile(Vec<[f64; 2]>),
 }
 
-/// A problem found while reading a program. The message starts with `error: ` or `warning: `.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Severity {
+    Error,
+    Warning,
+}
+
+/// A problem found while reading or simulating a program. `col` is 0 when unknown.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Diag {
     pub line: u32,
     pub col: u32,
+    pub severity: Severity,
     pub msg: String,
 }
 
 impl Diag {
-    pub fn error(line: u32, col: u32, msg: impl AsRef<str>) -> Diag {
-        Diag { line, col, msg: format!("error: {}", msg.as_ref()) }
+    pub fn error(line: u32, col: u32, msg: impl Into<String>) -> Diag {
+        Diag { line, col, severity: Severity::Error, msg: msg.into() }
     }
 
-    pub fn warning(line: u32, col: u32, msg: impl AsRef<str>) -> Diag {
-        Diag { line, col, msg: format!("warning: {}", msg.as_ref()) }
+    pub fn warning(line: u32, col: u32, msg: impl Into<String>) -> Diag {
+        Diag { line, col, severity: Severity::Warning, msg: msg.into() }
     }
 
     pub fn is_error(&self) -> bool {
-        self.msg.starts_with("error: ")
+        self.severity == Severity::Error
     }
 }

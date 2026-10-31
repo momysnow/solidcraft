@@ -23,4 +23,7 @@ pub enum SimError {
     SegmentCap { max: usize },
     #[error("more than {max} moves")]
     TooManyMoves { max: usize },
+    /// A cut failed at move `index` (0-based), from G-code line or CAM op `line`.
+    #[error("move {index} (line {line}): {cause}")]
+    AtMove { index: usize, line: u32, cause: String },
 }

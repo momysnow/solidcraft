@@ -7,11 +7,14 @@ use crate::SimError;
 use crate::gcode::{CodeTable, parse};
 use crate::sim::simulate;
 use crate::sweep::{ArcFixedAxis, FlatTool, LinearFixedAxis};
-use crate::toolpath::{Diag, Shape, Tool};
+use crate::toolpath::{Program, Shape, Tool};
 
 const R: f64 = 2.5;
 const L: f64 = 20.0;
 const BUDGET: u64 = 1 << 32;
+/// Volume tolerance as a fraction of perimeter times h times depth. A midpoint sample that lands on a
+/// wall loses half a ray row: at h = 0.2 that is about 0.29 of this bound for the test slot.
+const TOL_FACTOR: f64 = 0.3;
 
 fn tool() -> FlatTool {
     FlatTool::new(R, L, Vec3::Z).expect("valid tool")
@@ -34,6 +37,11 @@ fn box_volume() -> f64 {
     60.0 * 20.0 * 10.0
 }
 
+/// A stored coordinate of a ray, converted back to the stock's absolute coordinates.
+fn abs(s: &Stock, axis: usize, stored: f32) -> f64 {
+    f64::from(stored) + s.min[axis]
+}
+
 #[test]
 fn slot_floor_is_exact_on_every_interior_z_ray() {
     let mut s = slot_stock(0.2);
@@ -46,12 +54,14 @@ fn slot_floor_is_exact_on_every_interior_z_ray() {
             let segs = s.ray_segs(2, iu, iv);
             if x > 10.5 && x < 49.5 && (y - 10.0).abs() < 2.0 {
                 assert_eq!(segs.len(), 1, "one interval left at ({x}, {y})");
-                assert!((f64::from(segs[0].hi) + 4.0).abs() < 1e-5, "floor {} at ({x}, {y})", segs[0].hi);
+                let floor = abs(&s, 2, segs[0].hi);
+                assert!((floor + 4.0).abs() < 1e-5, "floor {floor} at ({x}, {y})");
                 assert_eq!(segs[0].hi_tag, 1, "the cut made the floor");
                 assert_eq!(segs[0].lo_tag, 0, "the bottom is still the stock face");
                 checked += 1;
             } else if x < 4.0 || x > 56.0 {
-                assert_eq!(segs[0].hi, 0.0, "the top is untouched far from the slot");
+                let top = abs(&s, 2, segs[0].hi);
+                assert!(top.abs() < 1e-6, "the top is untouched far from the slot: {top}");
             }
         }
     }
@@ -59,8 +69,52 @@ fn slot_floor_is_exact_on_every_interior_z_ray() {
 }
 
 #[test]
+fn slot_walls_are_exact_on_x_and_y_rays() {
+    let mut s = slot_stock(0.2);
+    s.apply(&slot(), 1).expect("cut");
+    let n = s.cell_counts();
+    // X rays (grid 0, indexed by y then z): the stadium chord at each y, clear of the walls.
+    let mut x_checked = 0;
+    for iy in 0..n[1] {
+        for iz in 0..n[2] {
+            let (y, z) = (s.pos(1, iy as i64), s.pos(2, iz as i64));
+            let dy = (y - 10.0).abs();
+            if dy > 0.05 && dy < R - 0.05 && z > -3.5 && z < -0.5 {
+                let h = (R * R - dy * dy).sqrt();
+                let segs = s.ray_segs(0, iy, iz);
+                assert_eq!(segs.len(), 2, "two material pieces at ({y}, {z})");
+                assert!((abs(&s, 0, segs[0].lo) - 0.0).abs() < 1e-5);
+                assert!((abs(&s, 0, segs[0].hi) - (10.0 - h)).abs() < 1e-5, "left wall at y={y}");
+                assert!((abs(&s, 0, segs[1].lo) - (50.0 + h)).abs() < 1e-5, "right wall at y={y}");
+                assert!((abs(&s, 0, segs[1].hi) - 60.0).abs() < 1e-5);
+                x_checked += 1;
+            }
+        }
+    }
+    assert!(x_checked > 100, "X rays checked: {x_checked}");
+    // Y rays (grid 1, indexed by z then x): the walls are at y = 7.5 and 12.5 for x inside the slot.
+    let mut y_checked = 0;
+    for iz in 0..n[2] {
+        for ix in 0..n[0] {
+            let (x, z) = (s.pos(0, ix as i64), s.pos(2, iz as i64));
+            if x > 10.5 && x < 49.5 && z > -3.5 && z < -0.5 {
+                let segs = s.ray_segs(1, iz, ix);
+                assert_eq!(segs.len(), 2, "two material pieces at ({x}, {z})");
+                assert!((abs(&s, 1, segs[0].hi) - 7.5).abs() < 1e-5, "near wall at x={x}");
+                assert!((abs(&s, 1, segs[1].lo) - 12.5).abs() < 1e-5, "far wall at x={x}");
+                y_checked += 1;
+            }
+        }
+    }
+    assert!(y_checked > 100, "Y rays checked: {y_checked}");
+}
+
+#[test]
 fn slot_volume_converges_to_the_analytic_depth_times_stadium() {
     let analytic_removed = slot_volume_analytic();
+    // A 0.1 mm error in the tool radius moves the removed volume by about 38 mm^3 for this slot,
+    // so the tolerance (a quarter of perimeter times h times depth) is well below that.
+    let perimeter = 2.0 * 40.0 + 2.0 * std::f64::consts::PI * R;
     let mut errs = Vec::new();
     for h in [0.2, 0.1, 0.05] {
         let mut s = slot_stock(h);
@@ -68,14 +122,25 @@ fn slot_volume_converges_to_the_analytic_depth_times_stadium() {
         let removed = box_volume() - s.volume();
         let err = (removed - analytic_removed).abs();
         eprintln!("slot h={h}: removed {removed:.4}, analytic {analytic_removed:.4}, error {err:.4}");
-        errs.push(err);
+        errs.push((h, err, TOL_FACTOR * perimeter * h * 4.0));
     }
-    // The error is bounded by the perimeter times h times depth, and it does not grow as h falls.
+    for (h, err, tol) in &errs {
+        assert!(err <= tol, "h={h}: error {err} over {tol}");
+    }
+    assert!(errs[1].1 < errs[0].1 && errs[2].1 < errs[1].1, "error falls as h halves: {errs:?}");
+}
+
+#[test]
+fn a_slightly_smaller_tool_fails_the_volume_check() {
+    // A 0.1 mm radius error changes the removed volume by more than the h = 0.1 tolerance.
     let perimeter = 2.0 * 40.0 + 2.0 * std::f64::consts::PI * R;
-    for (err, h) in errs.iter().zip([0.2, 0.1, 0.05]) {
-        assert!(*err <= perimeter * h * 4.0, "h={h}: error {err}");
-    }
-    assert!(errs[2] <= errs[0] + 1e-9, "{errs:?}");
+    let tol = TOL_FACTOR * perimeter * 0.1 * 4.0;
+    let smaller = FlatTool::new(R - 0.1, L, Vec3::Z).expect("tool");
+    let sweep = LinearFixedAxis { from: slot().from, to: slot().to, tool: smaller };
+    let mut s = slot_stock(0.1);
+    s.apply(&sweep, 1).expect("cut");
+    let err = (box_volume() - s.volume() - slot_volume_analytic()).abs();
+    assert!(err > tol, "a 0.1 mm radius error gave {err}, under the tolerance {tol}");
 }
 
 fn pocket_program() -> Vec<crate::toolpath::Move> {
@@ -83,8 +148,8 @@ fn pocket_program() -> Vec<crate::toolpath::Move> {
     parse(text, &CodeTable::default()).moves
 }
 
-fn run_pocket(s: &mut Stock) -> Vec<Diag> {
-    let program = crate::toolpath::Program { tools: vec![flat_tool(0)], moves: pocket_program(), diags: Vec::new() };
+fn run_pocket(s: &mut Stock) -> Vec<crate::toolpath::Diag> {
+    let program = Program { tools: vec![flat_tool(0)], moves: pocket_program(), diags: Vec::new() };
     simulate(&program, s).expect("simulate")
 }
 
@@ -103,7 +168,7 @@ fn circular_pocket_from_g3_arcs_matches_the_analytic_volume() {
     let err = (removed - analytic).abs();
     eprintln!("pocket h=0.2: removed {removed:.3}, analytic {analytic:.3}, error {err:.3}");
     let perimeter = 2.0 * std::f64::consts::PI * 10.0;
-    assert!(err <= perimeter * 0.2 * 4.0, "error {err}");
+    assert!(err <= TOL_FACTOR * perimeter * 0.2 * 4.0, "error {err}");
 }
 
 #[test]
@@ -141,6 +206,18 @@ fn stock_refuses_bad_sizes_and_budgets() {
 }
 
 #[test]
+fn budget_is_enforced_as_cuts_split_rays() {
+    // A 1 mm cube at h = 1 is 3 rays of 20 bytes. A cut that splits a ray adds bytes, so a budget
+    // with only 8 bytes to spare refuses it, and the stock is unchanged.
+    let mut s = Stock::new_box(Vec3::ZERO, Vec3::new(1.0, 1.0, 1.0), 1.0, 60 + 8).expect("stock fits");
+    let hole =
+        LinearFixedAxis { from: Vec3::new(0.5, 0.5, 0.4), to: Vec3::new(0.5, 0.5, 0.401), tool: FlatTool::new(0.1, 0.001, Vec3::Z).expect("tool") };
+    let (segs, hash) = (s.segments(), s.state_hash());
+    assert!(matches!(s.apply(&hole, 1), Err(SimError::Budget { .. })));
+    assert_eq!((s.segments(), s.state_hash()), (segs, hash));
+}
+
+#[test]
 fn too_many_segments_is_an_error_and_leaves_the_stock_alone() {
     let mut s = Stock::new_box(Vec3::new(0.0, 0.0, -10.0), Vec3::new(1.0, 1.0, 0.0), 1.0, BUDGET).expect("stock");
     let mut failed = false;
@@ -172,7 +249,7 @@ fn bad_sweep_bounds_do_not_panic() {
     let mut s = slot_stock(0.5);
     let nan = LinearFixedAxis { from: Vec3::new(f64::NAN, 0.0, 0.0), to: Vec3::new(1.0, 1.0, 1.0), tool: tool() };
     assert!(s.apply(&nan, 1).is_ok());
-    assert_eq!(s.volume(), box_volume());
+    assert!((s.volume() - box_volume()).abs() < 1e-6);
 }
 
 #[test]
@@ -180,13 +257,27 @@ fn g_code_slot_simulates_to_the_analytic_floor() {
     let text = "G0 X10 Y10 Z5\nG1 Z-4 F100\nG1 X50\nG0 Z5\nG0 X10 Y10";
     let program = parse(text, &CodeTable::default());
     assert!(program.diags.is_empty());
-    let program = crate::toolpath::Program { tools: vec![flat_tool(0)], ..program };
+    let program = Program { tools: vec![flat_tool(0)], ..program };
     let mut s = slot_stock(0.2);
     let diags = simulate(&program, &mut s).expect("simulate");
     assert!(diags.is_empty(), "{diags:?}");
     let removed = box_volume() - s.volume();
-    // The plunge at the slot end and the rapids above the stock add nothing beyond the slot.
-    assert!((removed - slot_volume_analytic()).abs() < 15.0, "removed {removed}");
+    assert!((removed - slot_volume_analytic()).abs() < TOL_FACTOR * (2.0 * 40.0 + 2.0 * std::f64::consts::PI * R) * 0.2 * 4.0, "removed {removed}");
+}
+
+#[test]
+fn a_jump_after_home_is_not_cut_and_the_next_move_starts_from_it() {
+    // Home is unknown: the move after G28 starts a new path, so the travel to it is not cut.
+    let text = "G0 X10 Y10 Z5\nG1 Z-4 F100\nG1 X20\nG28\nG0 X30 Y10 Z5\nG1 X40 Y10 Z-4";
+    let program = parse(text, &CodeTable::default());
+    assert!(program.diags.iter().all(|d| !d.is_error()), "{:?}", program.diags);
+    let program = Program { tools: vec![flat_tool(0)], ..program };
+    // Moves: rapid, feed, feed, then the rapid after G28 (G28 itself makes no move).
+    let jump = program.moves.iter().position(|m| m.kind == crate::toolpath::MoveKind::Jump).expect("a jump");
+    assert_eq!(jump, 3, "the rapid after G28 is a jump");
+    let mut s = slot_stock(0.2);
+    let diags = simulate(&program, &mut s).expect("simulate");
+    assert!(diags.is_empty(), "{diags:?}");
 }
 
 #[test]
@@ -199,7 +290,7 @@ fn unsupported_shapes_are_reported_once_not_panicked() {
     let diags = simulate(&program, &mut s).expect("simulate");
     assert_eq!(diags.len(), 1, "{diags:?}");
     assert!(diags[0].msg.contains("not simulated yet"));
-    assert_eq!(s.volume(), box_volume());
+    assert!((s.volume() - box_volume()).abs() < 1e-6);
 }
 
 #[test]
@@ -208,6 +299,49 @@ fn undefined_tool_is_reported() {
     let mut s = slot_stock(0.5);
     let diags = simulate(&program, &mut s).expect("simulate");
     assert!(diags.iter().any(|d| d.msg.contains("not defined")), "{diags:?}");
+}
+
+#[test]
+fn a_failing_cut_names_its_move() {
+    let mut s = Stock::new_box(Vec3::new(0.0, 0.0, -10.0), Vec3::new(1.0, 1.0, 0.0), 1.0, BUDGET).expect("stock");
+    let mut moves = Vec::new();
+    for k in 0..400 {
+        let z = -9.9 + 0.03 * f64::from(k);
+        moves.push(crate::toolpath::Move {
+            kind: crate::toolpath::MoveKind::Jump,
+            tip: [0.5, 0.5, z + 0.001],
+            axis: [0.0, 0.0, 1.0],
+            joints: None,
+            interp: crate::toolpath::Interp::Tcp,
+            tool: 0,
+            feed: 1.0,
+            spindle: 0.0,
+            source: 100 + k as u32,
+        });
+        moves.push(crate::toolpath::Move {
+            kind: crate::toolpath::MoveKind::Feed,
+            tip: [0.5, 0.5, z],
+            axis: [0.0, 0.0, 1.0],
+            joints: None,
+            interp: crate::toolpath::Interp::Tcp,
+            tool: 0,
+            feed: 0.0,
+            spindle: 0.0,
+            source: 100 + k as u32,
+        });
+    }
+    let program = Program {
+        tools: vec![Tool { id: 0, shape: Shape::Flat, diameter: 0.2, flute_length: 0.001, shank: Vec::new(), holder: Vec::new(), stickout: 30.0 }],
+        moves,
+        diags: Vec::new(),
+    };
+    match simulate(&program, &mut s) {
+        Err(SimError::AtMove { index, line, cause }) => {
+            assert!(index > 0 && line >= 100, "index {index} line {line}");
+            assert!(cause.contains("segments"), "{cause}");
+        }
+        other => panic!("expected a named failure, got {other:?}"),
+    }
 }
 
 #[test]

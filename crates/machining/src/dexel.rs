@@ -75,6 +75,14 @@ pub struct Stock {
     cell: [f64; 3],
     n: [usize; 3],
     grids: [Grid; 3],
+    /// Bytes the grids take (tiles counted as if none were shared), and the budget they must fit.
+    used: u64,
+    budget: u64,
+}
+
+/// Bytes of a tile's contents: a segment is 16 bytes, a start 4.
+fn tile_bytes(tile: &Tile) -> u64 {
+    (tile.segs.len() as u64) * 16 + (tile.start.len() as u64) * 4
 }
 
 impl Stock {
@@ -111,7 +119,7 @@ impl Stock {
             return Err(SimError::Budget { need, budget: budget_bytes });
         }
         let grids = [build_grid(0, &n, &lo, &hi), build_grid(1, &n, &lo, &hi), build_grid(2, &n, &lo, &hi)];
-        Ok(Stock { min: lo, max: hi, cell, n, grids })
+        Ok(Stock { min: lo, max: hi, cell, n, grids, used: need, budget: budget_bytes })
     }
 
     /// Cuts the stock with a sweep. Only rays the sweep can reach are visited. `tag` is recorded on
@@ -159,7 +167,14 @@ impl Stock {
                             }
                             out.clear();
                             sweep.ray(Vec3::from(o), Vec3::from(d), (self.min[a], self.max[a]), &mut out);
-                            let kept: Vec<(f64, f64)> = out.iter().copied().filter(|(x, y)| x.is_finite() && y.is_finite() && y > x).collect();
+                            // Stored coordinates are relative to the stock's minimum on each axis.
+                            let base = self.min[a];
+                            let kept: Vec<(f64, f64)> = out
+                                .iter()
+                                .copied()
+                                .filter(|(x, y)| x.is_finite() && y.is_finite() && y > x)
+                                .map(|(x, y)| (x - base, y - base))
+                                .collect();
                             if !kept.is_empty() {
                                 cuts.push((lv * w + lu, kept));
                             }
@@ -172,12 +187,31 @@ impl Stock {
                 }
             }
         }
+        // The byte total must still fit the budget; checked before anything is committed.
+        let mut added = 0u64;
+        let mut removed = 0u64;
+        for (a, tidx, tile) in &staged {
+            added = added.saturating_add(tile_bytes(tile));
+            if let Some(old) = self.grids[*a].tiles.get(*tidx) {
+                removed = removed.saturating_add(tile_bytes(old));
+            }
+        }
+        let used = self.used.saturating_add(added).saturating_sub(removed);
+        if used > self.budget {
+            return Err(SimError::Budget { need: used, budget: self.budget });
+        }
         for (a, tidx, tile) in staged {
             if let Some(slot) = self.grids[a].tiles.get_mut(tidx) {
                 *slot = Arc::new(tile);
             }
         }
+        self.used = used;
         Ok(())
+    }
+
+    /// Bytes the grids take now, against the budget they were created with.
+    pub fn memory(&self) -> (u64, u64) {
+        (self.used, self.budget)
     }
 
     /// Material volume in mm^3: the average of the three grids' estimates (each is the sum of its
@@ -264,7 +298,7 @@ impl Stock {
         if !(real(nu, self.n_of(u)) && real(nv, self.n_of(v))) {
             return None;
         }
-        let (t0, t1) = (self.pos(axis, na), self.pos(axis, na + 1));
+        let (t0, t1) = (self.rel(axis, self.pos(axis, na)), self.rel(axis, self.pos(axis, na + 1)));
         let mut best: Option<f64> = None;
         for s in self.ray_segs(axis, nu as usize, nv as usize) {
             for b in [f64::from(s.lo), f64::from(s.hi)] {
@@ -273,7 +307,7 @@ impl Stock {
                 }
             }
         }
-        let t = best.unwrap_or(0.5 * (t0 + t1));
+        let t = self.min[axis] + best.unwrap_or(0.5 * (t0 + t1));
         let mut p = [0.0f64; 3];
         if let Some(x) = p.get_mut(axis) {
             *x = t;
@@ -291,7 +325,13 @@ impl Stock {
         self.n.get(k).copied().unwrap_or(0) as i64
     }
 
+    /// A coordinate along `axis` in the stored frame (relative to the stock minimum).
+    fn rel(&self, axis: usize, t: f64) -> f64 {
+        t - self.min.get(axis).copied().unwrap_or(0.0)
+    }
+
     fn contains(&self, axis: usize, iu: usize, iv: usize, t: f64) -> bool {
+        let t = self.rel(axis, t);
         self.ray_segs(axis, iu, iv).iter().any(|s| f64::from(s.lo) <= t && t <= f64::from(s.hi))
     }
 
@@ -333,7 +373,9 @@ fn build_grid(axis: usize, n: &[usize; 3], lo: &[f64; 3], hi: &[f64; 3]) -> Grid
     let (u, v) = ((axis + 1) % 3, (axis + 2) % 3);
     let (nu, nv) = (n_at(n, u), n_at(n, v));
     let (tu, tv) = (nu.div_ceil(TILE), nv.div_ceil(TILE));
-    let (a_lo, a_hi) = (lo.get(axis).copied().unwrap_or(0.0) as f32, hi.get(axis).copied().unwrap_or(0.0) as f32);
+    // The axis runs from 0 to its length in stored coordinates, so f32 keeps the offsets exact.
+    let length = hi.get(axis).copied().unwrap_or(0.0) - lo.get(axis).copied().unwrap_or(0.0);
+    let (a_lo, a_hi) = (0.0f32, length as f32);
     let mut cache: Vec<((usize, usize), Arc<Tile>)> = Vec::new();
     let mut tiles = Vec::with_capacity(tu * tv);
     for tvi in 0..tv {

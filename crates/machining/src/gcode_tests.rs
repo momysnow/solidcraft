@@ -170,22 +170,89 @@ fn block_delete_skips_only_when_enabled() {
 
 #[test]
 fn dwell_offsets_and_stops_are_accepted_silently() {
-    let p = run("G4 P1\nG54 G1 X1\nG55 G0 X2\nG17 G80 G40 G49\nM0\nM1\nM2\nM7 M8 M9\nM30");
+    let p = run("G4 P1\nG54 G1 X1\nG55 G0 X2\nG17 G80 G40 G49\nM0\nM1\nM7 M8 M9\nM30");
     assert!(p.diags.is_empty(), "{:?}", p.diags);
     assert_eq!(p.moves.len(), 2);
 }
 
 #[test]
+fn dwell_takes_its_x_word_as_a_time_and_makes_no_move() {
+    // Fanuc-style G4 X1.5 is a dwell in seconds, not a move.
+    let p = run("G1 X1\nG4 X1.5\nG4 P2");
+    assert!(p.diags.is_empty(), "{:?}", p.diags);
+    assert_eq!(p.moves.len(), 1);
+}
+
+#[test]
+fn position_is_unknown_after_home_so_the_next_move_is_a_jump() {
+    let p = run("G1 X10\nG28\nG0 X20 Y20 Z5\nG1 X30");
+    assert!(errors(&p).is_empty(), "{:?}", p.diags);
+    assert_eq!(p.moves.len(), 3);
+    assert!(matches!(p.moves[1].kind, MoveKind::Jump), "{:?}", p.moves[1]);
+    assert!(matches!(p.moves[2].kind, MoveKind::Feed));
+    assert_close(p.moves[2].tip, [30.0, 20.0, 5.0]);
+    // A relative move from the unknown home is an error, not a guess.
+    let q = run("G28\nG91 X1");
+    assert!(errors(&q).iter().any(|d| d.msg.contains("position is unknown")), "{:?}", q.diags);
+}
+
+#[test]
+fn arc_turns_come_from_p_and_are_capped() {
+    let p = run("G1 X10 Y0\nG3 X0 Y10 I-10 J0 P2");
+    match &p.moves[1].kind {
+        MoveKind::Arc { turns, .. } => assert_eq!(*turns, 2),
+        other => panic!("{other:?}"),
+    }
+    let q = run("G1 X10 Y0\nG3 X0 Y10 I-10 J0 P1001");
+    assert!(errors(&q).iter().any(|d| d.msg.contains("turns over")), "{:?}", q.diags);
+    assert_eq!(q.moves.len(), 1);
+}
+
+#[test]
+fn canned_cycle_error_ignores_axis_words_until_g80() {
+    let p = run("G1 X1\nG81 X1 Y1 R1 Z-1\nX2 Y2\nG80\nG1 X3");
+    let e = errors(&p);
+    assert!(e.iter().any(|d| d.msg.contains("canned")), "{:?}", p.diags);
+    assert!(e.iter().any(|d| d.msg.contains("axis words are ignored")), "{:?}", p.diags);
+    // Only the first and the last feed are moves; the hole lines are not.
+    assert_eq!(p.moves.len(), 2, "{:?}", p.moves);
+    assert_close(p.moves[1].tip, [3.0, 0.0, 0.0]);
+}
+
+#[test]
+fn arc_block_without_words_moves_nothing() {
+    let p = run("G1 X1\nG2 F200\nG3 M9\nG2 T2 M6");
+    assert!(errors(&p).is_empty(), "{:?}", p.diags);
+    assert_eq!(p.moves.len(), 1);
+}
+
+#[test]
+fn rounded_semicircle_is_accepted_by_the_r_form() {
+    // The end point is 0.001 mm short of the diameter: inside the 0.002 mm tolerance.
+    let p = run("G1 X0 Y0\nG3 Y10.001 R5");
+    assert!(errors(&p).is_empty(), "{:?}", p.diags);
+    assert_eq!(p.moves.len(), 2);
+}
+
+#[test]
+fn text_after_m30_is_ignored_with_one_warning() {
+    let p = run("G1 X1\nM30\nG1 X2\nG1 X3\n%");
+    assert_eq!(p.moves.len(), 1);
+    assert_eq!(warnings(&p).iter().filter(|d| d.msg.contains("after M2 or M30")).count(), 1, "{:?}", p.diags);
+}
+
+#[test]
 fn warnings_for_cutter_compensation_home_and_tool_length() {
-    let p = run("G41 G1 X1\nG42 X2\nG43 H1 G1 X3\nG28\nG30 G0 X5\nM10");
+    let p = run("G41 G1 X1\nG42 X2\nG43 H1 G1 X3\nG28\nG0 X5 Y5 Z5\nM10");
     assert!(errors(&p).is_empty(), "{:?}", p.diags);
     let w = warnings(&p);
     assert!(w.iter().any(|d| d.msg.contains("cutter compensation")));
     assert!(w.iter().any(|d| d.msg.contains("G28")));
     assert!(w.iter().any(|d| d.msg.contains("tool length")));
     assert!(w.iter().any(|d| d.msg.contains("M10")));
-    // G41 and G42 still move: the path is shown uncompensated.
-    assert_eq!(p.moves.len(), 3);
+    // G41 and G42 still move: the path is shown uncompensated. The move after G30 is a jump.
+    assert_eq!(p.moves.len(), 4);
+    assert!(matches!(p.moves[3].kind, MoveKind::Jump));
     assert_eq!(w.iter().filter(|d| d.msg.contains("cutter")).count(), 2);
     assert!(w.iter().all(|d| d.line > 0));
 }
@@ -197,7 +264,7 @@ fn errors_have_line_and_column() {
     assert_eq!(e.len(), 1, "{:?}", p.diags);
     assert_eq!(e[0].line, 2);
     assert_eq!(e[0].col, 9);
-    assert!(e[0].msg.starts_with("error: variables"));
+    assert!(e[0].msg.starts_with("variables"));
     assert_eq!(p.moves.len(), 1);
 }
 
