@@ -356,6 +356,36 @@ fn one_undo_restores_the_old_sides() {
     assert!(near(place(&s, "B", Vec3::new(25.0, 5.0, 0.0)), Vec3::new(5.0, 5.0, 10.0)));
 }
 
+/// Moving a side re-solves the joint as joint.create would at the same pose: the turn B keeps
+/// about the joint's axis follows its new origin, so B does not turn by a half turn (or any turn
+/// a fresh create would not give). Both designs start from the same pose; one moves the side,
+/// the other deletes the joint and creates it with the new sides.
+#[test]
+fn moving_a_side_places_the_part_as_create_would() {
+    let a_faces = [[5, 5, 10], [5, 0, 5], [5, 10, 5], [10, 5, 5], [0, 5, 5]];
+    let b_faces = [[25, 5, 0], [25, 5, 10], [25, 0, 5], [25, 10, 5], [20, 5, 5], [30, 5, 5]];
+    // A point of B off the axes of every face above.
+    let probe = |s: &Session| place(s, "B", Vec3::new(22.0, 3.0, 7.0));
+    let mut differ = Vec::new();
+    for a in a_faces {
+        for b in b_faces {
+            let mut edited = two_cubes();
+            run(&mut edited, "joint.create", json!({"type": "rigid", "name": "J", "a": {"face": [5, 5, 10]}, "b": {"face": [25, 5, 0]}}));
+            let mut created = Session::new(solidcraft_doc::Document::from_json(&edited.doc.to_json()).unwrap());
+            // The new sides in world coordinates, where B is before the move.
+            let (aw, bw) = (Vec3::new(a[0] as f64, a[1] as f64, a[2] as f64), place(&edited, "B", Vec3::new(b[0] as f64, b[1] as f64, b[2] as f64)));
+            let side = |occurrence: &str, p: Vec3| json!({"occurrence": occurrence, "face": [p.x, p.y, p.z]});
+            run(&mut edited, "joint.edit", json!({"joint": "J", "a": side("A", aw), "b": side("B", bw)}));
+            run(&mut created, "joint.delete", json!({"joint": "J"}));
+            run(&mut created, "joint.create", json!({"type": "rigid", "name": "J", "a": side("A", aw), "b": side("B", bw)}));
+            if !near(probe(&edited), probe(&created)) {
+                differ.push((a, b, probe(&edited), probe(&created)));
+            }
+        }
+    }
+    assert!(differ.is_empty(), "moved sides place B differently from create: {differ:?}");
+}
+
 /// A side that makes no joint is refused, and the joint is left as it was: a side on the other
 /// side's component, a side that is not a joint origin, an unknown occurrence.
 #[test]

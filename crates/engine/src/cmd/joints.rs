@@ -1428,6 +1428,17 @@ fn edit(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(x) = bool_(p, "suppressed") {
         suppress_joints(s.doc_mut(), &[id], x);
     }
+    // A side moved without an angle turns B as joint.create would: the least turn from where it
+    // is now (a relation's angle is its tilt, which stays).
+    if sides
+        && p.get("angle").is_none()
+        && let Some(j) = s.doc.assembly.joints.iter().find(|j| j.id == id).filter(|j| !j.kind.is_relation()).cloned()
+    {
+        let turn = joints::least_turn_angle(&s.doc, &s.model.state(), &j);
+        if let Some(j) = s.doc_mut().assembly.joints.iter_mut().find(|j| j.id == id) {
+            j.angle = turn;
+        }
+    }
     // A relation whose type, offset, tilt or flip changes starts again from where its parts are.
     let reseat = kind.is_some() || offset.is_some() || angle.is_some() || p.get("flip").is_some() || sides;
     if reseat {
