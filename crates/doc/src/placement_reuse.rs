@@ -120,6 +120,7 @@ fn same_geometry_inputs(a: &Document, b: &Document) -> bool {
         components,
         occurrences: _,
         assembly: _,
+        cam: _,
         sheet,
         plastic,
         parts,

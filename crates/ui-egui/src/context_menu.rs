@@ -759,9 +759,10 @@ fn manufacture_viewport_items(app: &SolveApp) -> Vec<Item> {
     let has_bodies = !app.session.world_state().bodies.is_empty();
     let sel_body = sel_bodies(app).into_iter().next();
     let has_sel = !app.session.selection.is_empty();
+    let key = crate::keymap::display_for(app, "edit.repeat").unwrap_or_default();
     let repeat = match &app.last_command {
-        Some((_, label)) => act("ui.repeat", &format!("Repeat {label}"), "redo").key(crate::keymap::REPEAT_KEY),
-        None => act("ui.repeat", "Repeat", "redo").key(crate::keymap::REPEAT_KEY).on(false),
+        Some((_, label)) => act("ui.repeat", &format!("Repeat {label}"), "redo").key(&key),
+        None => act("ui.repeat", "Repeat", "redo").key(&key).on(false),
     };
     vec![
         act("ui.ok", "OK", "finish").key("Return").on(setup_open),
