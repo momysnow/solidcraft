@@ -19,7 +19,7 @@
 //! shortcut: a group's vertex is the mean of its crossings, so sharp edges are rounded by up to one
 //! cell size; upgrade to a QEF with the tags' normals in S8.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 
 use solidcraft_geom::{Mesh, Vec3};
 
@@ -53,7 +53,7 @@ impl Lattice for Stock {
 }
 
 /// Chunks along each axis: the nodes run from `-1` to `n`, so `n + 2` of them.
-fn chunk_counts<L: Lattice>(lat: &L) -> [i64; 3] {
+pub(crate) fn chunk_counts<L: Lattice>(lat: &L) -> [i64; 3] {
     lat.cell_counts().map(|x| (x - LOWEST + 1 + CHUNK - 1) / CHUNK)
 }
 
@@ -84,40 +84,37 @@ pub fn chunk_mesh(stock: &Stock, idx: [usize; 3]) -> Option<Mesh> {
     chunk_mesh_of(stock, idx.map(|x| x as i64))
 }
 
-/// The chunks whose surface can change after the tiles in [`Stock::dirty_tiles`] were cut. A tile
-/// changes the nodes whose rays it holds, so the chunks near those nodes are dirty: a tile's chunks
-/// are the ones at its position, two either side, and every chunk along the tile's own axis.
+/// The chunks whose surface may have changed since the last [`Stock::clear_dirty`]: each once. A cut
+/// records them as it applies (see [`chunks_for_nodes`]), so a small cut in a large stock marks only
+/// the chunks near it.
 pub fn dirty_chunks(stock: &Stock) -> Vec<[usize; 3]> {
-    let counts = chunk_counts(stock);
-    let mut set: BTreeSet<[usize; 3]> = BTreeSet::new();
-    for &(a, tidx) in stock.dirty_tiles() {
-        let (u, v) = ((a + 1) % 3, (a + 2) % 3);
-        let (tu, tv) = stock.tile_coords(a, tidx);
-        let span = |k: usize, centre: i64| -> Vec<i64> {
-            let (lo, hi) = if k == a { (0, counts[k] - 1) } else { ((centre - 2).max(0), (centre + 2).min(counts[k] - 1)) };
-            (lo..=hi).collect()
-        };
-        let ranges: [Vec<i64>; 3] = std::array::from_fn(|k| {
-            let centre = if k == u {
-                tu as i64
-            } else if k == v {
-                tv as i64
-            } else {
-                0
-            };
-            span(k, centre)
-        });
-        for &x in &ranges[0] {
-            for &y in &ranges[1] {
-                for &z in &ranges[2] {
-                    if x >= 0 && y >= 0 && z >= 0 && x < counts[0] && y < counts[1] && z < counts[2] {
-                        set.insert([x as usize, y as usize, z as usize]);
-                    }
-                }
+    stock.dirty_chunks()
+}
+
+/// The chunks whose mesh reads a node of the box `lo..=hi` (node indices per axis), with a margin of
+/// two nodes either side. A chunk of first lower node `first` reads the nodes `first - 2` to
+/// `first + CHUNK + 1`, so a node affects the chunks whose window holds it. `counts` are the chunk
+/// counts of the lattice; the result is clipped to them.
+pub(crate) fn chunks_for_nodes(lo: [i64; 3], hi: [i64; 3], counts: [i64; 3]) -> Vec<[usize; 3]> {
+    let mut per_axis: Vec<Vec<i64>> = Vec::with_capacity(3);
+    for k in 0..3 {
+        // Chunk c reads nodes [CHUNK * c + LOWEST - 2, CHUNK * c + LOWEST + CHUNK + 1].
+        let a = lo[k] - 2;
+        let b = hi[k] + 2;
+        let c_min = -((-(a - LOWEST - CHUNK - 1)).div_euclid(CHUNK));
+        let c_max = (b - LOWEST + 2).div_euclid(CHUNK);
+        let (from, to) = (c_min.max(0), c_max.min(counts[k] - 1));
+        per_axis.push((from..=to).collect());
+    }
+    let mut out = Vec::new();
+    for &x in &per_axis[0] {
+        for &y in &per_axis[1] {
+            for &z in &per_axis[2] {
+                out.push([x as usize, y as usize, z as usize]);
             }
         }
     }
-    set.into_iter().collect()
+    out
 }
 
 /// The volume of the cut stock from its surface, by the divergence theorem. The chunk meshes share
@@ -240,10 +237,9 @@ impl<'a, L: Lattice> Builder<'a, L> {
             for l0 in first[0].max(LOWEST)..hi[0] {
                 for l1 in first[1].max(LOWEST)..hi[1] {
                     for l2 in first[2].max(LOWEST)..hi[2] {
+                        // Lower nodes run up to n: an edge from material at n leaves the lattice to air,
+                        // and its quad must still be emitted.
                         let lower = [l0, l1, l2];
-                        if lower[a] > self.n[a] - 1 {
-                            continue;
-                        }
                         self.edge(a, lower);
                     }
                 }

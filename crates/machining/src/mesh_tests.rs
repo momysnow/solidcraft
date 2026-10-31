@@ -263,3 +263,57 @@ fn mesh_volume_is_the_precise_number() {
     eprintln!("analytic {analytic:.3}: mesh error {err_mesh:.4}, midpoint error {err_dexel:.4}");
     assert!(err_mesh < 6.0, "mesh error {err_mesh}");
 }
+
+fn odd_edges(m: &Mesh) -> Vec<((u32, u32), u32)> {
+    let mut count: HashMap<(u32, u32), u32> = HashMap::new();
+    for t in &m.triangles {
+        for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+            *count.entry((a.min(b), a.max(b))).or_insert(0) += 1;
+        }
+    }
+    count.into_iter().filter(|(_, c)| c % 2 != 0).take(5).collect()
+}
+
+#[test]
+fn material_on_the_last_node_gives_a_closed_surface() {
+    // The node at n is the last one the lattice has. Its edges leave the lattice, and must still close.
+    let lat = NodeSet { n: 2, set: [[2i64, 2, 2]].into_iter().collect() };
+    let m = weld(&extract(&lat));
+    assert!(!m.triangles.is_empty());
+    let odd = odd_edges(&m);
+    assert!(odd.is_empty(), "edges with an odd count: {odd:?}");
+}
+
+#[test]
+fn a_small_cut_in_a_large_stock_marks_only_nearby_chunks() {
+    // A 130 mm stock at h = 0.5 has 81 chunks. A 1 mm pocket in one corner must mark only a few.
+    let mut s = Stock::new_box(Vec3::new(0.0, 0.0, -10.0), Vec3::new(130.0, 130.0, 0.0), 0.5, 1 << 34).expect("stock");
+    s.clear_dirty();
+    let all: Vec<[usize; 3]> = (0..9usize).flat_map(|z| (0..9usize).flat_map(move |y| (0..9usize).map(move |x| [x, y, z]))).collect();
+    let fingerprints = |s: &Stock| -> Vec<(usize, u64)> {
+        all.iter()
+            .map(|idx| match chunk_mesh(s, *idx) {
+                None => (0, 0),
+                Some(m) => {
+                    let h = m.positions.iter().fold(0u64, |acc, p| {
+                        acc.wrapping_mul(31).wrapping_add(p.x.to_bits() ^ p.y.to_bits().rotate_left(7) ^ p.z.to_bits().rotate_left(13))
+                    });
+                    (m.triangles.len(), h)
+                }
+            })
+            .collect()
+    };
+    let before = fingerprints(&s);
+    let tool = FlatTool::new(1.0, 3.0, Vec3::Z).expect("tool");
+    let pocket = LinearFixedAxis { from: Vec3::new(119.0, 119.0, -6.0), to: Vec3::new(120.0, 119.0, -6.0), tool };
+    s.apply(&pocket, 9).expect("cut");
+    let dirty = dirty_chunks(&s);
+    let after = fingerprints(&s);
+    assert!(dirty.len() <= 9, "dirty chunks {dirty:?}");
+    for (i, idx) in all.iter().enumerate() {
+        if before[i] != after[i] {
+            assert!(dirty.contains(idx), "chunk {idx:?} changed but was not dirty");
+        }
+    }
+    assert!(before.iter().zip(&after).any(|(a, b)| a != b), "the cut changed some chunk");
+}

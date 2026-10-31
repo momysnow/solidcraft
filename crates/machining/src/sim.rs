@@ -5,7 +5,7 @@ use solidcraft_geom::Vec3;
 
 use crate::SimError;
 use crate::dexel::Stock;
-use crate::sweep::{ArcFixedAxis, FlatTool, LinearFixedAxis, MAX_ARC_TURNS};
+use crate::sweep::{ArcFixedAxis, FlatTool, LinearFixedAxis, MAX_ARC_TURNS, Sweep};
 use crate::toolpath::{Diag, MoveKind, Program, Shape};
 
 const MAX_DIAGS: usize = 1000;
@@ -78,14 +78,10 @@ pub fn simulate(program: &Program, stock: &mut Stock) -> Result<Vec<Diag>, SimEr
                 }
                 match ArcFixedAxis::new(Vec3::from(start), Vec3::from(m.tip), Vec3::from(*centre), Vec3::from(*normal), *ccw, *turns, flat) {
                     Some(arc) => {
-                        let mut result = Ok(());
-                        for piece in arc.revolutions() {
-                            result = stock.apply(&piece, tag);
-                            if result.is_err() {
-                                break;
-                            }
-                        }
-                        result
+                        // All revolutions or none: a failing one must not leave the earlier ones cut.
+                        let pieces = arc.revolutions();
+                        let refs: Vec<&dyn Sweep> = pieces.iter().map(|p| p as &dyn Sweep).collect();
+                        stock.apply_all(&refs, tag)
                     }
                     None => {
                         push(&mut diags, m.tool, m.source, "arc", format!("degenerate arc at line {} skipped", m.source));

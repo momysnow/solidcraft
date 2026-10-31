@@ -398,3 +398,31 @@ fn radius_60_arc_move_timing_for_the_report() {
     eprintln!("R=60 quarter arc h=0.1: {elapsed:?}, removed {removed:.2}, analytic {analytic:.2}");
     assert!((removed - analytic).abs() < 0.01 * analytic, "removed {removed} vs {analytic}");
 }
+
+/// Many holes on every ray: a piece whose cut overflows the segment cap.
+struct Holes;
+
+impl crate::sweep::Sweep for Holes {
+    fn bounds(&self) -> solidcraft_geom::Aabb3 {
+        solidcraft_geom::Aabb3 { min: Vec3::new(-1.0, -1.0, -11.0), max: Vec3::new(2.0, 2.0, 1.0) }
+    }
+
+    fn ray(&self, _o: Vec3, _d: Vec3, _t_range: (f64, f64), out: &mut Vec<(f64, f64)>) {
+        for k in 0..300 {
+            let z = -9.9 + 0.03 * f64::from(k);
+            out.push((z, z + 0.01));
+        }
+    }
+}
+
+#[test]
+fn a_multi_piece_cut_that_fails_partway_leaves_the_stock_unchanged() {
+    // An arc is several revolution pieces. If a later piece fails, the earlier ones must not stay.
+    let mut s = Stock::new_box(Vec3::new(0.0, 0.0, -10.0), Vec3::new(1.0, 1.0, 0.0), 1.0, BUDGET).expect("stock");
+    let good =
+        LinearFixedAxis { from: Vec3::new(0.5, 0.5, -2.0), to: Vec3::new(0.5, 0.5, -1.0), tool: FlatTool::new(0.1, 0.5, Vec3::Z).expect("tool") };
+    let before = (s.segments(), s.state_hash());
+    let pieces: [&dyn crate::sweep::Sweep; 2] = [&good, &Holes];
+    assert!(s.apply_all(&pieces, 1).is_err());
+    assert_eq!((s.segments(), s.state_hash()), before);
+}

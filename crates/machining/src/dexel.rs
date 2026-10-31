@@ -78,8 +78,8 @@ pub struct Stock {
     /// Bytes the grids take (tiles counted as if none were shared), and the budget they must fit.
     used: u64,
     budget: u64,
-    /// Tiles changed since the last [`Stock::clear_dirty`]: (axis, tile index), in apply order.
-    dirty: Vec<(usize, usize)>,
+    /// Chunks whose surface may have changed since the last [`Stock::clear_dirty`]: each once, sorted.
+    dirty: std::collections::BTreeSet<[usize; 3]>,
 }
 
 /// Bytes of a tile's contents: a segment is 16 bytes, a start 4.
@@ -124,7 +124,7 @@ impl Stock {
             return Err(SimError::Budget { need, budget: budget_bytes });
         }
         let grids = [build_grid(0, &n, &lo, &hi), build_grid(1, &n, &lo, &hi), build_grid(2, &n, &lo, &hi)];
-        Ok(Stock { min: lo, max: hi, cell, n, grids, used: need, budget: budget_bytes, dirty: Vec::new() })
+        Ok(Stock { min: lo, max: hi, cell, n, grids, used: need, budget: budget_bytes, dirty: std::collections::BTreeSet::new() })
     }
 
     /// Cuts the stock with a sweep. Only rays the sweep can reach are visited. `tag` is recorded on
@@ -210,29 +210,55 @@ impl Stock {
         for (a, tidx, tile) in staged {
             if let Some(slot) = self.grids[a].tiles.get_mut(tidx) {
                 *slot = Arc::new(tile);
-                self.dirty.push((a, tidx));
             }
         }
         self.used = used;
+        // The chunks that hold the nodes this sweep's box covers are dirty (see mesh::chunks_for_nodes).
+        let counts = crate::mesh::chunk_counts(&*self);
+        if let Some((lo, hi)) = self.node_box(bmin, bmax) {
+            self.dirty.extend(crate::mesh::chunks_for_nodes(lo, hi, counts));
+        }
         Ok(())
     }
 
-    /// The tiles changed since the last [`Stock::clear_dirty`], as (axis, tile index).
-    pub fn dirty_tiles(&self) -> &[(usize, usize)] {
-        &self.dirty
+    /// Cuts several pieces of one move under one tag, all or nothing: on an error the stock is as it
+    /// was before the call. One piece is atomic already; more are applied to a copy, which replaces
+    /// the stock only once every piece has gone through.
+    pub fn apply_all(&mut self, pieces: &[&dyn Sweep], tag: u32) -> Result<(), SimError> {
+        if pieces.len() <= 1 {
+            for p in pieces {
+                self.apply(*p, tag)?;
+            }
+            return Ok(());
+        }
+        let mut trial = self.clone();
+        for p in pieces {
+            trial.apply(*p, tag)?;
+        }
+        *self = trial;
+        Ok(())
     }
 
-    /// Forgets the changed tiles (after the caller has remeshed what they touch).
+    /// The chunks marked dirty since the last [`Stock::clear_dirty`], each once.
+    pub fn dirty_chunks(&self) -> Vec<[usize; 3]> {
+        self.dirty.iter().copied().collect()
+    }
+
+    /// Forgets the dirty chunks (after the caller has remeshed what they touch).
     pub fn clear_dirty(&mut self) {
         self.dirty.clear();
     }
 
-    /// The tile of a grid as (tile column along u, tile row along v).
-    pub(crate) fn tile_coords(&self, axis: usize, tidx: usize) -> (usize, usize) {
-        match self.grids.get(axis) {
-            Some(g) if g.tu > 0 => (tidx % g.tu, tidx / g.tu),
-            _ => (0, 0),
+    /// The inclusive node range, per axis, of the world box `lo..=hi`, clamped to the lattice's
+    /// `-1..=n`; `None` when the box holds no node.
+    fn node_box(&self, lo: [f64; 3], hi: [f64; 3]) -> Option<([i64; 3], [i64; 3])> {
+        let spans: [Option<(i64, i64)>; 3] = std::array::from_fn(|k| node_span(self.min[k], self.cell[k], self.n[k] as i64, lo[k], hi[k]));
+        if spans.iter().any(Option::is_none) {
+            return None;
         }
+        let a = spans.map(|s| s.map_or(0, |x| x.0));
+        let b = spans.map(|s| s.map_or(0, |x| x.1));
+        Some((a, b))
     }
 
     /// Bytes the grids take now, against the budget they were created with.
@@ -388,6 +414,17 @@ impl Stock {
         }
         Some((a as usize, b as usize))
     }
+}
+
+/// The inclusive node indices along one axis whose positions lie in `lo..=hi`, clamped to `-1..=n`.
+fn node_span(min: f64, cell: f64, n: i64, lo: f64, hi: f64) -> Option<(i64, i64)> {
+    let a = ((lo - min) / cell - 0.5).ceil();
+    let b = ((hi - min) / cell - 0.5).floor();
+    if !(a.is_finite() && b.is_finite()) {
+        return None;
+    }
+    let (a, b) = ((a as i64).max(-1), (b as i64).min(n));
+    (a <= b).then_some((a, b))
 }
 
 fn real(i: i64, n: i64) -> bool {
