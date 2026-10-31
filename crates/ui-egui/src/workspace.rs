@@ -100,6 +100,72 @@ pub struct Section {
 /// MANAGE, their canonical home.
 const CONFIGURE: &[&str] = &["parameters.change", "config.table", "config.configure"];
 
+const MFG_SETUP: &[&str] = &["manufacture.setup.new"];
+const MFG_MANAGE: &[&str] =
+    &["manufacture.tools.library", "manufacture.manage.machine_library", "manufacture.manage.post_library", "manufacture.manage.template_library"];
+const MFG_2D: &[&str] = &[
+    "manufacture.2d.contour",
+    "manufacture.2d.face",
+    "manufacture.2d.adaptive",
+    "manufacture.2d.pocket",
+    "manufacture.2d.slot",
+    "manufacture.2d.trace",
+    "manufacture.2d.thread",
+    "manufacture.2d.bore",
+    "manufacture.2d.circular",
+    "manufacture.2d.engrave",
+    "manufacture.2d.chamfer",
+];
+const MFG_DRILLING: &[&str] = &["manufacture.drill", "manufacture.hole_recognition"];
+const MFG_3D: &[&str] = &[
+    "manufacture.3d.adaptive",
+    "manufacture.3d.parallel",
+    "manufacture.3d.scallop",
+    "manufacture.3d.steep",
+    "manufacture.3d.contour",
+    "manufacture.3d.flat",
+];
+const MFG_MULTIAXIS: &[&str] = &[
+    "manufacture.multiaxis.swarf",
+    "manufacture.multiaxis.rough",
+    "manufacture.multiaxis.rotary",
+    "manufacture.multiaxis.finish",
+    "manufacture.multiaxis.contour",
+    "manufacture.multiaxis.adv_swarf",
+];
+const MFG_TURNING: &[&str] = &[
+    "manufacture.turning.face",
+    "manufacture.turning.profile",
+    "manufacture.turning.groove",
+    "manufacture.turning.thread",
+    "manufacture.turning.chamfer",
+    "manufacture.turning.part",
+];
+const MFG_PART: &[&str] = &[
+    "manufacture.part_handling.grab",
+    "manufacture.part_handling.bar_pull",
+    "manufacture.part_handling.return",
+    "manufacture.part_handling.tool_call",
+];
+const MFG_PROBE: &[&str] = &[
+    "manufacture.inspection.wcs",
+    "manufacture.inspection.geometry",
+    "manufacture.inspection.surface",
+    "manufacture.inspection.align",
+    "manufacture.inspection.manual",
+    "manufacture.inspection.record",
+];
+const MFG_CUTTING: &[&str] = &["manufacture.fabrication.nest", "manufacture.fabrication.profile"];
+const MFG_ADDITIVE: &[&str] = &["manufacture.additive.toolpath", "manufacture.additive.from_gcode", "manufacture.additive.simulate"];
+const MFG_MODIFY: &[&str] = &[
+    "manufacture.modify.trim",
+    "manufacture.modify.delete_passes",
+    "manufacture.modify.leads_links",
+    "manufacture.modify.replace_tool",
+    "manufacture.modify.move_entry",
+];
+const MFG_POST: &[&str] = &["manufacture.post.process", "manufacture.post.time", "manufacture.post.sheet"];
+
 /// Commands that stay for agents, MCP and scripts but are not offered to people: the sketch solves
 /// itself after every edit, so a Solve button (and the search hit for it) only confuses; drawn 3D
 /// points are moved with the triad that appears when one is clicked, not a Move button.
@@ -378,6 +444,38 @@ const LEGACY_RENDER_SECTIONS: &[Section] = &[
         ids: &["render.export", "render.result.regrade", "render.compare", "render.status", "render.backends"],
     },
     Section { tab: "RENDER", panel: "BATCH", promoted: 1, ids: &["render.batch"] },
+    // Manufacture workspace: process tabs at the top (not Design's MODEL/SURFACE/etc.).
+    Section { tab: "MILLING", panel: "SETUP", promoted: 1, ids: MFG_SETUP },
+    Section { tab: "MILLING", panel: "MANAGE", promoted: 4, ids: MFG_MANAGE },
+    Section { tab: "MILLING", panel: "2D", promoted: 4, ids: MFG_2D },
+    Section { tab: "MILLING", panel: "DRILLING", promoted: 2, ids: MFG_DRILLING },
+    Section { tab: "MILLING", panel: "3D", promoted: 4, ids: MFG_3D },
+    Section { tab: "MILLING", panel: "MULTI-AXIS", promoted: 4, ids: MFG_MULTIAXIS },
+    Section { tab: "MILLING", panel: "MODIFY", promoted: 4, ids: MFG_MODIFY },
+    Section { tab: "MILLING", panel: "POST", promoted: 3, ids: MFG_POST },
+    Section { tab: "MILLING", panel: "SELECT", promoted: 0, ids: &[] },
+    Section { tab: "TURNING", panel: "SETUP", promoted: 1, ids: MFG_SETUP },
+    Section { tab: "TURNING", panel: "MANAGE", promoted: 4, ids: MFG_MANAGE },
+    Section { tab: "TURNING", panel: "TURNING", promoted: 4, ids: MFG_TURNING },
+    Section { tab: "TURNING", panel: "PART", promoted: 4, ids: MFG_PART },
+    Section { tab: "TURNING", panel: "MODIFY", promoted: 4, ids: MFG_MODIFY },
+    Section { tab: "TURNING", panel: "POST", promoted: 3, ids: MFG_POST },
+    Section { tab: "TURNING", panel: "SELECT", promoted: 0, ids: &[] },
+    Section { tab: "ADDITIVE", panel: "SETUP", promoted: 1, ids: MFG_SETUP },
+    Section { tab: "ADDITIVE", panel: "MANAGE", promoted: 4, ids: MFG_MANAGE },
+    Section { tab: "ADDITIVE", panel: "ADDITIVE", promoted: 3, ids: MFG_ADDITIVE },
+    Section { tab: "ADDITIVE", panel: "POST", promoted: 3, ids: MFG_POST },
+    Section { tab: "ADDITIVE", panel: "SELECT", promoted: 0, ids: &[] },
+    Section { tab: "INSPECTION", panel: "SETUP", promoted: 1, ids: MFG_SETUP },
+    Section { tab: "INSPECTION", panel: "MANAGE", promoted: 4, ids: MFG_MANAGE },
+    Section { tab: "INSPECTION", panel: "PROBE", promoted: 4, ids: MFG_PROBE },
+    Section { tab: "INSPECTION", panel: "POST", promoted: 3, ids: MFG_POST },
+    Section { tab: "INSPECTION", panel: "SELECT", promoted: 0, ids: &[] },
+    Section { tab: "FABRICATION", panel: "SETUP", promoted: 1, ids: MFG_SETUP },
+    Section { tab: "FABRICATION", panel: "MANAGE", promoted: 4, ids: MFG_MANAGE },
+    Section { tab: "FABRICATION", panel: "CUTTING", promoted: 2, ids: MFG_CUTTING },
+    Section { tab: "FABRICATION", panel: "POST", promoted: 3, ids: MFG_POST },
+    Section { tab: "FABRICATION", panel: "SELECT", promoted: 0, ids: &[] },
 ];
 
 /// Compact source labels for painted big buttons only. Menus, search and tooltips
@@ -428,6 +526,65 @@ pub const RIBBON_LABELS: &[(&str, &str)] = &[
     ("joint.as_built", "As-Built"),
     ("material.assign", "Material"),
     ("occurrence.move", "Move"),
+    ("manufacture.2d.adaptive", "Adaptive"),
+    ("manufacture.2d.bore", "Bore"),
+    ("manufacture.2d.chamfer", "Chamfer"),
+    ("manufacture.2d.circular", "Circular"),
+    ("manufacture.2d.contour", "Contour"),
+    ("manufacture.2d.engrave", "Engrave"),
+    ("manufacture.2d.face", "Face"),
+    ("manufacture.2d.pocket", "Pocket"),
+    ("manufacture.2d.slot", "Slot"),
+    ("manufacture.2d.thread", "Thread"),
+    ("manufacture.2d.trace", "Trace"),
+    ("manufacture.3d.adaptive", "Adaptive"),
+    ("manufacture.3d.contour", "3D Contour"),
+    ("manufacture.3d.flat", "Flat"),
+    ("manufacture.3d.parallel", "Parallel"),
+    ("manufacture.3d.scallop", "Scallop"),
+    ("manufacture.3d.steep", "Steep"),
+    ("manufacture.additive.from_gcode", "From G-code"),
+    ("manufacture.additive.simulate", "Simulate"),
+    ("manufacture.additive.toolpath", "Additive"),
+    ("manufacture.drill", "Drill"),
+    ("manufacture.fabrication.nest", "Nest"),
+    ("manufacture.fabrication.profile", "2D Profile"),
+    ("manufacture.hole_recognition", "Hole Rec."),
+    ("manufacture.inspection.align", "Align"),
+    ("manufacture.inspection.geometry", "Probe Geom"),
+    ("manufacture.inspection.manual", "Manual"),
+    ("manufacture.inspection.record", "Record"),
+    ("manufacture.inspection.surface", "Surface"),
+    ("manufacture.inspection.wcs", "Probe WCS"),
+    ("manufacture.manage.machine_library", "Machines"),
+    ("manufacture.manage.post_library", "Posts"),
+    ("manufacture.manage.template_library", "Templates"),
+    ("manufacture.modify.delete_passes", "Del Passes"),
+    ("manufacture.modify.leads_links", "Leads/Links"),
+    ("manufacture.modify.move_entry", "Move Entry"),
+    ("manufacture.modify.replace_tool", "Replace Tool"),
+    ("manufacture.modify.trim", "Trim"),
+    ("manufacture.multiaxis.adv_swarf", "Adv. Swarf"),
+    ("manufacture.multiaxis.contour", "MA Contour"),
+    ("manufacture.multiaxis.finish", "MA Finish"),
+    ("manufacture.multiaxis.rotary", "Rotary"),
+    ("manufacture.multiaxis.rough", "MA Rough"),
+    ("manufacture.multiaxis.swarf", "Swarf"),
+    ("manufacture.part_handling.bar_pull", "Bar Pull"),
+    ("manufacture.part_handling.grab", "Grab"),
+    ("manufacture.part_handling.return", "Return"),
+    ("manufacture.part_handling.tool_call", "Tool Call"),
+    ("manufacture.post.process", "Post"),
+    ("manufacture.post.sheet", "Setup Sheet"),
+    ("manufacture.post.time", "Cycle Time"),
+    ("manufacture.setup.new", "New Setup"),
+    ("manufacture.tools.library", "Tool Library"),
+    ("manufacture.turning.chamfer", "Chamfer"),
+    ("manufacture.turning.face", "Face"),
+    ("manufacture.turning.groove", "Groove"),
+    ("manufacture.turning.part", "Part"),
+    ("manufacture.turning.profile", "Profile"),
+    ("manufacture.turning.thread", "Thread"),
     ("parameters.change", "Parameters"),
     ("parameters.graph", "Param. Graph"),
     ("parts.fastener", "Fastener"),
@@ -669,6 +826,9 @@ pub fn visible_tabs(app: &crate::SolveApp) -> Vec<&'static str> {
     if crate::render_workspace::active(app) {
         return Vec::new();
     }
+    if crate::manufacture_workspace::active(app) {
+        return crate::manufacture_workspace::TABS.to_vec();
+    }
     let mut tabs: Vec<_> = TABS.iter().copied().filter(|tab| tab_turned_on(app, tab)).collect();
     if app.preferences.sketch_tab_always {
         // Right after MODEL, whether a sketch is open or not (#7904).
@@ -704,6 +864,10 @@ pub fn starts_a_sketch(app: &crate::SolveApp, id: &str) -> bool {
 /// metal, and sheet metal over weldments.
 pub fn sync_context(app: &mut crate::SolveApp) {
     if crate::render_workspace::active(app) {
+        return;
+    }
+    if crate::manufacture_workspace::active(app) {
+        crate::manufacture_workspace::sync_tab(app);
         return;
     }
     let context = app
@@ -749,6 +913,13 @@ pub fn select_command_tab(app: &mut crate::SolveApp, id: &str) {
     sync_context(app);
     if let Some(tab) = command_tab(app, id) {
         app.ui.tab = tab.into();
+    } else if let Some((tab, _)) = solidcraft_engine::find_command(id).and_then(destination)
+        && crate::manufacture_workspace::is_tab(tab)
+        && !crate::toolbar_custom::panel_lists(&app.ui.tab).iter().any(|(_, cmds, _)| cmds.iter().any(|c| c.id == id))
+    {
+        // command_tab is pure; a Manufacture command enters its workspace here.
+        crate::manufacture_workspace::enter(app);
+        crate::manufacture_workspace::show_tab(app, tab);
     }
 }
 
