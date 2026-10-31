@@ -3863,7 +3863,7 @@ pub(crate) fn build_highlight(app: &SolveApp) -> GpuScene {
         let k = (strength * 2.25).min(1.0);
         let rim = Color32::from_rgb(blend(edge.r(), cap.r(), k), blend(edge.g(), cap.g(), k), blend(edge.b(), cap.b(), k));
         let outline = EdgeColours::new(&mut feedback, rim, rim);
-        for b in st.bodies.iter().filter(|b| app.session.body_visible(&b.name) && !app.preview.effective_replaced().contains(&b.name)) {
+        for b in st.bodies.iter().filter(|b| cam_body_visible(app, &b.name) && !app.preview.effective_replaced().contains(&b.name)) {
             let Some(Ok(face)) = s.doc.print_face(&st, b) else { continue };
             let (r, g, bl) = body_rgb(app, &b.name);
             face_tris(&mut feedback, &shown(b), face.index, [mix(r, cap.r()), mix(g, cap.g()), mix(bl, cap.b()), 255], true);
@@ -6081,7 +6081,7 @@ fn origin_hidden_by_body(app: &SolveApp, proj: &Proj) -> bool {
     let walk_eps = 1e-6 * (1.0 + scene_radius(app));
     let slack = scene_pick_slack(app);
     for (i, b) in st.bodies.iter().enumerate() {
-        if !app.body_visible(&b.name) {
+        if !cam_body_visible(app, &b.name) {
             continue;
         }
         // Bodies whose box the ray misses cannot cover the origin.
