@@ -272,3 +272,13 @@ fn components_move_only_as_copies() {
     assert!(error.to_string().contains("copy"), "{error}");
     assert_eq!(s.doc, before, "a refused move changes nothing");
 }
+
+#[test]
+fn bodies_that_are_not_a_list_are_refused_with_components() {
+    let mut s = Session::default();
+    let (_, occurrence) = part_with_cube(&mut s);
+    let before = s.doc.clone();
+    let error = s.execute("solid.move", &json!({"bodies": "Peg", "occurrences": [[occurrence]], "copy": true, "translate": [50, 0, 0]})).unwrap_err();
+    assert!(error.to_string().contains("bodies"), "{error}");
+    assert_eq!(s.doc, before, "a refused move changes nothing");
+}

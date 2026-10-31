@@ -1876,7 +1876,11 @@ fn copy_components(s: &mut Session, p: &Value, paths: Vec<Vec<u64>>) -> Result<V
     paths.retain(|p| !all.iter().any(|q| q.len() < p.len() && p.starts_with(q)));
     // The bodies are given in the world; their own component's frame turns them, as a move of bodies
     // alone is turned, so they are mapped the same way, before any copy is made.
-    let has_bodies = p.get("bodies").and_then(Value::as_array).is_some_and(|b| !b.is_empty());
+    let has_bodies = match p.get("bodies") {
+        None => false,
+        Some(Value::Array(bodies)) => !bodies.is_empty(),
+        Some(_) => return Err(bad(cmd, "`bodies` must list bodies")),
+    };
     let mut rest = p.clone();
     if let Some(object) = rest.as_object_mut() {
         object.remove("occurrences");
