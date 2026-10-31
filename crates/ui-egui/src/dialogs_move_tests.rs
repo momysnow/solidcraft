@@ -719,12 +719,18 @@ fn a_component_picked_before_create_copy_is_ticked_is_copied_as_a_component() {
 
 #[test]
 fn editing_a_move_never_takes_a_component_pick() {
+    // An existing move of another body is edited, and the component is clicked in component mode.
     let (mut h, _) = part_harness();
-    h.app.start("solid.move");
+    h.app.run("solid.box", json!({"length": 10, "width": 10, "height": 10, "corner": [100, 0, 0], "body_name": "Plate"})).unwrap();
+    let moved = h.app.run("solid.move", json!({"bodies": ["Plate"], "translate": [0, 0, 5]})).unwrap()["feature"].as_u64().unwrap();
+    h.app.dialog = Some(crate::dialogs::for_feature(&h.app, moved, None).unwrap());
     h.settle();
-    assert!(crate::dialogs_move::picks_components(&h.app), "a new move takes components in component mode");
-    h.app.dialog.as_mut().unwrap().editing = Some((1, None));
-    assert!(!crate::dialogs_move::picks_components(&h.app), "an edited move's picks stay bodies");
+    h.app.ui.pick_components = true;
+    h.app.ui.pick_bodies = false;
+    h.step(&json!({"click": {"world": [10, 10, 20]}})).unwrap();
+    let items = h.app.dialog.as_ref().unwrap().inputs[0].items.clone();
+    assert!(items.iter().any(|s| matches!(s, Sel::Body { name } if name == "Peg")), "the click picks the body: {items:?}");
+    assert!(!items.iter().any(|s| matches!(s, Sel::Occurrence { .. })), "an edited move's picks stay bodies: {items:?}");
 }
 
 #[test]
