@@ -178,8 +178,8 @@ pub(crate) fn picks_components(app: &SolveApp) -> bool {
     app.dialog.as_ref().is_some_and(|d| matches!(d.kind, Kind::Move { .. }) && d.active == 0 && d.editing.is_none())
 }
 
-/// What a click picks in a Move dialog: with Create Copy ticked and the component pick mode on,
-/// the component a body belongs to (a copy of the component), otherwise the pick as it was.
+/// What a click picks in a Move dialog: with the component pick mode on, the component a body
+/// belongs to (copied as a component with Create Copy, see `targets`), otherwise the pick as it was.
 pub(crate) fn component_pick(app: &SolveApp, hit: &crate::viewport::Hit, sel: Sel) -> Sel {
     let (crate::viewport::Hit::Face { body, .. }, Sel::Body { .. }) = (hit, &sel) else { return sel };
     if app.ui.pick_components && picks_components(app) {
