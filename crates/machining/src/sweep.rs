@@ -3,14 +3,21 @@
 //!
 //! The tool is a flat cylinder: radius R, cutting from the tip up the axis to the flute length L.
 //! Linear moves use closed forms for rays parallel and perpendicular to the axis, and an envelope
-//! over the move for other rays. Arcs use an envelope over pieces that split at 90 degrees and at
-//! the angles where the distance to the ray is extreme.
+//! over the move for other rays. Arcs use an envelope over pieces that split at quarter turns and
+//! at the angles where each world coordinate of the tip peaks, so each piece is monotone in every
+//! constraint.
+//!
+//! One tie rule throughout: the tool's footprint is an open set. A ray exactly on the tool's
+//! boundary (a wall at exactly R) is not cut, and neither is a ray that only touches it.
 
 use std::f64::consts::{FRAC_PI_2, PI, TAU};
 
 use solidcraft_geom::{Aabb3, Vec3};
 
 use crate::det_math;
+
+/// Arcs with more extra turns than this are refused (a `Move` can come from any source).
+pub const MAX_ARC_TURNS: u32 = 1000;
 
 /// The ray-intersection interface the dexel stock is cut with.
 pub trait Sweep {
@@ -37,29 +44,48 @@ impl FlatTool {
     }
 }
 
-/// Parallel test thresholds: `|d . axis|` near 1 is parallel, near 0 is perpendicular.
+/// `|d . axis|` within this of 1 is parallel, within it of 0 is perpendicular.
 const AXIS_EPS: f64 = 1e-12;
+/// Relative slack of the open-set tie rule: `dist < r (1 - TIE)` counts as inside.
+const TIE: f64 = 1e-12;
 /// Brent evaluation budget per minimisation.
 const BRENT_EVALS: usize = 25;
 /// Penalty for "no tool here" in the minimisations. Far outside any real coordinate.
 const PENALTY: f64 = 1e15;
+/// Stands in for an unbounded parameter range; far outside any stock.
+const BIG: f64 = 1e12;
 
 fn perp(v: Vec3, u: Vec3) -> Vec3 {
     v - u * v.dot(u)
 }
 
-/// The part of the ray inside the flat cylinder with tip at `p`, as an interval of `t`, clipped to
-/// `lim`. Closed form: a quadratic (radius) intersected with a linear pair (cutting length).
-fn fiber(o: Vec3, d: Vec3, p: Vec3, tool: &FlatTool, lim: (f64, f64)) -> Option<(f64, f64)> {
+/// The open interval of `t` where `|w + t v| < r`. Lagrange form: the minimum squared distance is
+/// `|w x v|^2 / |v|^2`, so a ray exactly tangent to the circle has a zero discriminant and no
+/// interval, with no rounding in the decision.
+fn chord_open(w: Vec3, v: Vec3, r: f64) -> Option<(f64, f64)> {
+    let vv = v.len2();
+    if vv < 1e-24 {
+        return (w.len2() < r * r).then_some((-BIG, BIG));
+    }
+    let disc = vv * r * r - w.cross(v).len2();
+    if disc <= TIE * vv * r * r {
+        return None;
+    }
+    let c = -w.dot(v) / vv;
+    let h = disc.sqrt() / vv;
+    Some((c - h, c + h))
+}
+
+/// The removed interval of the ray `o + t d` for a flat cylinder with its tip at `p`, unclipped:
+/// the open footprint chord intersected with the open height window `0 < a < length`.
+fn fiber(o: Vec3, d: Vec3, p: Vec3, tool: &FlatTool) -> Option<(f64, f64)> {
     let u = tool.axis;
     let w = o - p;
     let alpha = w.dot(u);
     let beta = d.dot(u);
-    let wp = perp(w, u);
-    let dp = perp(d, u);
-    let (mut lo, mut hi) = lim;
+    let (mut lo, mut hi) = (-BIG, BIG);
     if beta.abs() < AXIS_EPS {
-        if alpha < 0.0 || alpha > tool.length {
+        if !(alpha > 0.0 && alpha < tool.length) {
             return None;
         }
     } else {
@@ -68,30 +94,17 @@ fn fiber(o: Vec3, d: Vec3, p: Vec3, tool: &FlatTool, lim: (f64, f64)) -> Option<
         lo = lo.max(ta.min(tb));
         hi = hi.min(ta.max(tb));
     }
-    let qa = dp.len2();
-    let qb = 2.0 * wp.dot(dp);
-    let qc = wp.len2() - tool.radius * tool.radius;
-    if qa < 1e-20 {
-        if qc > 0.0 {
-            return None;
-        }
-    } else {
-        let c = -qb / (2.0 * qa);
-        let disc = c * c - qc / qa;
-        if disc < 0.0 {
-            return None;
-        }
-        let h = disc.sqrt();
-        lo = lo.max(c - h);
-        hi = hi.min(c + h);
-    }
+    let (qlo, qhi) = chord_open(perp(w, u), perp(d, u), tool.radius)?;
+    lo = lo.max(qlo);
+    hi = hi.min(qhi);
     (lo <= hi).then_some((lo, hi))
 }
 
-/// Interval of `t` where `a0 + t a1` lies in `[lo, hi]`; unbounded when `a1` is zero and `a0` is in.
+/// Interval of `t` where `a0 + t a1` lies in `[lo, hi]`. A ray parallel to the strip (`a1` zero)
+/// is in it only strictly inside, so a ray exactly on the strip's edge is not cut.
 fn linear_window(a0: f64, a1: f64, lo: f64, hi: f64) -> Option<(f64, f64)> {
     if a1.abs() < AXIS_EPS {
-        return (a0 >= lo && a0 <= hi).then_some((f64::NEG_INFINITY, f64::INFINITY));
+        return (a0 > lo && a0 < hi).then_some((-BIG, BIG));
     }
     let t1 = (lo - a0) / a1;
     let t2 = (hi - a0) / a1;
@@ -104,14 +117,7 @@ fn linear_window(a0: f64, a1: f64, lo: f64, hi: f64) -> Option<(f64, f64)> {
 fn stadium_chord(o: Vec3, d: Vec3, q0: Vec3, q1: Vec3, r: f64, u: Vec3) -> Option<(f64, f64)> {
     let mut pieces: Vec<(f64, f64)> = Vec::with_capacity(3);
     for q in [q0, q1] {
-        let w = o - q;
-        let b = w.dot(d);
-        let c = w.len2() - r * r;
-        let disc = b * b - c;
-        if disc >= 0.0 {
-            let h = disc.sqrt();
-            pieces.push((-b - h, -b + h));
-        }
+        pieces.extend(chord_open(o - q, d, r));
     }
     let seg = q1 - q0;
     let len = seg.len();
@@ -122,7 +128,7 @@ fn stadium_chord(o: Vec3, d: Vec3, q0: Vec3, q1: Vec3, r: f64, u: Vec3) -> Optio
         if let (Some(a), Some(b)) = (linear_window(w0.dot(f), d.dot(f), 0.0, len), linear_window(w0.dot(n), d.dot(n), -r, r)) {
             let lo = a.0.max(b.0);
             let hi = a.1.min(b.1);
-            if lo <= hi {
+            if lo < hi {
                 pieces.push((lo, hi));
             }
         }
@@ -223,8 +229,9 @@ fn brent_min(f: &dyn Fn(f64) -> f64, ax: f64, bx: f64, tol: f64, max_eval: usize
 /// Extremes over a parameter range of the removed interval `(lo, hi)` at each parameter value:
 /// the least `lo` and the greatest `hi`. Samples first, then Brent around the best sample on each
 /// side. A `None` fiber means the tool is not on the ray at that parameter.
-/// shortcut: a feasible window narrower than one sample step can be missed, which loses only a
-/// sliver of volume at a grazing contact.
+/// shortcut: the sampled envelope is the general path for oblique rays. A feasible window narrower
+/// than one sample step can be missed (a grazing sliver), and it costs up to 16 + 2 x 25 evaluations.
+/// Replace with closed forms for oblique rays when 5-axis motion needs them.
 fn envelope(fib: &dyn Fn(f64) -> Option<(f64, f64)>, a: f64, b: f64, samples: usize, tol: f64) -> Option<(f64, f64)> {
     let x_of = |k: usize| a + (b - a) * (k as f64) / (samples as f64);
     let mut best_lo: Option<(usize, f64)> = None;
@@ -256,6 +263,16 @@ fn swept_box(base: Aabb3, tool: &FlatTool) -> Aabb3 {
     base.union(&shifted).inflated(tool.radius)
 }
 
+/// Clips the removed interval to the ray's range and pushes it if any length is left.
+fn push_clipped(found: Option<(f64, f64)>, t_range: (f64, f64), out: &mut Vec<(f64, f64)>) {
+    if let Some((a, b)) = found {
+        let (lo, hi) = (a.max(t_range.0), b.min(t_range.1));
+        if lo < hi {
+            out.push((lo, hi));
+        }
+    }
+}
+
 /// A flat end mill moving in a straight line from `from` to `to`, its axis fixed.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LinearFixedAxis {
@@ -265,58 +282,41 @@ pub struct LinearFixedAxis {
 }
 
 impl LinearFixedAxis {
-    fn parallel(&self, o: Vec3, d: Vec3, tr: (f64, f64)) -> Option<(f64, f64)> {
+    /// Ray parallel to the axis: the footprint is over the ray for an open interval of s (a
+    /// quadratic in s), and the cut is the height window at the ends of that interval.
+    fn parallel(&self, o: Vec3, d: Vec3) -> Option<(f64, f64)> {
         let u = self.tool.axis;
-        let r = self.tool.radius;
-        // Which s put the tool's footprint over the ray: a quadratic in s, convex, so an interval.
+        let path = self.to - self.from;
         let g = perp(o - self.from, u);
-        let dp = perp(self.to - self.from, u);
-        let qa = dp.len2();
-        let qb = -2.0 * g.dot(dp);
-        let qc = g.len2() - r * r;
-        let (s0, s1) = if qa < 1e-20 {
-            if qc > 0.0 {
-                return None;
-            }
-            (0.0, 1.0)
-        } else {
-            let c = -qb / (2.0 * qa);
-            let disc = c * c - qc / qa;
-            if disc < 0.0 {
-                return None;
-            }
-            let h = disc.sqrt();
-            ((c - h).max(0.0), (c + h).min(1.0))
-        };
+        let (sa, sb) = chord_open(g, -perp(path, u), self.tool.radius)?;
+        let (s0, s1) = (sa.max(0.0), sb.min(1.0));
         if s0 > s1 {
             return None;
         }
-        // Along the ray the cut is the tool's height window, linear in s, so its extremes are at
-        // the ends of the s interval.
         // The ray runs along the axis, so the height along it changes by +-1 per unit t.
         let beta = d.dot(u);
         let mut lo = f64::INFINITY;
         let mut hi = f64::NEG_INFINITY;
         for s in [s0, s1] {
-            let p = self.from + (self.to - self.from) * s;
-            let alpha = (o - p).dot(u);
+            let alpha = (o - (self.from + path * s)).dot(u);
             let ta = -alpha / beta;
             let tb = (self.tool.length - alpha) / beta;
             lo = lo.min(ta.min(tb));
             hi = hi.max(ta.max(tb));
         }
-        let (lo, hi) = (lo.max(tr.0), hi.min(tr.1));
         (lo <= hi).then_some((lo, hi))
     }
 
-    fn perpendicular(&self, o: Vec3, d: Vec3, tr: (f64, f64)) -> Option<(f64, f64)> {
+    /// Ray perpendicular to the axis: it sits at one height, so the s values that put the tip
+    /// window over it form an interval, and the footprint is the stadium of that segment.
+    fn perpendicular(&self, o: Vec3, d: Vec3) -> Option<(f64, f64)> {
         let u = self.tool.axis;
         let len = self.tool.length;
+        let path = self.to - self.from;
         let alpha0 = (o - self.from).dot(u);
-        let delta = (self.to - self.from).dot(u);
-        // The ray sits at one height; the s values that put the tip window over it.
+        let delta = path.dot(u);
         let (s0, s1) = if delta.abs() < AXIS_EPS {
-            if alpha0 < 0.0 || alpha0 > len {
+            if !(alpha0 > 0.0 && alpha0 < len) {
                 return None;
             }
             (0.0, 1.0)
@@ -328,17 +328,16 @@ impl LinearFixedAxis {
         if s0 > s1 {
             return None;
         }
-        let q0 = perp(self.from + (self.to - self.from) * s0, u);
-        let q1 = perp(self.from + (self.to - self.from) * s1, u);
-        let (lo, hi) = stadium_chord(perp(o, u), d, q0, q1, self.tool.radius, u)?;
-        let (lo, hi) = (lo.max(tr.0), hi.min(tr.1));
-        (lo <= hi).then_some((lo, hi))
+        let q0 = perp(self.from + path * s0, u);
+        let q1 = perp(self.from + path * s1, u);
+        stadium_chord(perp(o, u), d, q0, q1, self.tool.radius, u)
     }
 
-    fn general(&self, o: Vec3, d: Vec3, tr: (f64, f64)) -> Option<(f64, f64)> {
-        let path = (self.to - self.from).len().max(1e-9);
-        let fib = |s: f64| fiber(o, d, self.from + (self.to - self.from) * s, &self.tool, tr);
-        envelope(&fib, 0.0, 1.0, 16, 1e-6 / path)
+    /// Any other ray: an envelope over the move of the closed-form cylinder fibers.
+    fn general(&self, o: Vec3, d: Vec3) -> Option<(f64, f64)> {
+        let path = self.to - self.from;
+        let fib = |s: f64| fiber(o, d, self.from + path * s, &self.tool);
+        envelope(&fib, 0.0, 1.0, 16, 1e-6 / path.len().max(1e-9))
     }
 }
 
@@ -351,13 +350,13 @@ impl Sweep for LinearFixedAxis {
     fn ray(&self, o: Vec3, d: Vec3, t_range: (f64, f64), out: &mut Vec<(f64, f64)>) {
         let beta = d.dot(self.tool.axis).abs();
         let found = if beta > 1.0 - AXIS_EPS {
-            self.parallel(o, d, t_range)
+            self.parallel(o, d)
         } else if beta < AXIS_EPS {
-            self.perpendicular(o, d, t_range)
+            self.perpendicular(o, d)
         } else {
-            self.general(o, d, t_range)
+            self.general(o, d)
         };
-        out.extend(found);
+        push_clipped(found, t_range, out);
     }
 }
 
@@ -382,8 +381,12 @@ pub struct ArcFixedAxis {
 
 impl ArcFixedAxis {
     /// The arc from `start` to `end` about `centre` in the plane with `normal`, counter-clockwise
-    /// when `ccw`, plus `turns` extra full revolutions. `None` for a degenerate arc.
+    /// when `ccw`, plus `turns` extra full revolutions (at most [`MAX_ARC_TURNS`]). `None` for a
+    /// degenerate arc or too many turns.
     pub fn new(start: Vec3, end: Vec3, centre: Vec3, normal: Vec3, ccw: bool, turns: u32, tool: FlatTool) -> Option<ArcFixedAxis> {
+        if turns > MAX_ARC_TURNS {
+            return None;
+        }
         let n = normal.normalized()?;
         let to_start = start - centre;
         let height = to_start.dot(n);
@@ -418,15 +421,39 @@ impl ArcFixedAxis {
         self.centre + self.lift * s + (self.e1 * cs + self.e2 * sn) * self.r
     }
 
-    /// Angles (as arc parameters, `0..TAU`) of the extremes of the distance to `w`, where the arc's
-    /// in-plane offset along `w` peaks and troughs.
+    /// Arc parameters at which the in-plane offset along `w` peaks or troughs: every turn of
+    /// both extremes, kept inside `0..total`.
     fn feet(&self, w: Vec3, total: f64, pts: &mut Vec<f64>) {
         let theta = det_math::atan2(w.dot(self.e2), w.dot(self.e1));
         for th in [theta, theta + PI] {
-            let u = (self.sweep.signum() * th).rem_euclid(TAU);
-            if u > 0.0 && u < total {
-                pts.push(u);
+            let mut u = (self.sweep.signum() * th).rem_euclid(TAU);
+            while u < total {
+                if u > 0.0 {
+                    pts.push(u);
+                }
+                u += TAU;
             }
+        }
+    }
+
+    /// True when no point of the arc is within the tool radius of the ray. Only decided for an arc
+    /// in a plane perpendicular to the tool axis, where the distances are exact.
+    fn misses(&self, o: Vec3, d: Vec3) -> bool {
+        if !self.axis_normal {
+            return false;
+        }
+        let along = d.dot(self.tool.axis).abs();
+        let rt = self.tool.radius;
+        if along > 1.0 - AXIS_EPS {
+            // Distances from the ray's foot to the circle lie in [|dc - r|, dc + r].
+            let dc = perp(self.centre - o, self.normal).len();
+            (dc - self.r).abs() >= rt
+        } else if along < AXIS_EPS {
+            // Signed distances from the ray's line to the circle lie in [dc - r, dc + r].
+            let dc = self.normal.cross(d).dot(self.centre - o);
+            dc - self.r >= rt || dc + self.r <= -rt
+        } else {
+            false
         }
     }
 }
@@ -445,35 +472,35 @@ impl Sweep for ArcFixedAxis {
 
     fn ray(&self, o: Vec3, d: Vec3, t_range: (f64, f64), out: &mut Vec<(f64, f64)>) {
         let total = self.sweep.abs();
-        if !(total > 1e-12) {
+        if !(total > 1e-12) || self.misses(o, d) {
             return;
         }
-        // Pieces of at most a quarter turn, cut where the distance to the ray is extreme, so that
-        // each piece's removed part is one interval.
+        // Pieces of at most a quarter turn, cut where each world coordinate of the tip peaks, so
+        // every constraint is monotone within a piece and its removed part is one interval.
         let mut pts = vec![0.0, total];
         let mut k = 1.0f64;
         while k * FRAC_PI_2 < total {
             pts.push(k * FRAC_PI_2);
             k += 1.0;
         }
+        for axis in [Vec3::X, Vec3::Y, Vec3::Z] {
+            self.feet(axis, total, &mut pts);
+        }
         if self.axis_normal {
             let along = d.dot(self.tool.axis).abs();
             if along > 1.0 - AXIS_EPS {
-                // Parallel ray: the distance to its foot peaks where the arc's offset from the foot points.
                 self.feet(perp(self.centre - o, self.normal), total, &mut pts);
             } else if along < AXIS_EPS {
-                // Perpendicular ray: the distance to its line peaks along the in-plane normal of the line.
                 self.feet(self.normal.cross(d), total, &mut pts);
             }
         }
         pts.sort_by(|a, b| a.total_cmp(b));
         pts.dedup_by(|a, b| (*a - *b).abs() < 1e-12);
         let tol = 1e-6 / self.r.max(1e-3);
-        let fib = |u: f64| fiber(o, d, self.tip(u), &self.tool, t_range);
+        let fib = |u: f64| fiber(o, d, self.tip(u), &self.tool);
         for pair in pts.windows(2) {
-            let (a, b) = (pair[0], pair[1]);
-            if let Some(iv) = envelope(&fib, a, b, 8, tol) {
-                out.push(iv);
+            if let Some(iv) = envelope(&fib, pair[0], pair[1], 8, tol) {
+                push_clipped(Some(iv), t_range, out);
             }
         }
     }
