@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use solidcraft_engine::Sel;
 use solidcraft_engine::Session;
 use solidcraft_engine::doc::expr::Kind as ValueKind;
-use solidcraft_engine::doc::joints::JointKind;
+use solidcraft_engine::doc::joints::{JointKind, JointOrigin, Snap};
 use solidcraft_engine::geom::{Aabb3, Mesh, Vec3};
 
 use crate::SolveApp;
@@ -137,6 +137,9 @@ pub struct JointForm {
     /// Editing this joint (its origins stay; type, alignment and limits change).
     pub editing: Option<u64>,
     pub kind: usize,
+    /// Edit Joint: the sides as the dialog opened on them. A side still that pick is not sent,
+    /// so it keeps its origin exactly.
+    pub sides: [Option<Sel>; 2],
     /// Flip B relative to the mate (faces apart instead of together).
     pub flip: bool,
     pub angle: String,
@@ -155,6 +158,7 @@ impl JointForm {
             as_built,
             editing: None,
             kind: 0,
+            sides: [None, None],
             flip: false,
             angle: "0 deg".into(),
             offset: std::array::from_fn(|_| crate::length_input::default(doc, "0")),
@@ -217,10 +221,7 @@ pub fn start(app: &SolveApp, id: &str) -> Option<(Kind, Vec<SelInput>)> {
     let s = &app.session;
     let (asm, inputs) = match id {
         "component.create" => (Asm::NewComponent { name: String::new(), activate: true }, vec![SelInput::new("Bodies (optional)", BODIES, true)]),
-        "joint.create" => (
-            Asm::Joint(Box::new(JointForm::new(false, &app.session.doc))),
-            vec![SelInput::new("Component 1", SNAPS, false), SelInput::new("Component 2", SNAPS, false)],
-        ),
+        "joint.create" => (Asm::Joint(Box::new(JointForm::new(false, &app.session.doc))), side_inputs()),
         "joint.as_built" => (
             Asm::Joint(Box::new(JointForm::new(true, &app.session.doc))),
             vec![SelInput::new("Components", BODIES, true), SelInput::new("Position", SNAPS, false)],
@@ -321,11 +322,53 @@ pub(crate) fn num(v: f64, unit: &str) -> String {
     format!("{} {unit}", crate::dialogs_coupling::trim(v))
 }
 
-/// The Edit Joint dialog for a joint (by id).
+/// The two side inputs of the Joint dialog (Joint and Edit Joint): the picks of each origin.
+fn side_inputs() -> Vec<SelInput> {
+    vec![SelInput::new("Component 1", SNAPS, false), SelInput::new("Component 2", SNAPS, false)]
+}
+
+/// The pick a joint origin shows as in the side inputs: the face (an edge, for an edge origin)
+/// of its own occurrence nearest the origin, in the placed model. A point origin off every face
+/// shows the nearest one anyway; the pick only matters once it is picked again.
+fn side_pick(app: &SolveApp, o: &JointOrigin) -> Option<Sel> {
+    let s = &app.session;
+    let at = s.doc.origin_world(&s.model.state(), o).ok()?;
+    let p = solidcraft_engine::doc::apply_point(&at, Vec3::ZERO);
+    let st = s.world_state();
+    let mut best: Option<(f64, Sel)> = None;
+    for b in st.bodies.iter().filter(|b| occurrence_of_body(s, &b.name) == Some(o.occurrence)) {
+        let m = b.mesh();
+        if matches!(o.snap, Snap::Edge { .. }) {
+            for (i, e) in m.edges.iter().enumerate() {
+                let d = e.windows(2).map(|w| p.dist_to_segment(w[0], w[1])).fold(f64::INFINITY, f64::min);
+                if best.as_ref().is_none_or(|(bd, _)| d < *bd) {
+                    best = Some((d, Sel::Edge { body: b.name.clone(), index: i, point: p }));
+                }
+            }
+        } else {
+            for (t, f) in m.triangles.iter().zip(&m.tri_face) {
+                let Some([a, c, e]) = m.tri(t) else { continue };
+                let d = crate::preview::point_triangle_dist(p, a, c, e);
+                if best.as_ref().is_none_or(|(bd, _)| d < *bd) {
+                    best = Some((d, Sel::Face { body: b.name.clone(), index: *f as usize, point: p }));
+                }
+            }
+        }
+    }
+    best.map(|(_, sel)| sel)
+}
+
+/// The Edit Joint dialog for a joint (by id). Its two sides show as the Joint dialog's do, each
+/// pre-filled with the pick it sits on.
 pub fn edit_joint(app: &SolveApp, id: u64) -> Option<Dialog> {
     let j = app.session.doc.assembly.joints.iter().find(|j| j.id == id)?;
     let mut f = JointForm::new(false, &app.session.doc);
     f.editing = Some(id);
+    f.sides = [side_pick(app, &j.a), side_pick(app, &j.b)];
+    let mut inputs = side_inputs();
+    for (input, pick) in inputs.iter_mut().zip(&f.sides) {
+        input.items = pick.iter().cloned().collect();
+    }
     f.kind = TYPES.iter().position(|t| JointKind::parse(t) == Some(j.kind)).unwrap_or(0);
     f.flip = j.flip;
     // An offset or angle typed as an expression shows (and is sent back) as that expression, so
@@ -339,7 +382,7 @@ pub fn edit_joint(app: &SolveApp, id: u64) -> Option<Dialog> {
             *l = (true, fmt(*lo), fmt(*hi));
         }
     }
-    Some(Dialog::new(Kind::Assembly(Asm::Joint(Box::new(f))), vec![]))
+    Some(Dialog::new(Kind::Assembly(Asm::Joint(Box::new(f))), inputs))
 }
 
 /// The Drive Joints dialog on a joint (by id).
@@ -970,7 +1013,16 @@ pub fn commands(app: &SolveApp, k: &Asm, inputs: &[SelInput]) -> Result<Vec<(Str
             let limits: Vec<Value> =
                 f.limits.iter().take(jk.dofs().len()).map(|(on, lo, hi)| if *on { json!([lo, hi]) } else { Value::Null }).collect();
             if let Some(id) = f.editing {
-                let mut out = cmd("joint.edit", json!({"joint": id, "type": kind, "flip": f.flip, "offset": f.offset[2], "angle": f.angle}));
+                let mut p = json!({"joint": id, "type": kind, "flip": f.flip, "offset": f.offset[2], "angle": f.angle});
+                // A side picked again moves the joint's attachment there; one left as it was keeps its origin.
+                for (i, key) in ["a", "b"].into_iter().enumerate() {
+                    let picked = sel_items(inputs, i).first();
+                    if picked != f.sides[i].as_ref() {
+                        let what = if i == 0 { "component 1's joint origin" } else { "component 2's joint origin" };
+                        p[key] = snap(i, what)?.param;
+                    }
+                }
+                let mut out = cmd("joint.edit", p);
                 for (i, l) in limits.iter().enumerate() {
                     let p = match l.as_array() {
                         Some(a) => json!({"joint": id, "index": i, "min": a.first(), "max": a.get(1)}),

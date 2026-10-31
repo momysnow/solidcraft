@@ -215,7 +215,7 @@ fn edit_joint_runs_edit_and_limits() {
         .unwrap();
     let id = app.session.doc.assembly.joints[0].id;
     let mut d = edit_joint(&app, id).unwrap();
-    assert!(d.inputs.is_empty());
+    assert_eq!(d.inputs.len(), 2, "the two sides show as in the Joint dialog");
     if let Kind::Assembly(Asm::Joint(f)) = &mut d.kind {
         assert_eq!(TYPES[f.kind], "slider");
         f.limits[0] = (true, "0 mm".into(), "15 mm".into());
@@ -279,6 +279,40 @@ fn edit_joint_keeps_an_offset_typed_as_an_expression() {
     let j = &app.session.doc.assembly.joints[0];
     assert!(j.flip);
     assert_eq!((j.exprs.offset.as_deref(), j.exprs.angle.as_deref()), (Some("gap"), None));
+}
+
+/// Edit Joint shows both sides pre-filled, each on its own component. OK sends no side while
+/// they are as they were; picking one side again sends only that side, and the joint keeps its
+/// other side.
+#[test]
+fn edit_joint_shows_both_sides_and_a_repick_sends_only_that_side() {
+    let mut app = two_boxes();
+    let (a, b) = (occ(&app, "A"), occ(&app, "B"));
+    app.run("joint.create", json!({"type": "rigid", "a": {"occurrence": a, "face": [10, 10, 10]}, "b": {"occurrence": b, "face": [40, 10, 0]}}))
+        .unwrap();
+    let before = app.session.doc.assembly.joints[0].clone();
+    let mut d = edit_joint(&app, before.id).unwrap();
+    assert_eq!(d.inputs.len(), 2);
+    for (input, occurrence) in d.inputs.iter().zip([a, b]) {
+        let Some(Sel::Face { body, .. }) = input.items.first() else { panic!("no side pick: {:?}", input.items) };
+        assert_eq!(occurrence_of_body(&app.session, body), Some(occurrence), "{body}");
+    }
+    let c = apply_commands(&app, &d).unwrap();
+    assert!(c[0].1.get("a").is_none() && c[0].1.get("b").is_none(), "{}", c[0].1);
+    // B's top face, where B now sits on A: side b alone is picked again.
+    d.active = 1;
+    d.pick(&app.session, face_sel(&app.session, Vec3::new(10.0, 10.0, 20.0)).unwrap());
+    let c = apply_commands(&app, &d).unwrap();
+    assert_eq!(c[0].0, "joint.edit");
+    assert!(c[0].1.get("a").is_none(), "{}", c[0].1);
+    assert_eq!(c[0].1["b"]["occurrence"], json!(b));
+    for (id, p) in c {
+        app.run(&id, p).unwrap();
+    }
+    let after = app.session.doc.assembly.joints[0].clone();
+    assert_eq!(after.a, before.a);
+    assert_eq!(after.b.occurrence, b);
+    assert_ne!(after.b, before.b);
 }
 
 #[test]
