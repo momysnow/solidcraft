@@ -48,8 +48,9 @@ pub struct CodeTable {
     pub cancel_cycle: u32,
     pub home: [u32; 2],
     pub set_offsets: u32,
-    /// Frame-changing codes (G92, G52, G68, G51, G16, G92.1 to G92.3): errors that forget the position.
-    pub frame: Vec<u32>,
+    /// Frame-changing codes, each with the transform it turns on (`true`) or off (`false`). While a
+    /// transform is on, moves are errors. G52 has no cancel here: it stays on until the program ends.
+    pub frame: Vec<(u32, FrameKind, bool)>,
     pub cycle_mode: [u32; 2],
     /// Modal codes that change no motion (feed mode, path control, cutter modes): accepted silently.
     pub ignored: Vec<u32>,
@@ -84,12 +85,23 @@ impl Default for CodeTable {
             cancel_cycle: 800,
             home: [280, 300],
             set_offsets: 100,
-            frame: vec![160, 510, 520, 680, 920, 921, 922, 923],
+            frame: vec![
+                (680, FrameKind::Rotate, true),
+                (690, FrameKind::Rotate, false),
+                (160, FrameKind::Polar, true),
+                (150, FrameKind::Polar, false),
+                (510, FrameKind::Scale, true),
+                (500, FrameKind::Scale, false),
+                (520, FrameKind::Local, true),
+                (920, FrameKind::Offset, true),
+                (921, FrameKind::Offset, false),
+                (922, FrameKind::Offset, false),
+                (923, FrameKind::Offset, true),
+            ],
             cycle_mode: [980, 990],
             // G94 feed per minute, G95 per revolution, G64 path blending, G61 and G61.1 exact stop
-            // and exact path, G15 polar off, G50 scaling off, G69 rotation off, and G67
-            // the macro call cancel.
-            ignored: vec![940, 950, 640, 610, 611, 150, 690, 500, 670],
+            // and exact path, and G67 the macro call cancel.
+            ignored: vec![940, 950, 640, 610, 611, 670],
             block_delete: false,
         }
     }
@@ -108,6 +120,23 @@ enum Plane {
     Xy,
     Zx,
     Yz,
+}
+
+/// The coordinate-frame transforms a frame code can turn on: rotation (G68), polar (G16), scaling
+/// (G51), the local shift (G52) and the G92 offset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameKind {
+    Rotate,
+    Polar,
+    Scale,
+    Local,
+    Offset,
+}
+
+impl FrameKind {
+    fn bit(self) -> u8 {
+        1 << (self as u8)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -131,8 +160,8 @@ enum GKind {
     Canned,
     CancelCycle,
     SetOffsets,
-    /// A frame-changing code (see [`CodeTable::frame`]).
-    Frame,
+    /// A frame-changing code (see [`CodeTable::frame`]): the transform, and whether it turns on.
+    Frame(FrameKind, bool),
     /// A modal code that changes no motion.
     Ignored,
     Unknown,
@@ -187,8 +216,8 @@ impl CodeTable {
         } else if (730..=890).contains(&code) {
             // G73 to G89: the canned cycles (G80, the cancel, is matched above).
             GKind::Canned
-        } else if self.frame.contains(&code) {
-            GKind::Frame
+        } else if let Some(&(_, kind, on)) = self.frame.iter().find(|(c, _, _)| *c == code) {
+            GKind::Frame(kind, on)
         } else if self.cycle_mode.contains(&code) || self.ignored.contains(&code) {
             GKind::Ignored
         } else if code == self.set_offsets {
@@ -223,6 +252,8 @@ struct State {
     pending_tool: u32,
     /// After an unsupported canned cycle, axis words are errors until G80.
     cycle_unsupported: bool,
+    /// The frame transforms on, one bit per [`FrameKind`]. While any is on, moves are errors.
+    frame_on: u8,
 }
 
 /// All three values, or `None` when one axis is unknown.
@@ -274,6 +305,7 @@ impl<'a> Parser<'a> {
                 tool: 0,
                 pending_tool: 0,
                 cycle_unsupported: false,
+                frame_on: 0,
             },
             moves: Vec::new(),
             diags: Vec::new(),
@@ -530,9 +562,15 @@ impl<'a> Parser<'a> {
                     self.err(col, "G10 is not supported yet; the positions after it are unknown");
                     return;
                 }
-                GKind::Frame => {
+                GKind::Frame(kind, on) => {
+                    if !on {
+                        // A cancel moves nothing and keeps the positions: they are unknown already.
+                        self.state.frame_on &= !kind.bit();
+                        continue;
+                    }
                     // Frame changes shift every later coordinate: the positions after them are unknown.
                     self.forget_all();
+                    self.state.frame_on |= kind.bit();
                     self.err(col, format!("G{} changes the coordinate frame: not supported yet; positions are unknown", c as f64 / 10.0));
                     return;
                 }
@@ -595,6 +633,11 @@ impl<'a> Parser<'a> {
             // A hole line in cycle mode: its axes are unknown now, whatever the cycle would have done.
             self.forget_axes(axes);
             self.err(motion_col, "axis words are ignored after an unsupported canned cycle; G80 clears it");
+            return;
+        }
+        if self.state.frame_on != 0 && (has_axes || has_arc_words) {
+            // The program's coordinates are shifted by a transform that is not applied: no move.
+            self.err(motion_col, "a coordinate frame change is active: this move is not simulated until it is cancelled");
             return;
         }
         match self.state.motion {
@@ -775,7 +818,7 @@ impl<'a> Parser<'a> {
             }
             return;
         }
-        if !was_known && matches!(kind, MoveKind::Feed) {
+        if !was_known && matches!(kind, MoveKind::Feed | MoveKind::Rapid) {
             // A cut from a start the program does not know: it is not simulated, and the program says so.
             self.warn(0, "the start of this cut is unknown (after G28 or G30): the cut from there is not simulated");
         }

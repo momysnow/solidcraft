@@ -525,11 +525,42 @@ fn frame_and_unknown_codes_with_axis_words_are_errors_and_skip_the_block() {
     assert!(errors(&p).iter().any(|d| d.msg.contains("G92")), "{:?}", p.diags);
     assert_eq!(p.moves.len(), 2, "{:?}", p.moves);
     assert_close(p.moves[1].tip, [5.0, 5.0, -1.0]);
-    for text in ["G52 X10 Y10", "G68 X1", "G51 X2", "G28.1 X3", "G92.1 X0", "G16 X4"] {
+    for text in ["G52 X10 Y10", "G68 X1", "G51 X2", "G28.1 X3", "G16 X4"] {
         let q = run(text);
         assert!(errors(&q).iter().any(|d| d.msg.contains("not supported") || d.msg.contains("frame")), "{text}: {:?}", q.diags);
         assert!(q.moves.is_empty(), "{text}: {:?}", q.moves);
     }
+}
+
+#[test]
+fn moves_are_errors_while_a_frame_change_is_active() {
+    // G16 makes the full move after it an error, so nothing is cut and nothing is guessed. G15
+    // cancels it, and the next full move is a jump from the position the program now gives.
+    let p = run("G1 X1 Y1 Z1\nG16\nG1 X10 Y45 Z0\nG15\nG1 X10 Y45 Z0");
+    assert_eq!(errors(&p).len(), 2, "{:?}", p.diags);
+    assert_eq!(p.moves.len(), 2, "{:?}", p.moves);
+    assert!(matches!(p.moves[1].kind, MoveKind::Jump), "{:?}", p.moves[1]);
+    assert_close(p.moves[1].tip, [10.0, 45.0, 0.0]);
+}
+
+#[test]
+fn each_frame_transform_is_cancelled_on_its_own() {
+    // G15 cancels only polar: rotation (G68) is still on, so the move stays an error until G69.
+    let p = run("G68 R30\nG16\nG15\nG1 X1 Y1 Z1\nG69\nG1 X2 Y2 Z2");
+    assert_eq!(p.moves.len(), 1, "{:?}", p.moves);
+    assert!(matches!(p.moves[0].kind, MoveKind::Jump), "{:?}", p.moves[0]);
+    assert_close(p.moves[0].tip, [2.0, 2.0, 2.0]);
+    assert_eq!(errors(&p).len(), 3, "{:?}", p.diags);
+}
+
+#[test]
+fn g92_is_cancelled_by_g92_1_and_g52_stays_until_the_end() {
+    let p = run("G92 X0 Y0 Z0\nG92.1\nG1 X1 Y1 Z1");
+    assert_eq!(errors(&p).len(), 1, "only the G92 line is an error: {:?}", p.diags);
+    assert!(matches!(p.moves[0].kind, MoveKind::Jump), "{:?}", p.moves);
+    // G52 has no cancel here: the moves after it stay errors until the program ends.
+    let q = run("G52 X1\nG69\nG92.1\nG1 X1 Y1 Z1");
+    assert!(q.moves.is_empty(), "{:?}", q.moves);
 }
 
 #[test]
@@ -554,6 +585,15 @@ fn feed_that_starts_a_path_after_home_warns() {
     // After a Z-only home, the plunge gives Z: the path from there is not simulated, and the
     // program says so. No home Z is invented.
     let p = run("G28 G91 Z0\nG90 G0 X10 Y10\nG1 Z-5 F100");
+    assert_eq!(p.moves.len(), 1, "{:?}", p.moves);
+    assert!(matches!(p.moves[0].kind, MoveKind::Jump), "{:?}", p.moves[0]);
+    assert!(warnings(&p).iter().any(|d| d.msg.contains("start") && d.msg.contains("not simulated")), "{:?}", p.diags);
+}
+
+#[test]
+fn rapid_from_an_unknown_position_warns_like_a_feed() {
+    // The Z rapid is the first full tip after the home: it starts a path the program cannot follow.
+    let p = run("G28 G91 Z0\nG90 G0 X10 Y10\nG0 Z-5");
     assert_eq!(p.moves.len(), 1, "{:?}", p.moves);
     assert!(matches!(p.moves[0].kind, MoveKind::Jump), "{:?}", p.moves[0]);
     assert!(warnings(&p).iter().any(|d| d.msg.contains("start") && d.msg.contains("not simulated")), "{:?}", p.diags);

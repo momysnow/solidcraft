@@ -96,16 +96,15 @@ pub fn dirty_chunks(stock: &Stock) -> Vec<[usize; 3]> {
 /// `first + CHUNK + 1`, so a node affects the chunks whose window holds it. `counts` are the chunk
 /// counts of the lattice; the result is clipped to them.
 pub(crate) fn chunks_for_nodes(lo: [i64; 3], hi: [i64; 3], counts: [i64; 3]) -> Vec<[usize; 3]> {
-    let mut per_axis: Vec<Vec<i64>> = Vec::with_capacity(3);
-    for k in 0..3 {
+    let per_axis: [Vec<i64>; 3] = std::array::from_fn(|k| {
         // Chunk c reads nodes [CHUNK * c + LOWEST - 2, CHUNK * c + LOWEST + CHUNK + 1].
         let a = lo[k] - 2;
         let b = hi[k] + 2;
         let c_min = -((-(a - LOWEST - CHUNK - 1)).div_euclid(CHUNK));
         let c_max = (b - LOWEST + 2).div_euclid(CHUNK);
         let (from, to) = (c_min.max(0), c_max.min(counts[k] - 1));
-        per_axis.push((from..=to).collect());
-    }
+        (from..=to).collect()
+    });
     let mut out = Vec::new();
     for &x in &per_axis[0] {
         for &y in &per_axis[1] {
