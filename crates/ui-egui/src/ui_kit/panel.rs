@@ -851,6 +851,8 @@ impl<'a> Panel<'a> {
     /// Tokens: space_24 and form_footer_height; header/body/footer own their historical padding.
     pub(crate) fn palette(&self, ui: &mut Ui, bottom: f32, top: f32, mut add: impl FnMut(&mut Ui, Part)) {
         let t = Tokens::get();
+        // Dialog buttons at top (#9860): the footer row moves under the header, above the options.
+        let at_top = DialogButtons::current(ui.ctx()) == DialogButtons::Top;
         ui.set_max_height((bottom - ui.cursor().top()).max(0.0));
         super::scope(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
@@ -858,7 +860,11 @@ impl<'a> Panel<'a> {
             let short = height < t.space_24 * 6.0;
             let mut contents = |ui: &mut Ui| {
                 add(ui, Part::Header);
-                let body_height = (bottom - ui.cursor().top() - t.form_footer_height).max(0.0);
+                if at_top {
+                    add(ui, Part::Footer);
+                }
+                let footer_height = if at_top { 0.0 } else { t.form_footer_height };
+                let body_height = (bottom - ui.cursor().top() - footer_height).max(0.0);
                 let mut body = |ui: &mut Ui| {
                     egui::Frame::NONE.inner_margin(egui::Margin::symmetric(t.space_10 as i8, t.space_4 as i8)).show(ui, |ui| add(ui, Part::Body));
                 };
@@ -878,7 +884,9 @@ impl<'a> Panel<'a> {
                         .inner;
                     scenario::publish_rect("sketch_palette:options", scroll.inner_rect);
                 }
-                add(ui, Part::Footer);
+                if !at_top {
+                    add(ui, Part::Footer);
+                }
             };
             if short {
                 let scroll = egui::ScrollArea::vertical()
