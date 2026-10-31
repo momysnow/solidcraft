@@ -121,7 +121,8 @@
   wide as that column; the column comes back as it was when the dialog closes.
   Interface › **Dialog buttons** › **Top** puts OK, Cancel and Apply in
   the dialog's title row, right of the title, where they stay while sections open and close;
-  Cancel then also takes the place of the close button. Enter and Esc work as before.
+  Cancel then also takes the place of the close button. Enter and Esc work as before. The Sketch
+  panel's Finish Sketch, Look at and Slice move up under its title, above the options.
 - **Timeline** (bottom). Every feature in order. Double-click to edit, drag the marker to roll
   back, and drag features to reorder them. A sketch's icon, here and in the browser, takes the
   colour of its state: the sketch colour while it is under constrained, the fully constrained
