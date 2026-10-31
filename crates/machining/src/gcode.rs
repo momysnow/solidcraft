@@ -48,7 +48,8 @@ pub struct CodeTable {
     pub cancel_cycle: u32,
     pub home: [u32; 2],
     pub set_offsets: u32,
-    pub canned: [u32; 4],
+    /// Frame-changing codes (G92, G52, G68, G51, G16, G92.1 to G92.3): errors that forget the position.
+    pub frame: Vec<u32>,
     pub cycle_mode: [u32; 2],
     /// Modal codes that change no motion (feed mode, path control, cutter modes): accepted silently.
     pub ignored: Vec<u32>,
@@ -83,11 +84,11 @@ impl Default for CodeTable {
             cancel_cycle: 800,
             home: [280, 300],
             set_offsets: 100,
-            canned: [730, 810, 820, 830],
+            frame: vec![160, 510, 520, 680, 920, 921, 922, 923],
             cycle_mode: [980, 990],
             // G94 feed per minute, G95 per revolution, G64 path blending, G61 and G61.1 exact stop
-            // and exact path, G15 polar off, G50 and G69 and G67 scaling and rotation off, G67
-            // macro call cancel.
+            // and exact path, G15 polar off, G50 scaling off, G69 rotation off, and G67
+            // the macro call cancel.
             ignored: vec![940, 950, 640, 610, 611, 150, 690, 500, 670],
             block_delete: false,
         }
@@ -130,6 +131,8 @@ enum GKind {
     Canned,
     CancelCycle,
     SetOffsets,
+    /// A frame-changing code (see [`CodeTable::frame`]).
+    Frame,
     /// A modal code that changes no motion.
     Ignored,
     Unknown,
@@ -179,12 +182,15 @@ impl CodeTable {
             GKind::ToolLengthOff
         } else if self.home.contains(&code) {
             GKind::Home
-        } else if self.canned.contains(&code) {
-            GKind::Canned
-        } else if self.cycle_mode.contains(&code) || self.ignored.contains(&code) {
-            GKind::Ignored
         } else if code == self.cancel_cycle {
             GKind::CancelCycle
+        } else if (730..=890).contains(&code) {
+            // G73 to G89: the canned cycles (G80, the cancel, is matched above).
+            GKind::Canned
+        } else if self.frame.contains(&code) {
+            GKind::Frame
+        } else if self.cycle_mode.contains(&code) || self.ignored.contains(&code) {
+            GKind::Ignored
         } else if code == self.set_offsets {
             GKind::SetOffsets
         } else {
@@ -466,8 +472,9 @@ impl<'a> Parser<'a> {
         let mut block_motion: Option<Motion> = None;
         let mut motion_col = 0u32;
         let mut skip_motion = false;
-        let mut machine = false;
         let mut home_seen = false;
+        let has_axes = axes.iter().any(|a| a.is_some());
+        let has_arc_words = ijk.iter().any(|a| a.is_some()) || radius.is_some();
         for (c, col) in gs {
             match self.codes.classify(c) {
                 GKind::Motion(m) => {
@@ -490,10 +497,13 @@ impl<'a> Parser<'a> {
                 GKind::CancelCycle => self.state.cycle_unsupported = false,
                 GKind::CutterOff => {}
                 GKind::Machine => {
-                    machine = true;
+                    // Machine coordinates are not known to the program: the named axes are unknown
+                    // after G53, and the block moves nothing.
+                    self.forget_axes(axes);
+                    skip_motion = true;
                     if !self.warned_machine {
                         self.warned_machine = true;
-                        self.warn(col, "G53 is taken as workpiece coordinates: no machine offsets in S1a");
+                        self.warn(col, "G53 moves in machine coordinates: its axes are unknown and nothing is cut");
                     }
                 }
                 GKind::CutterComp => self.warn(col, "cutter compensation is not applied: the path is shown uncompensated"),
@@ -516,14 +526,21 @@ impl<'a> Parser<'a> {
                     return;
                 }
                 GKind::SetOffsets => {
-                    self.err(col, "G10 is not supported yet");
+                    self.forget_all();
+                    self.err(col, "G10 is not supported yet; the positions after it are unknown");
+                    return;
+                }
+                GKind::Frame => {
+                    // Frame changes shift every later coordinate: the positions after them are unknown.
+                    self.forget_all();
+                    self.err(col, format!("G{} changes the coordinate frame: not supported yet; positions are unknown", c as f64 / 10.0));
                     return;
                 }
                 GKind::Unknown => {
                     let code = c as f64 / 10.0;
-                    // Unknown motion codes (G33 threading, G38 probing) would move the tool: an error.
-                    if matches!(c / 10, 33 | 38) || (730..=899).contains(&c) {
-                        self.err(col, format!("G{code} is not supported"));
+                    // A code this table does not know, with axis or arc words, would move the tool.
+                    if has_axes || has_arc_words {
+                        self.err(col, format!("G{code} is not supported and would move the tool; the block is skipped"));
                         return;
                     }
                     self.warn(col, format!("G{code} is not supported and is ignored"));
@@ -574,9 +591,9 @@ impl<'a> Parser<'a> {
         if skip_motion {
             return;
         }
-        let has_axes = axes.iter().any(|a| a.is_some());
-        let has_arc_words = ijk.iter().any(|a| a.is_some()) || radius.is_some();
         if self.state.cycle_unsupported && (has_axes || has_arc_words) {
+            // A hole line in cycle mode: its axes are unknown now, whatever the cycle would have done.
+            self.forget_axes(axes);
             self.err(motion_col, "axis words are ignored after an unsupported canned cycle; G80 clears it");
             return;
         }
@@ -585,7 +602,7 @@ impl<'a> Parser<'a> {
                 if !has_axes {
                     return;
                 }
-                let Some(tip) = self.target(axes, machine, motion_col) else { return };
+                let Some(tip) = self.target(axes, motion_col) else { return };
                 let kind = if self.state.motion == Motion::Rapid { MoveKind::Rapid } else { MoveKind::Feed };
                 self.push_kind(kind, tip);
             }
@@ -611,12 +628,17 @@ impl<'a> Parser<'a> {
                         extra
                     }
                 };
-                self.arc(m, axes, ijk, radius, machine, extra, motion_col);
+                self.arc(m, axes, ijk, radius, extra, motion_col);
             }
         }
     }
 
     /// Marks the named axes as unknown (used when the program's motion can no longer be followed).
+    /// Every axis is unknown: a frame change or a G10 means the program no longer knows where it is.
+    fn forget_all(&mut self) {
+        self.state.pos = [None; 3];
+    }
+
     fn forget_axes(&mut self, axes: [Option<f64>; 3]) {
         for (k, a) in axes.iter().enumerate() {
             if let Some(slot) = self.state.pos.get_mut(k).filter(|_| a.is_some()) {
@@ -627,8 +649,8 @@ impl<'a> Parser<'a> {
 
     /// The end point of a linear or arc move, per axis: a missing axis keeps its position, which
     /// may be unknown. An incremental move on an unknown axis is an error.
-    fn target(&mut self, axes: [Option<f64>; 3], machine: bool, col: u32) -> Option<[Option<f64>; 3]> {
-        let absolute = self.state.absolute || machine;
+    fn target(&mut self, axes: [Option<f64>; 3], col: u32) -> Option<[Option<f64>; 3]> {
+        let absolute = self.state.absolute;
         let mut tip = self.state.pos;
         for (k, a) in axes.iter().enumerate() {
             let Some(v) = *a else { continue };
@@ -656,7 +678,7 @@ impl<'a> Parser<'a> {
         Some(tip)
     }
 
-    fn arc(&mut self, m: Motion, axes: [Option<f64>; 3], ijk: [Option<f64>; 3], radius: Option<f64>, machine: bool, turns: u32, col: u32) {
+    fn arc(&mut self, m: Motion, axes: [Option<f64>; 3], ijk: [Option<f64>; 3], radius: Option<f64>, turns: u32, col: u32) {
         let (u, v, n) = match self.state.plane {
             Plane::Xy => (0usize, 1usize, 2usize),
             Plane::Zx => (2, 0, 1),
@@ -667,7 +689,7 @@ impl<'a> Parser<'a> {
             return;
         };
         let ccw = m == Motion::ArcCcw;
-        let Some(end_partial) = self.target(axes, machine, col) else { return };
+        let Some(end_partial) = self.target(axes, col) else { return };
         let Some(end) = all_known(end_partial) else {
             self.err(col, "arc after G28 or G30: give all three axes at its end");
             return;
@@ -752,6 +774,10 @@ impl<'a> Parser<'a> {
                 self.err(0, "more than 2,000,000 moves; the rest are dropped");
             }
             return;
+        }
+        if !was_known && matches!(kind, MoveKind::Feed) {
+            // A cut from a start the program does not know: it is not simulated, and the program says so.
+            self.warn(0, "the start of this cut is unknown (after G28 or G30): the cut from there is not simulated");
         }
         let kind = if was_known { kind } else { MoveKind::Jump };
         let feeding = matches!(kind, MoveKind::Feed | MoveKind::Arc { .. });

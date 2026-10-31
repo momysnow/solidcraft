@@ -252,9 +252,9 @@ fn incremental_move_on_an_unknown_axis_is_an_error() {
 
 #[test]
 fn unknown_non_motion_codes_warn_and_motion_codes_error() {
-    let p = run("G90 G94 G95 G64 G61.1 G15 G50 G69 G67 G98 G80\nG1 X1\nG52 P1\nG33 X3 K1");
+    let p = run("G90 G94 G95 G64 G61.1 G15 G50 G69 G67 G98 G80\nG1 X1\nG22 P1\nG33 X3 K1");
     assert!(errors(&p).iter().any(|d| d.msg.contains("G33")), "{:?}", p.diags);
-    assert!(warnings(&p).iter().any(|d| d.msg.contains("G52")), "{:?}", p.diags);
+    assert!(warnings(&p).iter().any(|d| d.msg.contains("G22")), "{:?}", p.diags);
     assert!(!errors(&p).iter().any(|d| d.msg.contains("G94") || d.msg.contains("G98")), "{:?}", p.diags);
     assert_eq!(p.moves.len(), 1);
 }
@@ -515,4 +515,54 @@ fn tool_default_is_zero_until_m6() {
     assert_eq!(p.moves[0].tool, 0);
     let tooled = run("T4 M6\nG1 X1");
     assert_eq!(only_move(&tooled).tool, 4);
+}
+
+#[test]
+fn frame_and_unknown_codes_with_axis_words_are_errors_and_skip_the_block() {
+    // G92 and the other frame codes would shift every later coordinate: an error, and no move from
+    // their words. An unknown code with axis words would move: an error too.
+    let p = run("G0 X5 Y5 Z5\nG1 Z-1 F100\nG92 X0 Y0 Z0");
+    assert!(errors(&p).iter().any(|d| d.msg.contains("G92")), "{:?}", p.diags);
+    assert_eq!(p.moves.len(), 2, "{:?}", p.moves);
+    assert_close(p.moves[1].tip, [5.0, 5.0, -1.0]);
+    for text in ["G52 X10 Y10", "G68 X1", "G51 X2", "G28.1 X3", "G92.1 X0", "G16 X4"] {
+        let q = run(text);
+        assert!(errors(&q).iter().any(|d| d.msg.contains("not supported") || d.msg.contains("frame")), "{text}: {:?}", q.diags);
+        assert!(q.moves.is_empty(), "{text}: {:?}", q.moves);
+    }
+}
+
+#[test]
+fn hole_lines_in_cycle_mode_forget_axes() {
+    // G81 forgets Z; the hole line X5 Y5 is an error and forgets X and Y too. After G80, the
+    // partial moves make no move: nothing feeds from the old (0, 0, 10).
+    let p = run("G0 X0 Y0 Z10\nG81 Z-1 R1 F100\nX5 Y5\nG80\nG0 Z10\nG1 X6");
+    assert_eq!(p.moves.len(), 1, "{:?}", p.moves);
+    assert!(!p.moves.iter().any(|m| matches!(m.kind, MoveKind::Feed)), "{:?}", p.moves);
+}
+
+#[test]
+fn g84_is_a_canned_cycle_and_makes_no_feed() {
+    let p = run("G0 X0 Y0 Z10\nG1 Z0 F100\nG84 X1 Y1 Z-5 R1\nX2 Y2\nG80");
+    assert!(errors(&p).iter().any(|d| d.msg.contains("canned")), "{:?}", p.diags);
+    assert_eq!(p.moves.len(), 2, "{:?}", p.moves);
+    assert!(!p.moves.iter().skip(2).any(|m| matches!(m.kind, MoveKind::Feed)));
+}
+
+#[test]
+fn feed_that_starts_a_path_after_home_warns() {
+    // After a Z-only home, the plunge gives Z: the path from there is not simulated, and the
+    // program says so. No home Z is invented.
+    let p = run("G28 G91 Z0\nG90 G0 X10 Y10\nG1 Z-5 F100");
+    assert_eq!(p.moves.len(), 1, "{:?}", p.moves);
+    assert!(matches!(p.moves[0].kind, MoveKind::Jump), "{:?}", p.moves[0]);
+    assert!(warnings(&p).iter().any(|d| d.msg.contains("start") && d.msg.contains("not simulated")), "{:?}", p.diags);
+}
+
+#[test]
+fn g53_axis_words_make_axes_unknown_without_a_move() {
+    // G53 gives machine coordinates the program does not know: no rapid to machine Z 0.
+    let p = run("G0 X5 Y5 Z5\nG53 G0 Z0.\nG1 X7");
+    assert!(errors(&p).is_empty(), "{:?}", p.diags);
+    assert_eq!(p.moves.len(), 1, "{:?}", p.moves);
 }
