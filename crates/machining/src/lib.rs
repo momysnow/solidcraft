@@ -1,9 +1,12 @@
-//! Stock-removal simulation for SolidCraft: a neutral move list and the G-code that fills it.
-//! Units are millimetres, in the workpiece frame. Depends on the geometry foundation only.
+//! Stock-removal simulation for SolidCraft: a neutral move list, the G-code that fills it, and the
+//! swept volumes of a flat end mill. Units are millimetres, in the workpiece frame. Depends on the
+//! geometry foundation only.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 
+mod det_math;
 pub mod gcode;
+pub mod sweep;
 pub mod toolpath;
 
 /// Errors from the simulation core. Never a panic: hostile sizes and counts come back as these.
