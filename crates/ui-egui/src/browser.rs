@@ -1884,11 +1884,17 @@ fn setup_rows(app: &mut SolveApp, ui: &mut egui::Ui, depth: usize) {
         }
         for (op, icon) in ops {
             let picked = selected && app.manufacture_workspace.selected_op.as_deref() == Some(op.as_str());
+            // An operation that did not build says why, on hover.
+            let error = crate::manufacture_toolpaths::error_of(app, &name, &op);
             let row = draw_row(
                 ui,
                 ui.id().with(("cam_op", &name, &op)),
-                &Row { depth: depth + 2, icon, label: &op, name: true, selected: picked, ..Default::default() },
+                &Row { depth: depth + 2, icon, label: &op, name: true, selected: picked, tip: error.as_deref(), ..Default::default() },
             );
+            // Named by setup and operation, so no feature or body name can clash with it.
+            if let Some(rect) = row.rect {
+                crate::scenario::publish_handle(&format!("row:op:{name}/{op}"), rect.center());
+            }
             if row.clicked {
                 app.manufacture_workspace.active_setup = name.clone();
                 app.manufacture_workspace.selected_op = if picked { None } else { Some(op.clone()) };

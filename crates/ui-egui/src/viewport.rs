@@ -583,6 +583,7 @@ fn scene_key(app: &SolveApp) -> u64 {
     app.session.visibility.hidden_folders.hash(&mut h);
     app.session.visibility.hidden_profiles.hash(&mut h);
     crate::manufacture_workspace::setup_body_key(app).hash(&mut h);
+    crate::manufacture_toolpaths::key(app).hash(&mut h);
     app.session.active_component.hash(&mut h);
     app.session.active_occurrence_path.hash(&mut h);
     app.preview.effective_replaced().hash(&mut h);
@@ -623,7 +624,6 @@ fn sketch_scene_key(app: &SolveApp, proj: &Proj) -> u64 {
     app.preferences.sketch_conflict_colour.hash(&mut h);
     (std::sync::Arc::as_ptr(&crate::open_meshing::shown_world(app)) as usize).hash(&mut h);
     crate::sketch_display::projection_key(proj, app.viewport.pixels_per_point()).hash(&mut h);
-    crate::manufacture_toolpaths::key(app).hash(&mut h);
     h.finish()
 }
 
@@ -1671,6 +1671,7 @@ pub(crate) fn build_scene(app: &SolveApp) -> GpuScene {
         }
     }
     crate::edit_in_place::draw_context(app, &mut sc);
+    crate::manufacture_toolpaths::draw(&mut sc, app);
 
     sc
 }
@@ -1825,7 +1826,6 @@ fn build_sketch_scene(app: &SolveApp, proj: &Proj) -> GpuScene {
             sc.line(a.to_f32(), b.to_f32(), warning, 1.5, true);
         }
     }
-    crate::manufacture_toolpaths::draw(&mut sc, app);
     sc
 }
 
