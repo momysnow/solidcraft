@@ -45,6 +45,11 @@ pub struct State {
     pub active_setup: String,
     pub cam_mode: CamMode,
     pub setup_dialog: Option<crate::manufacture_setup::SetupDialogState>,
+    /// The operation picked in the Browser (its name in the active setup): its toolpath is drawn
+    /// in the highlight colour and the others are dimmed.
+    pub selected_op: Option<String>,
+    /// The active setup's toolpaths, computed off the window thread.
+    pub toolpaths: crate::manufacture_toolpaths::Toolpaths,
 }
 
 pub fn is_tab(tab: &str) -> bool {
@@ -86,6 +91,7 @@ pub fn exit(app: &mut SolveApp) {
     }
     close_floating_dialogs(app);
     app.manufacture_workspace.active = false;
+    app.manufacture_workspace.selected_op = None;
     if is_tab(&app.ui.tab) {
         app.ui.tab = "MODEL".into();
     }
@@ -141,6 +147,7 @@ pub fn start_hook(app: &mut SolveApp, id: &str) -> bool {
 }
 
 pub fn tick(app: &mut SolveApp, ctx: &egui::Context) {
+    crate::manufacture_toolpaths::poll(app, ctx);
     if app.manufacture_workspace.setup_dialog.is_none() {
         return;
     }
@@ -273,5 +280,77 @@ mod tests {
         assert!(crate::scenario::handle_at("button:manufacture.turning.face").is_some());
         assert!(crate::scenario::handle_at("button:manufacture.2d.contour").is_none());
         assert!(crate::scenario::handle_at("button:solid.extrude").is_none());
+    }
+
+    /// Two operations on one setup, with the workspace on.
+    fn milled_setup(h: &mut Harness) {
+        let s = &mut h.app.session;
+        s.execute("cam.tool.define", &json!({"number": 1, "diameter": 6, "flute_length": 20, "feed": 600, "plunge_feed": 200, "stepdown": 3}))
+            .unwrap_or_else(|e| panic!("{e}"));
+        s.execute("cam.setup", &json!({"name": "Top"})).unwrap_or_else(|e| panic!("{e}"));
+        s.execute(
+            "cam.op.contour",
+            &json!({"setup": "Top", "name": "Outside", "tool": 1, "outer": [[0, 0], [40, 0], [40, 30], [0, 30]], "side": "outside", "bottom": -3, "stepdown": 3}),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        s.execute(
+            "cam.op.pocket",
+            &json!({"setup": "Top", "name": "Pocket", "tool": 1, "outer": [[5, 5], [35, 5], [35, 25], [5, 25]], "stepover": 2, "bottom": -3, "stepdown": 3}),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        crate::manufacture_workspace::enter(&mut h.app);
+        h.app.manufacture_workspace.active_setup = "Top".into();
+    }
+
+    /// The active setup's toolpaths are computed once for a design, then drawn as strokes; the
+    /// picked operation takes its own colour role, the others are dimmed, and leaving the
+    /// workspace draws nothing.
+    #[test]
+    fn toolpaths_are_computed_once_per_design_and_drawn_with_the_pick_highlighted() {
+        use crate::manufacture_toolpaths::{Role, computing, key, poll, strokes, wait};
+        let mut h = Harness::new();
+        milled_setup(&mut h);
+        let ctx = egui::Context::default();
+        poll(&mut h.app, &ctx);
+        assert!(computing(&h.app));
+        wait(&mut h.app);
+        let all = strokes(&h.app);
+        assert!(all.iter().any(|s| s.rapid), "rapids are drawn");
+        assert!(all.iter().any(|s| !s.rapid && s.role == Role::Feed), "cutting moves are drawn");
+        poll(&mut h.app, &ctx);
+        assert!(!computing(&h.app), "the same design and setup are not computed again");
+        let plain = key(&h.app);
+        h.app.manufacture_workspace.selected_op = Some("Pocket".into());
+        let picked = strokes(&h.app);
+        assert_ne!(plain, key(&h.app), "picking an operation changes what is drawn");
+        assert!(picked.iter().any(|s| s.role == Role::Selected));
+        assert!(picked.iter().any(|s| s.role == Role::Dimmed));
+        assert!(!picked.iter().any(|s| s.role == Role::Feed || s.role == Role::Rapid));
+        // An edit to the design computes the paths again.
+        h.app.session.execute("cam.tool.define", &json!({"number": 2, "diameter": 3, "flute_length": 10})).unwrap_or_else(|e| panic!("{e}"));
+        poll(&mut h.app, &ctx);
+        assert!(computing(&h.app));
+        wait(&mut h.app);
+        crate::manufacture_workspace::exit(&mut h.app);
+        poll(&mut h.app, &ctx);
+        assert!(strokes(&h.app).is_empty());
+        assert!(h.app.manufacture_workspace.selected_op.is_none());
+    }
+
+    /// Each operation is a row under its setup, and a click picks it and clicking it again lets
+    /// go of it.
+    #[test]
+    fn operations_are_rows_under_their_setup_and_a_click_picks_one() {
+        let mut h = Harness::new();
+        milled_setup(&mut h);
+        h.frames(2);
+        assert!(crate::scenario::handle_at("row:Outside").is_some());
+        assert!(crate::scenario::handle_at("row:Pocket").is_some());
+        h.step(&json!({"click": {"handle": "row:Pocket"}})).unwrap_or_else(|e| panic!("{e}"));
+        h.frames(2);
+        assert_eq!(h.app.manufacture_workspace.selected_op.as_deref(), Some("Pocket"));
+        h.step(&json!({"click": {"handle": "row:Pocket"}})).unwrap_or_else(|e| panic!("{e}"));
+        h.frames(2);
+        assert!(h.app.manufacture_workspace.selected_op.is_none());
     }
 }

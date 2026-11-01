@@ -241,6 +241,10 @@ impl Tokens {
             bend_up: Color32::from_rgb(30, 140, 50),
             bend_down: Color32::from_rgb(200, 90, 20),
             interference: Color32::from_rgb(235, 45, 40),
+            cam_feed: Color32::from_rgb(18, 104, 196),
+            cam_rapid: Color32::from_rgb(120, 140, 165),
+            cam_selected: Color32::from_rgb(230, 110, 20),
+            cam_dimmed: Color32::from_rgb(176, 186, 200),
             continuity: [
                 Color32::from_rgb(0, 158, 115),
                 Color32::from_rgb(0, 114, 178),
@@ -364,6 +368,10 @@ impl Tokens {
         t.sketch = Color32::from_rgb(92, 150, 255);
         t.sketch_fixed = Color32::from_rgb(232, 234, 238);
         t.sketch_halo = Color32::from_rgb(28, 32, 40);
+        t.cam_feed = Color32::from_rgb(110, 180, 255);
+        t.cam_rapid = Color32::from_rgb(120, 136, 160);
+        t.cam_selected = Color32::from_rgb(255, 176, 64);
+        t.cam_dimmed = Color32::from_rgb(70, 80, 96);
         t.sketch_point = Color32::from_rgb(232, 234, 238);
         t.sketch_locked = Color32::from_rgb(96, 204, 116);
         // Sketch dimensions: Light's plum, lightened for the dark view (#7861).

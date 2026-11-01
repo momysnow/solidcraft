@@ -1843,18 +1843,67 @@ fn setup_rows(app: &mut SolveApp, ui: &mut egui::Ui, depth: usize) {
     }
     for name in names {
         let selected = app.manufacture_workspace.active_setup == name;
+        // Each operation is a child row, with its type's icon; the setup folds them away.
+        let ops: Vec<(String, &'static str)> = app
+            .session
+            .doc
+            .cam
+            .setup(&name)
+            .map(|s| s.operations.iter().map(|op| (op.name().to_string(), cam_op_icon(op))).collect())
+            .unwrap_or_default();
+        let fold_key = format!("cam_setup:{name}");
+        let open = is_open(app, &fold_key, true);
         let r = draw_row(
             ui,
             ui.id().with(("cam_setup", &name)),
-            &Row { depth: depth + 1, icon: "settings", label: &name, name: true, selected, ..Default::default() },
+            &Row {
+                depth: depth + 1,
+                fold: (!ops.is_empty()).then_some(open),
+                icon: "settings",
+                label: &name,
+                name: true,
+                selected,
+                ..Default::default()
+            },
         );
+        if r.fold {
+            toggle(app, &fold_key, true);
+        }
         if r.clicked {
+            if !selected {
+                app.manufacture_workspace.selected_op = None;
+            }
             app.manufacture_workspace.active_setup = name.clone();
         }
         if r.double {
             app.manufacture_workspace.active_setup = name.clone();
             crate::manufacture_setup::open_edit(app, &name);
         }
+        if !open {
+            continue;
+        }
+        for (op, icon) in ops {
+            let picked = selected && app.manufacture_workspace.selected_op.as_deref() == Some(op.as_str());
+            let row = draw_row(
+                ui,
+                ui.id().with(("cam_op", &name, &op)),
+                &Row { depth: depth + 2, icon, label: &op, name: true, selected: picked, ..Default::default() },
+            );
+            if row.clicked {
+                app.manufacture_workspace.active_setup = name.clone();
+                app.manufacture_workspace.selected_op = if picked { None } else { Some(op.clone()) };
+            }
+        }
+    }
+}
+
+/// The icon of an operation's type.
+fn cam_op_icon(op: &solidcraft_engine::doc::cam::CamOperation) -> &'static str {
+    use solidcraft_engine::doc::cam::CamOperation;
+    match op {
+        CamOperation::Contour { .. } => "cut",
+        CamOperation::Pocket { .. } => "hole",
+        CamOperation::Adaptive { .. } => "sweep",
     }
 }
 

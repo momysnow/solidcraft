@@ -341,6 +341,11 @@ fn groups(t: &Tokens) -> Vec<Group> {
         group("section", &[("section_cap", t.section_cap)], &[("body", t.body)]),
         group("interference", &[("interference", t.interference)], &[("body", t.body)]),
         group(
+            "cam toolpaths",
+            &[("cam_feed", t.cam_feed), ("cam_rapid", t.cam_rapid), ("cam_selected", t.cam_selected), ("cam_dimmed", t.cam_dimmed)],
+            &[("viewport_top", t.viewport_top)],
+        ),
+        group(
             "continuity seams",
             &[
                 ("continuity[0]", t.continuity[0]),

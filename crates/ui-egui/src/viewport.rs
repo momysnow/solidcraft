@@ -623,6 +623,7 @@ fn sketch_scene_key(app: &SolveApp, proj: &Proj) -> u64 {
     app.preferences.sketch_conflict_colour.hash(&mut h);
     (std::sync::Arc::as_ptr(&crate::open_meshing::shown_world(app)) as usize).hash(&mut h);
     crate::sketch_display::projection_key(proj, app.viewport.pixels_per_point()).hash(&mut h);
+    crate::manufacture_toolpaths::key(app).hash(&mut h);
     h.finish()
 }
 
@@ -1824,6 +1825,7 @@ fn build_sketch_scene(app: &SolveApp, proj: &Proj) -> GpuScene {
             sc.line(a.to_f32(), b.to_f32(), warning, 1.5, true);
         }
     }
+    crate::manufacture_toolpaths::draw(&mut sc, app);
     sc
 }
 

@@ -1208,6 +1208,12 @@ pub struct Tokens {
     pub bend_down: Color32,
     /// Interference: the clash fill, before its shading.
     pub interference: Color32,
+    /// Manufacture toolpaths: cutting moves, rapids (drawn dashed), the operation picked in the
+    /// Browser, and the other operations' cutting moves while one is picked.
+    pub cam_feed: Color32,
+    pub cam_rapid: Color32,
+    pub cam_selected: Color32,
+    pub cam_dimmed: Color32,
     /// Continuity Analysis seams, best to worst as `inspect.continuity` judges them: smooth (G2),
     /// tangent with a curvature jump (G1), a crease (G0) and a gap. Bluish green, blue, yellow
     /// and reddish purple stay apart in every colour vision mode, so no mode changes them.
@@ -1374,6 +1380,10 @@ impl Tokens {
             bend_up: view.bend_up,
             bend_down: view.bend_down,
             interference: view.interference,
+            cam_feed: view.cam_feed,
+            cam_rapid: view.cam_rapid,
+            cam_selected: view.cam_selected,
+            cam_dimmed: view.cam_dimmed,
             continuity: view.continuity,
             analysis: view.analysis,
             ..self
