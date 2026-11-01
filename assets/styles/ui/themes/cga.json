@@ -93,6 +93,10 @@
     "icons.highlight": "#ffffff",
     "icons.marker_halo": "#000000cc",
     "interference": "#ff5555",
+    "cam_feed": "#55ffff",
+    "cam_rapid": "#55ffff",
+    "cam_selected": "#ffff55",
+    "cam_dimmed": "#555555",
     "joint_axis": "#aaaaaa",
     "joint_manipulator": "#ffff55",
     "logo": [

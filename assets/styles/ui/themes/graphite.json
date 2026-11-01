@@ -120,6 +120,10 @@
     "icons.stripe": "#a0a6b0",
     "icons.warning": "#dbb879",
     "interference": "#ed7777",
+    "cam_feed": "#2878a9",
+    "cam_rapid": "#a0a6b0",
+    "cam_selected": "#2878a9",
+    "cam_dimmed": "#292b30",
     "logo": [
       "#4aa3d8",
       "#2878a9",

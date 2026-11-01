@@ -602,7 +602,8 @@ fn paint_setup(app: &SolveApp, painter: &egui::Painter, proj: &viewport::Proj, s
         [min[0], max[1], max[2]],
     ];
     let edges = [[0, 1], [1, 2], [2, 3], [3, 0], [4, 5], [5, 6], [6, 7], [7, 4], [0, 4], [1, 5], [2, 6], [3, 7]];
-    let stock_color = egui::Color32::from_rgba_unmultiplied(255, 180, 60, 180);
+    let tk = crate::theme::Tokens::get();
+    let stock_color = tk.warning.gamma_multiply(0.7);
     for e in edges {
         let a = corners[e[0]];
         let b = corners[e[1]];
@@ -623,14 +624,14 @@ fn paint_setup(app: &SolveApp, painter: &egui::Painter, proj: &viewport::Proj, s
         let active = (origin[0] - world[0]).abs() < 1e-3 && (origin[1] - world[1]).abs() < 1e-3 && (origin[2] - world[2]).abs() < 1e-3;
         let hot = hover.is_some_and(|h| h.distance(sp) <= 14.0);
         let color = if active {
-            egui::Color32::from_rgb(80, 160, 255)
+            tk.accent
         } else if hot {
-            egui::Color32::from_rgb(255, 255, 255)
+            tk.icons.highlight
         } else {
-            egui::Color32::from_rgb(255, 210, 80)
+            tk.warning
         };
         painter.circle_filled(sp, if active || hot { 6.0 } else { 4.0 }, color);
-        painter.circle_stroke(sp, if active || hot { 6.0 } else { 4.0 }, egui::Stroke::new(1.0, egui::Color32::BLACK));
+        painter.circle_stroke(sp, if active || hot { 6.0 } else { 4.0 }, egui::Stroke::new(1.0, tk.icons.marker_halo));
     }
 }
 
