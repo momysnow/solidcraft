@@ -12,7 +12,7 @@ use solidcraft_machining::SimError;
 use solidcraft_machining::dexel::Stock;
 use solidcraft_machining::gcode::{self, CodeTable};
 use solidcraft_machining::sweep::FlatTool;
-use solidcraft_machining::toolpath::{Diag, NO_TOOL, Severity, Shape, Tool};
+use solidcraft_machining::toolpath::{Diag, MoveKind, NO_TOOL, Severity, Shape, Tool};
 use web_time::Instant;
 
 use super::CommandSpec;
@@ -130,7 +130,7 @@ fn shape_of(t: &ToolParams) -> std::result::Result<Shape, String> {
     let id = t.id;
     let name = t.shape.unwrap_or_default();
     let given = [
-        ("corner_radius", t.corner_radius.is_some()),
+        ("corner_radius", t.corner_radius.is_some_and(|r| r != 0.0)),
         ("tip_diameter", t.tip_diameter.is_some()),
         ("angle", t.angle.is_some()),
         ("a0", t.a0.is_some()),
@@ -214,6 +214,17 @@ fn setup(s: &mut Session, p: &Value) -> Result<Value> {
             }
         }
     }
+    // Cutting moves with no tool are not simulated: an error, with the count, so the caller sees it.
+    let cutting = |m: &solidcraft_machining::toolpath::Move| m.tool == NO_TOOL && matches!(m.kind, MoveKind::Feed | MoveKind::Arc { .. });
+    let uncut = program.moves.iter().filter(|m| cutting(m)).count();
+    if let Some(first) = program.moves.iter().find(|m| cutting(m)) {
+        let msg = if uncut == 1 {
+            "1 cutting move before the first M6 is not simulated: give initial_tool or a tool change".to_string()
+        } else {
+            format!("{uncut} cutting moves before the first M6 are not simulated: give initial_tool or a tool change")
+        };
+        program.diags.push(Diag::error(first.source, 0, msg));
+    }
     program.tools = tools;
     let (min, max) = (Vec3::from(input.stock.boxed.min), Vec3::from(input.stock.boxed.max));
     let h = match input.resolution {
@@ -222,7 +233,7 @@ fn setup(s: &mut Session, p: &Value) -> Result<Value> {
         None => default_resolution(min, max, budget_bytes).map_err(|e| sim_error(C, e))?,
     };
     let setup = Setup { min, max, h, budget_bytes, program };
-    let revision = s.sim.fresh_revision();
+    let revision = crate::sim_jobs::next_revision();
     let job = Job::new(setup, revision).map_err(|e| sim_error(C, e))?;
     let (min, max) = job.bounds();
     let reply = SetupReply {

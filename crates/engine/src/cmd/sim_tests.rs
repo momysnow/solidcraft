@@ -355,13 +355,88 @@ fn a_backward_seek_redraws_the_whole_surface() {
     call(&mut s, "sim.setup", &params);
     let end = call(&mut s, "sim.run", &json!({}));
     assert_eq!(end["done"], true);
+    let touched = s.sim_stock().map(|st| st.touched_chunks()).unwrap_or_default();
     // The UI has drawn the cut.
     s.sim_take_dirty();
     let back = call(&mut s, "sim.run", &json!({"to": 4}));
     assert_ne!(back["revision"], end["revision"], "a rebuild changes the revision: {back}");
     assert_eq!(Some(back["revision"].as_u64().unwrap_or(0)), Some(s.sim_revision()));
     let dirty = s.sim_take_dirty();
+    // The dirty chunks are the chunks the cut touched, and only those: a 200 x 20 x 10 mm stock at 0.1 mm
+    // has 1764 chunks; each sweep reaches its chunks plus a two-node margin, so two slots touch about 108.
+    assert_eq!(dirty, touched, "a backward seek redraws the union of touched chunks");
+    assert!(!touched.is_empty() && touched.len() < 200, "{} touched", touched.len());
     // Cells of 0.1 mm, 32 to a chunk: x = 175 is about chunk 54.
     assert!(dirty.iter().any(|c| (53..=55).contains(&c[0])), "the second slot's chunks must redraw: {dirty:?}");
     assert!(s.sim_take_dirty().is_empty(), "taking the dirty chunks forgets them");
+}
+
+#[test]
+fn a_flat_setup_has_no_chunks_the_ui_must_mesh_until_a_cut_reaches_them() {
+    // Redraws follow the cut: a box with no cut dirties nothing, and a backward seek to the start
+    // dirties exactly the chunks the cut had touched.
+    let mut s = set_up(SLOT);
+    call(&mut s, "sim.run", &json!({}));
+    let touched = s.sim_stock().map(|st| st.touched_chunks()).unwrap_or_default();
+    s.sim_take_dirty();
+    call(&mut s, "sim.run", &json!({"to": 0}));
+    assert_eq!(s.sim_take_dirty(), touched);
+}
+
+#[test]
+fn a_fresh_setup_has_nothing_to_redraw() {
+    // The UI draws the uncut box itself: no chunk is dirty until a cut reaches it.
+    let mut s = set_up(SLOT);
+    assert!(s.sim_take_dirty().is_empty(), "a fresh box has dirty chunks");
+    call(&mut s, "sim.run", &json!({}));
+    assert!(!s.sim_take_dirty().is_empty(), "the cut must dirty the chunks it reached");
+}
+
+#[test]
+fn cutting_moves_before_the_first_tool_change_are_an_error_with_a_count() {
+    let params = json!({
+        "stock": {"box": {"min": [0, 0, -10], "max": [60, 20, 0]}},
+        "tools": [{"id": 1, "diameter": 6, "flute_length": 20}],
+        "gcode": "G0 X10 Y10 Z5\nG1 Z-3 F100\nG1 X40\nG0 Z5\nT1 M6\nG0 X10 Y10 Z5\nG1 Z-2 F100\nG1 X30 F300\nG0 Z5",
+        "resolution": 0.1
+    });
+    let mut s = Session::default();
+    let setup = call(&mut s, "sim.setup", &params);
+    let errors: Vec<String> = setup["diagnostics"]
+        .as_array()
+        .map(|d| d.iter().filter(|x| x["severity"] == "error").filter_map(|x| x["msg"].as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    assert!(errors.iter().any(|m| m.contains("2 cutting moves before the first M6")), "{setup}");
+}
+
+#[test]
+fn a_flat_tool_accepts_a_zero_corner_radius() {
+    let mut params = setup_params(SLOT);
+    params["tools"] = json!([{"id": 0, "diameter": 6, "flute_length": 20, "corner_radius": 0}]);
+    let mut s = Session::default();
+    call(&mut s, "sim.setup", &params);
+    assert_eq!(call(&mut s, "sim.run", &json!({}))["done"], true);
+}
+
+#[test]
+fn tool_and_box_entries_refuse_unknown_keys() {
+    let mut tool = setup_params(SLOT);
+    tool["tools"] = json!([{"id": 0, "diameter": 6, "flute_length": 20, "colour": "red"}]);
+    assert!(Session::default().execute("sim.setup", &tool).is_err(), "an unknown tool key was accepted");
+    let mut bx = setup_params(SLOT);
+    bx["stock"] = json!({"box": {"min": [0, 0, -10], "max": [60, 20, 0], "margin": 1}});
+    assert!(Session::default().execute("sim.setup", &bx).is_err(), "an unknown box key was accepted");
+}
+
+#[test]
+fn revisions_never_repeat_across_sessions() {
+    let mut a = set_up(SLOT);
+    let mut b = set_up(SLOT);
+    let ra = call(&mut a, "sim.run", &json!({}))["revision"].as_u64().unwrap_or(0);
+    let rb = call(&mut b, "sim.run", &json!({}))["revision"].as_u64().unwrap_or(0);
+    assert_ne!(ra, rb, "two simulations share revision {ra}");
+    let again = call(&mut a, "sim.setup", &setup_params(SLOT));
+    assert!(again.is_object());
+    let ra2 = call(&mut a, "sim.run", &json!({}))["revision"].as_u64().unwrap_or(0);
+    assert!(ra2 > ra && ra2 != rb, "a new setup must hand out a new revision: {ra} {ra2} {rb}");
 }

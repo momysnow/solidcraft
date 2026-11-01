@@ -10,6 +10,8 @@ use solidcraft_machining::SimError;
 use solidcraft_machining::dexel::Stock;
 use solidcraft_machining::sim::{Cut, Cutter, Progress};
 use solidcraft_machining::toolpath::{Diag, Program};
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use web_time::Instant;
 
 use crate::Session;
@@ -44,16 +46,22 @@ pub(crate) struct Job {
 #[derive(Default)]
 pub(crate) struct Sim {
     job: Option<Job>,
-    /// The highest revision any job has had, so a revision is never handed out twice.
-    last_revision: u64,
+}
+
+/// Revisions are handed out by the process, not by a session, so one never repeats: not after
+/// `file.new`, not in another session.
+static REVISIONS: AtomicU64 = AtomicU64::new(0);
+
+/// A revision no stock has had before.
+pub(crate) fn next_revision() -> u64 {
+    REVISIONS.fetch_add(1, Ordering::Relaxed) + 1
 }
 
 impl Job {
-    /// The stock of `setup`, uncut, with every chunk dirty. Refused, never a panic, when the box or
-    /// the memory is bad.
+    /// The stock of `setup`, uncut. Nothing is dirty: the UI draws the uncut box itself. Refused, never
+    /// a panic, when the box or the memory is bad.
     pub fn new(setup: Setup, revision: u64) -> Result<Job, SimError> {
-        let mut stock = Stock::new_box(setup.min, setup.max, setup.h, setup.budget_bytes)?;
-        stock.mark_all_dirty();
+        let stock = Stock::new_box(setup.min, setup.max, setup.h, setup.budget_bytes)?;
         let start_volume = stock.volume();
         Ok(Job { setup, stock, cursor: 0, cutter: Cutter::new(), start_volume, partial: None, error: None, revision })
     }
@@ -108,16 +116,18 @@ impl Job {
     }
 
     /// Builds the stock again from the setup, uncut, and cuts nothing: the start of a backward seek.
-    /// Every chunk is dirty, since the whole surface is new, and the revision moves on.
+    /// The chunks the old stock had touched are dirty, since they are the box again; nothing else is,
+    /// as the new stock is the box where no cut reaches. The revision moves on.
     fn rebuild(&mut self) -> Result<(), SimError> {
+        let previous = self.stock.touched_chunks();
         let mut stock = Stock::new_box(self.setup.min, self.setup.max, self.setup.h, self.setup.budget_bytes)?;
-        stock.mark_all_dirty();
+        stock.mark_dirty(previous);
         self.stock = stock;
         self.cursor = 0;
         self.cutter = Cutter::new();
         self.partial = None;
         self.error = None;
-        self.revision += 1;
+        self.revision = next_revision();
         Ok(())
     }
 
@@ -187,9 +197,7 @@ impl Job {
 impl Sim {
     /// Makes `job` the simulation, dropping the one there was.
     pub fn set(&mut self, job: Job) {
-        if let Some(old) = self.job.replace(job) {
-            self.last_revision = self.last_revision.max(old.revision());
-        }
+        self.job = Some(job);
     }
 
     pub fn job(&self) -> Option<&Job> {
@@ -200,22 +208,9 @@ impl Sim {
         self.job.as_mut()
     }
 
-    /// A revision no stock has had before: above the current job's and every dropped job's.
-    pub fn fresh_revision(&mut self) -> u64 {
-        let current = self.job.as_ref().map_or(0, Job::revision);
-        self.last_revision = self.last_revision.max(current) + 1;
-        self.last_revision
-    }
-
     /// Drops the simulation; `true` when there was one.
     pub fn clear(&mut self) -> bool {
-        match self.job.take() {
-            Some(job) => {
-                self.last_revision = self.last_revision.max(job.revision());
-                true
-            }
-            None => false,
-        }
+        self.job.take().is_some()
     }
 }
 

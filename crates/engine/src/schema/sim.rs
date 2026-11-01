@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 
 /// The stock, as a box. Only `box` is accepted for now.
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
 pub struct StockParams {
     #[serde(rename = "box")]
     pub boxed: BoxParams,
@@ -13,6 +15,8 @@ pub struct StockParams {
 
 /// The box `min..max` in the workpiece frame. Each axis needs `min < max`.
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
 pub struct BoxParams {
     pub min: [f64; 3],
     pub max: [f64; 3],
@@ -39,6 +43,8 @@ pub enum ShapeName {
 /// A tool the G-code selects with `T` and `M6`. `diameter` and `flute_length` are mm and must be
 /// positive. The other fields belong to particular shapes and are refused for any other.
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
 pub struct ToolParams {
     pub id: u32,
     pub diameter: f64,
