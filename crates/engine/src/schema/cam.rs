@@ -12,6 +12,9 @@ pub struct ToolpathParams {
     /// One operation of the setup, by name. Default: every operation of the setup, in order.
     #[serde(default)]
     pub operation: Option<String>,
+    /// The chord tolerance in mm for cutting arcs as straight points (default 0.01; 0 < t ≤ 1).
+    #[serde(default)]
+    pub tolerance: Option<f64>,
 }
 
 /// How a move reaches its point: `rapid` at the machine's rapid rate, `feed` along a cut (an arc
@@ -58,6 +61,6 @@ mod tests {
 
     #[test]
     fn schemas_and_the_key_check_agree() {
-        assert_keys(input_schema_for::<ToolpathParams>(), &["operation", "setup"]);
+        assert_keys(input_schema_for::<ToolpathParams>(), &["operation", "setup", "tolerance"]);
     }
 }

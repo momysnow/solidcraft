@@ -68,7 +68,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .contract(&TOOLPATH_CONTRACT)
         .output(crate::schema::output_schema_for::<ToolpathResult>)
         .params(
-            "setup; operation?: name (default every operation, in order) → {setup, operations: [{name, tool, error?, length_mm, \
+            "setup; operation?: name (default every operation, in order); tolerance?: arc chord tolerance in mm (default 0.01, 0 < t ≤ 1) → {setup, operations: [{name, tool, error?, length_mm, \
              points: [[x,y,z]…] in model coordinates (mm), kinds: [rapid|feed|plunge…] with kinds[i] the move that ends at points[i]}]}. \
              An operation that does not build reports its error and the others still return. Read only: the design is not changed.",
         ),
@@ -600,13 +600,17 @@ fn toolpath_cmd(s: &mut Session, p: &Value) -> Result<Value> {
     {
         return Err(bad(cmd, format!("no operation `{name}` in setup `{setup_name}`")));
     }
+    let tolerance = match p.get("tolerance") {
+        None | Some(Value::Null) => PATH_TOLERANCE,
+        Some(v) => v.as_f64().filter(|t| t.is_finite() && *t > 0.0 && *t <= 1.0).ok_or_else(|| bad(cmd, "`tolerance` must be a chord tolerance in mm, 0 < t ≤ 1"))?,
+    };
     let frame = work_frame(&setup).map_err(|e| bad(cmd, e))?;
     let mut operations = Vec::new();
     for op in setup.operations.iter().filter(|o| only.as_deref().is_none_or(|n| o.name() == n)) {
         let mut out =
             ToolpathOperation { name: op.name().to_string(), tool: op.tool(), error: None, length_mm: 0.0, points: Vec::new(), kinds: Vec::new() };
         match build_path(s, &setup, op) {
-            Ok(path) => fill_path(&mut out, &path, &frame),
+            Ok(path) => fill_path(&mut out, &path, &frame, tolerance),
             Err(e) => out.error = Some(e),
         }
         operations.push(out);
@@ -615,11 +619,11 @@ fn toolpath_cmd(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 /// The path's points in model coordinates, each with the kind of the move that ends there.
-fn fill_path(out: &mut ToolpathOperation, path: &Toolpath, frame: &WorkFrame) {
+fn fill_path(out: &mut ToolpathOperation, path: &Toolpath, frame: &WorkFrame, tolerance: f64) {
     let stats = path.stats();
     out.length_mm = stats.cut_length + stats.rapid_length;
     let mut prev: Option<Vec3> = None;
-    for (w, cutting) in path.points(PATH_TOLERANCE) {
+    for (w, cutting) in path.points(tolerance) {
         let kind = match prev {
             _ if !cutting => PathKind::Rapid,
             // A feed that only goes down (no XY motion) is a plunge.
@@ -643,6 +647,8 @@ fn axes(axis: Vec3) -> Option<(Vec3, Vec3, Vec3)> {
     } else {
         Vec3::new(0.0, 0.0, 1.0).cross(z).normalized()?
     };
+    // The snapped axes above are only nearly square to a nearly vertical tool axis.
+    let x = (x - z * x.dot(z)).normalized()?;
     Some((x, z.cross(x), z))
 }
 
@@ -1277,5 +1283,50 @@ mod tests {
         assert_eq!(one["operations"].as_array().unwrap().len(), 1);
         assert!(s.execute("cam.toolpath", &json!({"setup": "Top", "operation": "Nope"})).is_err());
         assert!(s.execute("cam.toolpath", &json!({"setup": "Nope"})).is_err());
+    }
+
+    /// A tilted tool axis (nearly vertical, or leaning) keeps the work frame square, so a model
+    /// point survives the round trip through the work frame.
+    #[test]
+    fn work_frame_round_trips_with_tilted_tool_axes() {
+        for axis in [[0.0, 1.0, 1.0], [3e-5, 3e-5, 1.0]] {
+            let mut setup = CamSetup::new("Tilt");
+            setup.tool_axis = axis;
+            setup.work_origin = [10.0, 20.0, 5.0];
+            let frame = work_frame(&setup).unwrap_or_else(|e| panic!("{e}"));
+            for w in [Vec3::new(1.0, 2.0, 3.0), Vec3::new(-7.5, 0.25, 4.0)] {
+                let back = frame.local(frame.model(w));
+                assert!(back.dist(w) < 1e-9, "{axis:?}: {back:?} is not {w:?}");
+            }
+        }
+    }
+
+    /// A coarser chord tolerance gives fewer points along an arc, and a bad one is refused.
+    #[test]
+    fn toolpath_tolerance_sets_how_finely_arcs_are_cut() {
+        let mut s = Session::default();
+        run(&mut s, "sketch.create", json!({"plane": "XY"}));
+        run(&mut s, "sketch.circle.center", json!({"center": [0, 0], "radius": 10}));
+        let sketch = s.active_sketch.expect("sketch");
+        run(&mut s, "sketch.finish", json!({}));
+        run(&mut s, "cam.tool.define", json!({"number": 1, "diameter": 4, "flute_length": 16, "feed": 400, "plunge_feed": 100, "stepdown": 2}));
+        run(&mut s, "cam.setup", json!({"name": "Top"}));
+        run(
+            &mut s,
+            "cam.op.contour",
+            json!({"setup": "Top", "name": "Boss", "tool": 1, "sketch": sketch, "side": "outside", "bottom": -2, "stepdown": 2}),
+        );
+        fn points(s: &mut Session, tolerance: Option<f64>) -> usize {
+            let mut p = json!({"setup": "Top"});
+            if let Some(t) = tolerance {
+                p["tolerance"] = json!(t);
+            }
+            run(s, "cam.toolpath", p)["operations"][0]["points"].as_array().map_or(0, Vec::len)
+        }
+        let fine = points(&mut s, None);
+        let coarse = points(&mut s, Some(0.05));
+        assert!(coarse < fine, "a coarser chord gives fewer points: {coarse} vs {fine}");
+        assert!(s.execute("cam.toolpath", &json!({"setup": "Top", "tolerance": 0})).is_err());
+        assert!(s.execute("cam.toolpath", &json!({"setup": "Top", "tolerance": "fine"})).is_err());
     }
 }
