@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use solidcraft_geom::{Mesh, Vec3};
 
-use super::{Lattice, chunk_mesh, chunk_meshes, dirty_chunks, extract, mesh_volume};
+use super::{Lattice, chunk_counts, chunk_mesh, chunk_meshes, dirty_chunks, extract, mesh_volume};
 use crate::dexel::Stock;
 use crate::sweep::{FlatTool, LinearFixedAxis};
 
@@ -190,21 +190,28 @@ fn example_lattice_has_even_edge_counts_including_across_a_seam() {
 
 #[test]
 fn chunk_meshes_are_the_same_as_chunk_by_chunk() {
+    // chunk_mesh meshes a chunk a cut has reached, and only those: together they are a part of the
+    // whole surface (the untouched chunks' box faces are in chunk_meshes alone).
     let s = slot_stock(0.25);
     let all = chunk_meshes(&s);
     let mut by_index = Vec::new();
+    let mut touched = 0;
     for cz in 0..4usize {
         for cy in 0..4usize {
             for cx in 0..4usize {
-                if let Some(m) = chunk_mesh(&s, [cx, cy, cz]) {
+                let idx = [cx, cy, cz];
+                assert_eq!(chunk_mesh(&s, idx).is_some(), s.is_touched(idx), "{idx:?}");
+                touched += usize::from(s.is_touched(idx));
+                if let Some(m) = chunk_mesh(&s, idx) {
                     by_index.push(m);
                 }
             }
         }
     }
+    assert_eq!(by_index.len(), touched);
     let tris = |ms: &[Mesh]| ms.iter().map(|m| m.triangles.len()).sum::<usize>();
-    assert_eq!(tris(&all), tris(&by_index));
-    assert_eq!(all.len(), by_index.len());
+    assert!(tris(&by_index) <= tris(&all), "{} vs {}", tris(&by_index), tris(&all));
+    assert!(tris(&by_index) > 0);
 }
 
 fn fingerprint(m: Option<Mesh>) -> (usize, u64) {
@@ -316,4 +323,40 @@ fn a_small_cut_in_a_large_stock_marks_only_nearby_chunks() {
         }
     }
     assert!(before.iter().zip(&after).any(|(a, b)| a != b), "the cut changed some chunk");
+}
+
+#[test]
+fn a_fresh_box_has_no_dirty_chunk_and_asking_for_untouched_chunks_is_instant() {
+    // 300 x 200 x 50 mm at 0.1 mm: about 95 000 chunks, all still the uncut box.
+    let s = Stock::new_box(Vec3::new(0.0, 0.0, -50.0), Vec3::new(300.0, 200.0, 0.0), 0.1, 1 << 32).expect("stock");
+    assert!(dirty_chunks(&s).is_empty(), "{} dirty chunks on a fresh box", dirty_chunks(&s).len());
+    let start = std::time::Instant::now();
+    let meshed = (0..100usize).filter(|k| chunk_mesh(&s, [*k, 0, 0]).is_some()).count();
+    let elapsed = start.elapsed();
+    assert_eq!(meshed, 0, "no cut reached these chunks, so none is meshed");
+    assert!(elapsed.as_millis() < 50, "100 untouched chunks took {elapsed:?}");
+}
+
+#[test]
+fn a_small_cut_dirties_only_its_chunks_and_the_surface_stays_closed() {
+    // A 130 x 130 x 10 mm stock at 0.5 mm, with one 5 mm slot 4 mm deep in its middle.
+    let mut s = Stock::new_box(Vec3::new(0.0, 0.0, -10.0), Vec3::new(130.0, 130.0, 0.0), 0.5, 1 << 34).expect("stock");
+    let tool = FlatTool::new(2.5, 20.0, Vec3::Z).expect("tool");
+    s.apply(&LinearFixedAxis { from: Vec3::new(60.0, 65.0, -4.0), to: Vec3::new(70.0, 65.0, -4.0), tool }, 1).expect("cut");
+    let dirty = dirty_chunks(&s);
+    let total: i64 = chunk_counts(&s).iter().product();
+    assert!(!dirty.is_empty() && (dirty.len() as i64) <= 9, "{} of {total} chunks dirty", dirty.len());
+    assert_two_per_edge(&weld(&chunk_meshes(&s)));
+}
+
+#[test]
+fn a_display_lod_mesh_has_far_fewer_triangles_than_the_full_surface() {
+    // Step 4 samples every fourth node: one coarse chunk covers this whole small stock.
+    let s = slot_stock(0.25);
+    let full: usize = chunk_meshes(&s).iter().map(|m| m.triangles.len()).sum();
+    let coarse = super::chunk_mesh_lod(&s, [0, 0, 0], 4).expect("the slot reaches this coarse chunk");
+    assert!(!coarse.triangles.is_empty());
+    assert!(coarse.triangles.len() * 4 < full, "coarse {} vs full {full} triangles", coarse.triangles.len());
+    // Step 1 is the full-resolution chunk mesh.
+    assert_eq!(super::chunk_mesh_lod(&s, [0, 0, 0], 1).map(|m| m.triangles.len()), chunk_mesh(&s, [0, 0, 0]).map(|m| m.triangles.len()));
 }

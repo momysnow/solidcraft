@@ -411,3 +411,20 @@ fn xz_and_yz_arcs_match_the_dense_oracle_on_x_y_and_z_rays() {
     }
     assert!(cut > 10, "rays cut: {cut}");
 }
+
+#[test]
+fn quarter_turn_pieces_cover_a_full_circle_in_order() {
+    // A full circle is one arc with the same start and end: four quarter turns, end to end.
+    let start = Vec3::new(10.0, 0.0, -4.0);
+    let arc = ArcFixedAxis::new(start, start, Vec3::new(0.0, 0.0, -4.0), Vec3::Z, true, 0, tool()).expect("arc");
+    let pieces = arc.pieces(std::f64::consts::FRAC_PI_2);
+    assert_eq!(pieces.len(), 4);
+    let total: f64 = pieces.iter().map(|p| p.sweep.abs()).sum();
+    assert!((total - arc.sweep.abs()).abs() < 1e-12, "{total} vs {}", arc.sweep);
+    for p in &pieces {
+        assert!((p.sweep.abs() - std::f64::consts::FRAC_PI_2).abs() < 1e-12, "{}", p.sweep);
+    }
+    // The first piece starts where the arc does, and the last ends where it does.
+    assert!((pieces[0].tip(0.0) - start).len() < 1e-9);
+    assert!((pieces[3].tip(pieces[3].sweep.abs()) - start).len() < 1e-9);
+}

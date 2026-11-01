@@ -57,7 +57,9 @@ pub(crate) fn chunk_counts<L: Lattice>(lat: &L) -> [i64; 3] {
     lat.cell_counts().map(|x| (x - LOWEST + 1 + CHUNK - 1) / CHUNK)
 }
 
-/// The surface of the cut stock, one mesh per non-empty chunk, in chunk order.
+/// The whole closed surface of the cut stock, one mesh per non-empty chunk, in chunk order. Untouched
+/// chunks are included, with their box faces, so this is the surface for volume and closedness checks.
+/// It is costly on a large stock: use [`chunk_mesh`] for drawing.
 pub fn chunk_meshes(stock: &Stock) -> Vec<Mesh> {
     extract(stock)
 }
@@ -78,10 +80,81 @@ pub fn extract<L: Lattice>(lat: &L) -> Vec<Mesh> {
     out
 }
 
-/// The mesh of one chunk of the cut stock, or `None` when the chunk has no surface. The index is
-/// the chunk's position along each axis, as [`dirty_chunks`] reports it.
+/// The surface of one chunk of the cut stock: its quads, the box faces included, or `None` when no cut
+/// has reached the chunk. The index is the chunk's position along each axis, as [`dirty_chunks`]
+/// reports it.
+///
+/// Design: a chunk no cut reached is the uncut box. It has no mesh here, and the caller draws the box
+/// itself. Box faces are per-cell quads, about 34 million triangles for a 300 x 200 mm top at 0.1 mm,
+/// so they are never meshed for a chunk that a cut has not reached. A chunk a cut reached keeps its
+/// own box faces, so the surface is closed where the cut is. The seam between a touched chunk's box
+/// faces and the box the caller draws is not stitched: a hairline gap at most, not a topology error.
+/// shortcut: stitch that seam (or draw the box with the same per-cell quads) when a UI needs it.
 pub fn chunk_mesh(stock: &Stock, idx: [usize; 3]) -> Option<Mesh> {
+    if !stock.is_touched(idx) {
+        return None;
+    }
     chunk_mesh_of(stock, idx.map(|x| x as i64))
+}
+
+/// A display mesh of chunk `idx` with the lattice sampled every `step` nodes (1, 2, 4 or 8): a coarse
+/// chunk spans `step` fine chunks along each axis and has about 1/step² of the quads. For drawing a
+/// stock the view is too big for only. The surface is not the simulated one and need not be closed.
+/// `None` when no cut reached the coarse chunk's fine nodes, as for [`chunk_mesh`]. Coarse node `k` is
+/// fine node `k * step`, so coarse chunk `c` covers fine nodes from `step * (c * CHUNK - 2)` on.
+pub fn chunk_mesh_lod(stock: &Stock, idx: [usize; 3], step: u32) -> Option<Mesh> {
+    let step = i64::from(step.clamp(1, 8));
+    if step == 1 {
+        return chunk_mesh(stock, idx);
+    }
+    let c = idx.map(|x| x as i64);
+    // Fine chunks that the coarse chunk's nodes can reach, with one chunk of margin either side.
+    let reached = stock.touched_chunks().into_iter().any(|t| (0..3).all(|k| (t[k] as i64) + 1 >= c[k] * step && (t[k] as i64) <= (c[k] + 1) * step));
+    if !reached {
+        return None;
+    }
+    let n = stock.cell_counts().map(|x| x as i64);
+    let counts = n.map(|x| (x + step - 1) / step);
+    chunk_mesh_of(&Strided { stock, step, counts }, c)
+}
+
+/// A lattice sampled every `step` nodes: coarse node `k` is fine node `k * step`, and a coarse edge
+/// crosses where the first fine edge along it changes sign.
+struct Strided<'a> {
+    stock: &'a Stock,
+    step: i64,
+    counts: [i64; 3],
+}
+
+impl Lattice for Strided<'_> {
+    fn cell_counts(&self) -> [i64; 3] {
+        self.counts
+    }
+
+    fn inside(&self, node: [i64; 3]) -> bool {
+        Lattice::inside(self.stock, node.map(|k| k * self.step))
+    }
+
+    fn crossing(&self, axis: usize, lower: [i64; 3]) -> Option<Vec3> {
+        let base = lower.map(|k| k * self.step);
+        let at = |i: i64| {
+            let mut p = base;
+            p[axis] += i;
+            p
+        };
+        for i in 0..self.step {
+            let (p, q) = (at(i), at(i + 1));
+            if Lattice::inside(self.stock, p) != Lattice::inside(self.stock, q) {
+                return Lattice::crossing(self.stock, axis, p);
+            }
+        }
+        // The coarse edge's ends differ, so a fine edge between them changes; the middle is a fallback.
+        let mid = |k: usize| {
+            let (a, b) = (self.stock.pos(k, base[k]), self.stock.pos(k, base[k] + if k == axis { self.step } else { 0 }));
+            0.5 * (a + b)
+        };
+        Some(Vec3::new(mid(0), mid(1), mid(2)))
+    }
 }
 
 /// The chunks whose surface may have changed since the last [`Stock::clear_dirty`]: each once. A cut

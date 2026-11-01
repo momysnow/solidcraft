@@ -12,6 +12,9 @@ use crate::sweep::{ArcFixedAxis, FlatTool, LinearFixedAxis, MAX_ARC_TURNS};
 use crate::toolpath::{Diag, MoveKind, NO_TOOL, Program, Shape};
 
 const MAX_DIAGS: usize = 1000;
+/// An arc is cut a quarter turn per step: a step is then a fraction of a second even at fine spacing,
+/// so a caller that checks its budget between steps stops in time.
+const STEP_SWEEP: f64 = std::f64::consts::FRAC_PI_2;
 
 fn finite(p: &[f64; 3]) -> bool {
     p.iter().all(|x| x.is_finite())
@@ -147,7 +150,7 @@ impl Cutter {
                 }
                 let arc = ArcFixedAxis::new(Vec3::from(start), Vec3::from(m.tip), Vec3::from(*centre), Vec3::from(*normal), *ccw, *turns, flat);
                 match arc {
-                    Some(arc) => arc.revolutions().into_iter().map(Step::Arc).collect(),
+                    Some(arc) => arc.pieces(STEP_SWEEP).into_iter().map(Step::Arc).collect(),
                     None => {
                         self.report(m.tool, "arc", Diag::error(m.source, 0, format!("degenerate arc at line {} skipped", m.source)));
                         return Ok(None);

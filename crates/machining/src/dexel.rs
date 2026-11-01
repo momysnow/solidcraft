@@ -83,6 +83,9 @@ pub struct Stock {
     budget: u64,
     /// Chunks whose surface may have changed since the last [`Stock::clear_dirty`]: each once, sorted.
     dirty: std::collections::BTreeSet<[usize; 3]>,
+    /// Every chunk a cut has reached since this stock was built. A chunk not in here is still the
+    /// uncut box, so it is not meshed (see `mesh::chunk_mesh`).
+    touched: std::collections::BTreeSet<[usize; 3]>,
 }
 
 /// Bytes of a tile's contents: a segment is 16 bytes, a start 4.
@@ -100,7 +103,17 @@ impl Stock {
         }
         let (lo, hi, n) = (layout.lo, layout.hi, layout.n);
         let grids = [build_grid(0, &n, &lo, &hi), build_grid(1, &n, &lo, &hi), build_grid(2, &n, &lo, &hi)];
-        Ok(Stock { min: lo, max: hi, cell: layout.cell, n, grids, used: layout.need, budget: budget_bytes, dirty: std::collections::BTreeSet::new() })
+        Ok(Stock {
+            min: lo,
+            max: hi,
+            cell: layout.cell,
+            n,
+            grids,
+            used: layout.need,
+            budget: budget_bytes,
+            dirty: std::collections::BTreeSet::new(),
+            touched: std::collections::BTreeSet::new(),
+        })
     }
 
     /// Bytes a box of `min..max` at ray spacing `h` takes, before any cut: what [`Stock::new_box`]
@@ -204,7 +217,9 @@ impl Stock {
         // The chunks that hold the nodes this sweep's box covers are dirty (see mesh::chunks_for_nodes).
         let counts = crate::mesh::chunk_counts(&*self);
         if let Some((lo, hi)) = self.node_box(bmin, bmax) {
-            self.dirty.extend(crate::mesh::chunks_for_nodes(lo, hi, counts));
+            let chunks = crate::mesh::chunks_for_nodes(lo, hi, counts);
+            self.touched.extend(chunks.iter().copied());
+            self.dirty.extend(chunks);
         }
         Ok(())
     }
@@ -268,17 +283,20 @@ impl Stock {
         total / 3.0
     }
 
-    /// Marks every chunk dirty. A stock built again (a rebuild) has a new surface everywhere, so the
-    /// caller redraws all of it, not only the chunks a cut touched.
-    pub fn mark_all_dirty(&mut self) {
-        let counts = crate::mesh::chunk_counts(&*self);
-        for z in 0..counts[2] {
-            for y in 0..counts[1] {
-                for x in 0..counts[0] {
-                    self.dirty.insert([x as usize, y as usize, z as usize]);
-                }
-            }
-        }
+    /// Marks these chunks dirty: the caller redraws them. A rebuilt stock marks the chunks the old one
+    /// had touched, since their surface has changed back to the box.
+    pub fn mark_dirty(&mut self, chunks: impl IntoIterator<Item = [usize; 3]>) {
+        self.dirty.extend(chunks);
+    }
+
+    /// The chunks a cut has reached since this stock was built, each once, sorted.
+    pub fn touched_chunks(&self) -> Vec<[usize; 3]> {
+        self.touched.iter().copied().collect()
+    }
+
+    /// Whether a cut has reached chunk `idx`. A chunk no cut reached is the uncut box.
+    pub fn is_touched(&self, idx: [usize; 3]) -> bool {
+        self.touched.contains(&idx)
     }
 
     /// FNV-1a over every segment and every start, in grid order: equal programs give equal hashes.

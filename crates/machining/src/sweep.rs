@@ -479,16 +479,22 @@ impl ArcFixedAxis {
     /// The arc cut into pieces of at most one revolution each, with the same union. The sim applies
     /// them one after another under one move tag, so a long arc can be pumped between revolutions.
     pub fn revolutions(&self) -> Vec<ArcFixedAxis> {
+        self.pieces(TAU)
+    }
+
+    /// The arc cut into pieces of at most `max` radians each, in order, with the same union. The
+    /// pieces share one circle and one lift per radian, so the pieces are exact parts of the arc.
+    pub fn pieces(&self, max: f64) -> Vec<ArcFixedAxis> {
         let total = self.sweep.abs();
-        if !(total > 0.0) {
+        if !(total > 0.0 && max > 0.0) {
             return Vec::new();
         }
         let sign = self.sweep.signum();
-        let count = (total / TAU).ceil().max(1.0) as usize;
+        let count = (total / max).ceil().max(1.0) as usize;
         (0..count)
             .map(|k| {
-                let start_u = k as f64 * TAU;
-                let len = (total - start_u).min(TAU);
+                let start_u = k as f64 * max;
+                let len = (total - start_u).min(max);
                 ArcFixedAxis {
                     centre: self.centre + self.lift * (start_u / total),
                     theta0: self.theta0 + sign * start_u,
