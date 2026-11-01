@@ -7,7 +7,7 @@
 //! start of the next path and cuts nothing).
 
 use crate::sweep::MAX_ARC_TURNS;
-use crate::toolpath::{Diag, Interp, Move, MoveKind, Program};
+use crate::toolpath::{Diag, Interp, Move, MoveKind, NO_TOOL, Program};
 
 pub const MAX_INPUT_BYTES: usize = 64 << 20;
 pub const MAX_LINE_BYTES: usize = 4096;
@@ -302,8 +302,8 @@ impl<'a> Parser<'a> {
                 feed: 0.0,
                 rpm: 0.0,
                 spindle_on: false,
-                tool: 0,
-                pending_tool: 0,
+                tool: NO_TOOL,
+                pending_tool: NO_TOOL,
                 cycle_unsupported: false,
                 frame_on: 0,
             },

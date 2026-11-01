@@ -3,6 +3,10 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The tool of a move made before the first tool change (M6): none is selected yet. The simulator
+/// reports such a move and does not cut it.
+pub const NO_TOOL: u32 = u32::MAX;
+
 /// A program: the moves in order, the tools they name, and what went wrong on the way.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Program {

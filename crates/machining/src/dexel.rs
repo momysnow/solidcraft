@@ -64,6 +64,9 @@ struct Grid {
     /// Tiles along `u`; tile `(tu, tv)` is `tiles[tv * tu_count + tu]`.
     tu: usize,
     tiles: Vec<Arc<Tile>>,
+    /// Sum of the lengths of every ray's material, in stored units. Kept up to date by `apply`, so
+    /// the volume is O(1) to read.
+    len: f64,
 }
 
 /// A box of material with three tri-dexel grids. Cell `i` along an axis spans `min + i * cell`
@@ -176,10 +179,13 @@ impl Stock {
         // The byte total must still fit the budget; checked before anything is committed.
         let mut added = 0u64;
         let mut removed = 0u64;
+        let mut len_change = [0.0f64; 3];
         for (a, tidx, tile) in &staged {
             added = added.saturating_add(tile_bytes(tile));
+            len_change[*a] += tile_len(tile);
             if let Some(old) = self.grids[*a].tiles.get(*tidx) {
                 removed = removed.saturating_add(tile_bytes(old));
+                len_change[*a] -= tile_len(old);
             }
         }
         let used = self.used.saturating_add(added).saturating_sub(removed);
@@ -190,6 +196,9 @@ impl Stock {
             if let Some(slot) = self.grids[a].tiles.get_mut(tidx) {
                 *slot = Arc::new(tile);
             }
+        }
+        for (grid, change) in self.grids.iter_mut().zip(len_change) {
+            grid.len += change;
         }
         self.used = used;
         // The chunks that hold the nodes this sweep's box covers are dirty (see mesh::chunks_for_nodes).
@@ -252,20 +261,24 @@ impl Stock {
     /// rounds sharp edges by up to a cell instead.
     pub fn volume(&self) -> f64 {
         let mut total = 0.0;
-        for a in 0..3 {
+        for (a, grid) in self.grids.iter().enumerate() {
             let (u, v) = ((a + 1) % 3, (a + 2) % 3);
-            let area = self.cell[u] * self.cell[v];
-            let mut len = 0.0;
-            for tile in &self.grids[a].tiles {
-                for r in 0..tile.rays() {
-                    for s in tile.ray(r) {
-                        len += f64::from(s.hi) - f64::from(s.lo);
-                    }
-                }
-            }
-            total += len * area;
+            total += grid.len * self.cell[u] * self.cell[v];
         }
         total / 3.0
+    }
+
+    /// Marks every chunk dirty. A stock built again (a rebuild) has a new surface everywhere, so the
+    /// caller redraws all of it, not only the chunks a cut touched.
+    pub fn mark_all_dirty(&mut self) {
+        let counts = crate::mesh::chunk_counts(&*self);
+        for z in 0..counts[2] {
+            for y in 0..counts[1] {
+                for x in 0..counts[0] {
+                    self.dirty.insert([x as usize, y as usize, z as usize]);
+                }
+            }
+        }
     }
 
     /// FNV-1a over every segment and every start, in grid order: equal programs give equal hashes.
@@ -482,7 +495,13 @@ fn build_grid(axis: usize, n: &[usize; 3], lo: &[f64; 3], hi: &[f64; 3]) -> Grid
             tiles.push(tile);
         }
     }
-    Grid { nu, nv, tu, tiles }
+    let len = tiles.iter().map(|t| tile_len(t)).sum();
+    Grid { nu, nv, tu, tiles, len }
+}
+
+/// Sum of the ray lengths of one tile, in stored units.
+fn tile_len(tile: &Tile) -> f64 {
+    tile.segs.iter().map(|s| f64::from(s.hi) - f64::from(s.lo)).sum()
 }
 
 /// The tile's rays after the cuts: each cut ray is rebuilt, the others are copied.

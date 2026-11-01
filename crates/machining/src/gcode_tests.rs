@@ -510,11 +510,15 @@ fn nan_and_exponent_text_is_rejected() {
 }
 
 #[test]
-fn tool_default_is_zero_until_m6() {
+fn tool_is_none_until_m6() {
+    // No tool is selected before the first M6, so a move before it is not taken for tool 0.
     let p = run("G1 X1");
-    assert_eq!(p.moves[0].tool, 0);
+    assert_eq!(p.moves[0].tool, u32::MAX);
     let tooled = run("T4 M6\nG1 X1");
     assert_eq!(only_move(&tooled).tool, 4);
+    // M6 with no T word before it selects nothing either.
+    let bare = run("M6\nG1 X1");
+    assert_eq!(only_move(&bare).tool, u32::MAX);
 }
 
 #[test]

@@ -147,7 +147,7 @@ fn a_slightly_smaller_tool_fails_the_volume_check() {
 }
 
 fn pocket_program() -> Vec<crate::toolpath::Move> {
-    let text = "G0 X37.5 Y30 Z5\nG1 Z-4 F200\nG3 X37.5 Y30 I-7.5 J0\nG1 X32.5 Y30\nG3 X32.5 Y30 I-2.5 J0";
+    let text = "T0 M6\nG0 X37.5 Y30 Z5\nG1 Z-4 F200\nG3 X37.5 Y30 I-7.5 J0\nG1 X32.5 Y30\nG3 X32.5 Y30 I-2.5 J0";
     parse(text, &CodeTable::default()).moves
 }
 
@@ -271,7 +271,7 @@ fn bad_sweep_bounds_do_not_panic() {
 
 #[test]
 fn g_code_slot_simulates_to_the_analytic_floor() {
-    let text = "G0 X10 Y10.03 Z5\nG1 Z-4 F100\nG1 X50\nG0 Z5\nG0 X10 Y10.03";
+    let text = "T0 M6\nG0 X10 Y10.03 Z5\nG1 Z-4 F100\nG1 X50\nG0 Z5\nG0 X10 Y10.03";
     let program = parse(text, &CodeTable::default());
     assert!(program.diags.is_empty());
     let program = Program { tools: vec![flat_tool(0)], ..program };
@@ -285,7 +285,7 @@ fn g_code_slot_simulates_to_the_analytic_floor() {
 #[test]
 fn a_jump_after_home_is_not_cut_and_the_next_move_starts_from_it() {
     // Home is unknown: the move after G28 starts a new path, so the travel to it is not cut.
-    let text = "G0 X10 Y10 Z5\nG1 Z-4 F100\nG1 X20\nG28\nG0 X30 Y10 Z5\nG1 X40 Y10 Z-4";
+    let text = "T0 M6\nG0 X10 Y10 Z5\nG1 Z-4 F100\nG1 X20\nG28\nG0 X30 Y10 Z5\nG1 X40 Y10 Z-4";
     let program = parse(text, &CodeTable::default());
     assert!(program.diags.iter().all(|d| !d.is_error()), "{:?}", program.diags);
     let program = Program { tools: vec![flat_tool(0)], ..program };
@@ -299,7 +299,7 @@ fn a_jump_after_home_is_not_cut_and_the_next_move_starts_from_it() {
 
 #[test]
 fn unsupported_shapes_are_reported_once_not_panicked() {
-    let text = "G0 X10 Y10 Z5\nG1 Z-4\nG1 X20\nG1 X30";
+    let text = "T0 M6\nG0 X10 Y10 Z5\nG1 Z-4\nG1 X20\nG1 X30";
     let mut program = parse(text, &CodeTable::default());
     program.tools =
         vec![Tool { id: 0, shape: Shape::Ball, diameter: 5.0, flute_length: 20.0, shank: Vec::new(), holder: Vec::new(), stickout: 30.0 }];
@@ -312,7 +312,7 @@ fn unsupported_shapes_are_reported_once_not_panicked() {
 
 #[test]
 fn undefined_tool_is_reported() {
-    let program = parse("G0 X1\nG1 X2", &CodeTable::default());
+    let program = parse("T0 M6\nG0 X1\nG1 X2", &CodeTable::default());
     let mut s = slot_stock(0.5);
     let diags = simulate(&program, &mut s).expect("simulate");
     assert!(diags.iter().any(|d| d.msg.contains("not defined")), "{diags:?}");
@@ -372,12 +372,102 @@ fn a_failing_cut_names_its_move() {
         moves,
         diags: Vec::new(),
     };
-    match simulate(&program, &mut s) {
-        Err(SimError::AtMove { index, line, cause }) => {
-            assert!(index > 0 && line >= 100, "index {index} line {line}");
-            assert!(cause.contains("segments"), "{cause}");
+    // A move over the segment cap is skipped and reported, not an error: the run goes on.
+    let diags = simulate(&program, &mut s).expect("the cap is a diagnostic, not a failed run");
+    assert!(!diags.is_empty(), "the cap is reached, so it must be reported");
+    assert!(diags.iter().all(|d| d.line >= 100 && d.msg.contains("segments")), "{diags:?}");
+    // One diagnostic per cause, however many moves hit the cap.
+    assert_eq!(diags.len(), 1, "{diags:?}");
+}
+
+#[test]
+fn moves_before_the_first_tool_change_are_warned_and_not_cut() {
+    // A rapid before any M6 carries no tool: a warning, and the stock is not touched by it.
+    let program = Program {
+        tools: vec![flat_tool(1)],
+        moves: vec![
+            crate::toolpath::Move {
+                kind: crate::toolpath::MoveKind::Rapid,
+                tip: [0.0, 0.0, 5.0],
+                axis: [0.0, 0.0, 1.0],
+                joints: None,
+                interp: crate::toolpath::Interp::Tcp,
+                tool: 1,
+                feed: 0.0,
+                spindle: 0.0,
+                source: 1,
+            },
+            crate::toolpath::Move {
+                kind: crate::toolpath::MoveKind::Rapid,
+                tip: [10.0, 10.0, 5.0],
+                axis: [0.0, 0.0, 1.0],
+                joints: None,
+                interp: crate::toolpath::Interp::Tcp,
+                tool: u32::MAX,
+                feed: 0.0,
+                spindle: 0.0,
+                source: 2,
+            },
+            crate::toolpath::Move {
+                kind: crate::toolpath::MoveKind::Feed,
+                tip: [10.0, 10.0, -2.0],
+                axis: [0.0, 0.0, 1.0],
+                joints: None,
+                interp: crate::toolpath::Interp::Tcp,
+                tool: 1,
+                feed: 100.0,
+                spindle: 0.0,
+                source: 2,
+            },
+        ],
+        diags: Vec::new(),
+    };
+    let mut s = slot_stock(0.5);
+    let diags = simulate(&program, &mut s).expect("simulate");
+    assert!(diags.iter().any(|d| d.msg.contains("no tool") && d.line == 2), "{diags:?}");
+    assert!(diags.iter().all(|d| !d.is_error()), "a move with no tool is a warning: {diags:?}");
+    assert!(s.volume() < box_volume(), "the feed after the tool change cuts");
+}
+
+#[test]
+fn incremental_volume_matches_a_full_scan_after_random_cuts() {
+    // A deterministic walk of slots and plunges over a box, checked against a scan of every ray.
+    let scan = |s: &Stock| -> f64 {
+        let mut total = 0.0;
+        for a in 0..3 {
+            let (u, v) = ((a + 1) % 3, (a + 2) % 3);
+            let area = s.cell[u] * s.cell[v];
+            let mut len = 0.0;
+            for tile in &s.grids[a].tiles {
+                for r in 0..tile.rays() {
+                    for seg in tile.ray(r) {
+                        len += f64::from(seg.hi) - f64::from(seg.lo);
+                    }
+                }
+            }
+            total += len * area;
         }
-        other => panic!("expected a named failure, got {other:?}"),
+        total / 3.0
+    };
+    let mut s = Stock::new_box(Vec3::new(0.0, 0.0, -10.0), Vec3::new(30.0, 30.0, 0.0), 0.5, BUDGET).expect("stock");
+    let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut next = move |scale: f64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed % 10_000) as f64 / 10_000.0 * scale
+    };
+    for k in 0..60u32 {
+        let (x, y, z) = (next(30.0), next(30.0), -next(10.0));
+        let (x2, y2) = (next(30.0), next(30.0));
+        let tool = FlatTool::new(1.0 + next(2.0), 8.0, Vec3::Z).expect("tool");
+        let sweep = LinearFixedAxis { from: Vec3::new(x, y, z), to: Vec3::new(x2, y2, z), tool };
+        match s.apply(&sweep, k + 1) {
+            Ok(()) | Err(SimError::SegmentCap { .. }) => {}
+            Err(e) => panic!("{e:?}"),
+        }
+        let (full, incremental) = (scan(&s), s.volume());
+        assert!((full - incremental).abs() <= 1e-9 * full.max(1.0), "cut {k}: scan {full}, cached {incremental}");
     }
 }
 
@@ -405,7 +495,7 @@ fn arc_sweep_on_the_stock_matches_a_full_circle_pocket_ring() {
 
 #[test]
 fn a_non_finite_position_is_a_diagnostic_not_a_cut() {
-    let mut program = parse("G0 X10 Y10 Z5\nG1 Z-4\nG1 X20", &CodeTable::default());
+    let mut program = parse("T0 M6\nG0 X10 Y10 Z5\nG1 Z-4\nG1 X20", &CodeTable::default());
     program.tools = vec![flat_tool(0)];
     program.moves[1].tip[0] = f64::NAN;
     let mut s = slot_stock(0.5);
