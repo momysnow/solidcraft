@@ -602,7 +602,10 @@ fn toolpath_cmd(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let tolerance = match p.get("tolerance") {
         None | Some(Value::Null) => PATH_TOLERANCE,
-        Some(v) => v.as_f64().filter(|t| t.is_finite() && *t > 0.0 && *t <= 1.0).ok_or_else(|| bad(cmd, "`tolerance` must be a chord tolerance in mm, 0 < t ≤ 1"))?,
+        Some(v) => v
+            .as_f64()
+            .filter(|t| t.is_finite() && *t > 0.0 && *t <= 1.0)
+            .ok_or_else(|| bad(cmd, "`tolerance` must be a chord tolerance in mm, 0 < t ≤ 1"))?,
     };
     let frame = work_frame(&setup).map_err(|e| bad(cmd, e))?;
     let mut operations = Vec::new();
