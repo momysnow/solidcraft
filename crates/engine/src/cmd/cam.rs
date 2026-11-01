@@ -5,8 +5,8 @@
 
 use serde_json::{Value, json};
 use solidcraft_cam::{
-    AdaptiveParams, ContourParams, Cut, Feeds, Heights, Operation, PocketParams, Post, Program, Side, Tool, ToolKind, adaptive, contour, emit,
-    pocket, readback,
+    AdaptiveParams, ContourParams, Cut, Feeds, Heights, Operation, PocketParams, Post, Program, Side, Tool, ToolKind, Toolpath, adaptive, contour,
+    emit, pocket, readback,
 };
 use solidcraft_doc::cam::{
     CamAdaptiveParams, CamContourParams, CamCut, CamFaceRef, CamGeometry, CamOperation, CamPocketParams, CamSettings, CamSetup, CamSide, MAX_OPS,
@@ -21,6 +21,7 @@ use solidcraft_sketch::{LinkGeom, LinkKind};
 
 use super::CommandSpec;
 use crate::params::{bad, bool_, expr, num, req_expr, str_, string_list, vec2, vec2_list, vec3};
+use crate::schema::cam::{PathKind, ToolpathOperation, ToolpathParams, ToolpathResult};
 use crate::{Result, Session};
 
 pub static COMMANDS: &[CommandSpec] = &[
@@ -38,7 +39,8 @@ pub static COMMANDS: &[CommandSpec] = &[
     ),
     CommandSpec::new("cam.op.contour", "2D Contour", contour_cmd).icon("cut").params(
         "setup; name; tool (number); sketch?: id or name, with profiles?: as solid.extrude; faces?: [{body, name, at?}]; \
-         or outer: [[x,y],…] (or regions: [{outer, holes?}]); holes?: [[[x,y],…]]; \
+         or outer: [[x,y],…] (or regions: [{outer, holes?}]); holes?: [[[x,y],…]] — polygon points are in the setup's work \
+         coordinates (not the model's; sketch and face geometry is mapped to work for you); \
          side?: outside|inside|on (default outside); climb?: bool (default true); stock_to_leave?; tolerance?; \
          ramp_angle?: deg (default 0); clearance?; retract?; top?; bottom (required unless cut given); stepdown?; \
          feed?; plunge_feed?; spindle_rpm?; coolant?",
@@ -46,21 +48,37 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("cam.op.pocket", "2D Pocket", pocket_cmd).icon("hole").params(
         "setup; name; tool (number); sketch?: id or name, with profiles?; faces?; or outer/regions; holes?; \
          stepover? (default half the tool diameter); climb?; stock_to_leave?; tolerance?; ramp_angle?: deg; \
-         clearance?; retract?; top?; bottom; stepdown?; feed?; plunge_feed?; spindle_rpm?; coolant?",
+         clearance?; retract?; top?; bottom; stepdown?; feed?; plunge_feed?; spindle_rpm?; coolant? \
+         (polygon outer/holes are in the setup's work coordinates, as for cam.op.contour)",
     ),
     CommandSpec::new("cam.op.adaptive", "Adaptive Clear", adaptive_cmd).icon("hole").params(
         "setup; name; tool (number); sketch?: id or name, with profiles?; faces?; or outer/regions; holes?; \
          stepover? (default half the tool diameter); climb?; stock_to_leave?; tolerance?; \
          clearance?; retract?; top?; bottom; stepdown?; feed?; plunge_feed?; spindle_rpm?; coolant? \
-         → constant-engagement clearing; narrow slots are crossed, not cleared",
+         → constant-engagement clearing; narrow slots are crossed, not cleared (polygon outer/holes are in the setup's work coordinates)",
     ),
     CommandSpec::new("cam.op.remove", "Remove CAM Operation", delete_op).icon("delete").params("setup; name"),
     CommandSpec::new("cam.post", "Post Process", post_cmd).icon("export").noundo().params(
         "setup; post?: rs274 | name of a saved post (default rs274); program?: name (default the setup's) → \
          {gcode, extension, post, operations, readback}. G-code is always read back and checked against the toolpaths.",
     ),
+    CommandSpec::new("cam.toolpath", "Toolpaths", crate::checked!("cam.toolpath", toolpath_cmd))
+        .icon("list")
+        .noundo()
+        .contract(&TOOLPATH_CONTRACT)
+        .output(crate::schema::output_schema_for::<ToolpathResult>)
+        .params(
+            "setup; operation?: name (default every operation, in order) → {setup, operations: [{name, tool, error?, length_mm, \
+             points: [[x,y,z]…] in model coordinates (mm), kinds: [rapid|feed|plunge…] with kinds[i] the move that ends at points[i]}]}. \
+             An operation that does not build reports its error and the others still return. Read only: the design is not changed.",
+        ),
     CommandSpec::new("cam.list", "List CAM", list_cmd).icon("list").noundo().params("→ tools, setups (with operations) and saved posts"),
 ];
+
+const TOOLPATH_CONTRACT: crate::schema::TypedContract<ToolpathParams> = crate::schema::TypedContract::new();
+
+/// Chord tolerance (mm) for the points of an arc in a reported toolpath.
+const PATH_TOLERANCE: f64 = 0.01;
 
 fn tool_cmd(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "cam.tool.define";
@@ -560,6 +578,58 @@ impl WorkFrame {
     fn local(&self, p: Vec3) -> Vec3 {
         let d = p - self.o;
         Vec3::new(d.dot(self.x), d.dot(self.y), d.dot(self.z))
+    }
+
+    /// The inverse of `local`: a work point in model coordinates.
+    fn model(&self, w: Vec3) -> Vec3 {
+        self.o + self.x * w.x + self.y * w.y + self.z * w.z
+    }
+}
+
+fn toolpath_cmd(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "cam.toolpath";
+    let setup_name = str_(p, "setup").map(str::trim).filter(|n| !n.is_empty()).ok_or_else(|| bad(cmd, "`setup` is required"))?.to_string();
+    let only = match p.get("operation") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(n)) => Some(n.trim().to_string()),
+        Some(_) => return Err(bad(cmd, "`operation` must be an operation's name")),
+    };
+    let setup = s.doc.cam.setup(&setup_name).cloned().ok_or_else(|| bad(cmd, format!("no setup `{setup_name}`")))?;
+    if let Some(name) = &only
+        && !setup.operations.iter().any(|o| o.name() == name)
+    {
+        return Err(bad(cmd, format!("no operation `{name}` in setup `{setup_name}`")));
+    }
+    let frame = work_frame(&setup).map_err(|e| bad(cmd, e))?;
+    let mut operations = Vec::new();
+    for op in setup.operations.iter().filter(|o| only.as_deref().is_none_or(|n| o.name() == n)) {
+        let mut out =
+            ToolpathOperation { name: op.name().to_string(), tool: op.tool(), error: None, length_mm: 0.0, points: Vec::new(), kinds: Vec::new() };
+        match build_path(s, &setup, op) {
+            Ok(path) => fill_path(&mut out, &path, &frame),
+            Err(e) => out.error = Some(e),
+        }
+        operations.push(out);
+    }
+    serde_json::to_value(ToolpathResult { setup: setup_name, operations }).map_err(|e| bad(cmd, e.to_string()))
+}
+
+/// The path's points in model coordinates, each with the kind of the move that ends there.
+fn fill_path(out: &mut ToolpathOperation, path: &Toolpath, frame: &WorkFrame) {
+    let stats = path.stats();
+    out.length_mm = stats.cut_length + stats.rapid_length;
+    let mut prev: Option<Vec3> = None;
+    for (w, cutting) in path.points(PATH_TOLERANCE) {
+        let kind = match prev {
+            _ if !cutting => PathKind::Rapid,
+            // A feed that only goes down (no XY motion) is a plunge.
+            Some(p) if (w.x - p.x).hypot(w.y - p.y) <= 1e-9 && w.z < p.z - 1e-9 => PathKind::Plunge,
+            _ => PathKind::Feed,
+        };
+        prev = Some(w);
+        let m = frame.model(w);
+        out.points.push([m.x, m.y, m.z]);
+        out.kinds.push(kind);
     }
 }
 
@@ -1090,5 +1160,122 @@ mod tests {
         let gcode = posted["gcode"].as_str().unwrap();
         assert!(gcode.contains("G2 ") || gcode.contains("G3 "), "{gcode}");
         assert!(posted["readback"]["within"].as_bool().unwrap());
+    }
+
+    /// A toolpath comes back in model coordinates. A polygon `outer` is already in the setup's
+    /// work coordinates (only sketch and face geometry is mapped), so with the work origin
+    /// [10, 20, 5] the pocket's region x 15..45, y 25..45 sits at model x 25..55, y 45..65. The
+    /// floor is the origin's Z plus the bottom, and rapids are marked.
+    #[test]
+    fn toolpath_is_in_model_coordinates_and_marks_rapids() {
+        let mut s = Session::default();
+        run(&mut s, "cam.tool.define", json!({"number": 1, "diameter": 6, "flute_length": 20, "feed": 600, "plunge_feed": 200, "stepdown": 3}));
+        run(&mut s, "cam.setup", json!({"name": "Top", "work_origin": [10, 20, 5]}));
+        run(
+            &mut s,
+            "cam.op.pocket",
+            json!({
+                "setup": "Top", "name": "Pocket", "tool": 1,
+                "outer": [[15, 25], [45, 25], [45, 45], [15, 45]],
+                "stepover": 2, "bottom": -3, "stepdown": 3,
+            }),
+        );
+        let undo = s.undo.len();
+        let r = run(&mut s, "cam.toolpath", json!({"setup": "Top"}));
+        assert_eq!(s.undo.len(), undo, "a read changes nothing");
+        let op = &r["operations"][0];
+        assert_eq!(op["name"], "Pocket");
+        assert_eq!(op["tool"], 1);
+        assert!(op.get("error").is_none(), "{op}");
+        let points = op["points"].as_array().unwrap();
+        let kinds = op["kinds"].as_array().unwrap();
+        assert_eq!(points.len(), kinds.len());
+        assert!(kinds.iter().any(|k| k.as_str() == Some("rapid")), "{op}");
+        assert!(kinds.iter().any(|k| k.as_str() == Some("feed")), "{op}");
+        let mut lowest = f64::MAX;
+        for (p, k) in points.iter().zip(kinds) {
+            if k.as_str() == Some("rapid") {
+                continue;
+            }
+            let (x, y, z) = (p[0].as_f64().unwrap(), p[1].as_f64().unwrap(), p[2].as_f64().unwrap());
+            assert!(
+                (25.0 - 1e-6..=55.0 + 1e-6).contains(&x) && (45.0 - 1e-6..=65.0 + 1e-6).contains(&y),
+                "a cut at ({x}, {y}, {z}) leaves the pocket's model region"
+            );
+            lowest = lowest.min(z);
+        }
+        assert!((lowest - 2.0).abs() < 1e-6, "the floor is the origin's Z (5) plus the bottom (-3), got {lowest}");
+        assert!(op["length_mm"].as_f64().unwrap() > 0.0);
+    }
+
+    /// A sketch is in model coordinates, so its path sits over the sketch whatever the work
+    /// origin: the outside contour of a 40 × 30 rectangle runs one tool radius (3 mm) beyond its
+    /// edges. A shifted work frame, mapped wrongly, would move it by the origin's 10 and 20 mm.
+    #[test]
+    fn toolpath_of_a_sketch_sits_over_the_sketch_with_a_work_origin() {
+        let mut s = Session::default();
+        run(&mut s, "sketch.create", json!({"plane": "XY"}));
+        run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [40, 30]}));
+        let sketch = s.active_sketch.expect("sketch");
+        run(&mut s, "sketch.finish", json!({}));
+        run(&mut s, "cam.tool.define", json!({"number": 1, "diameter": 6, "flute_length": 20, "feed": 600, "plunge_feed": 200, "stepdown": 3}));
+        run(&mut s, "cam.setup", json!({"name": "Top", "work_origin": [10, 20, 5]}));
+        run(
+            &mut s,
+            "cam.op.contour",
+            json!({"setup": "Top", "name": "Outside", "tool": 1, "sketch": sketch, "side": "outside", "bottom": -3, "stepdown": 3}),
+        );
+        let r = run(&mut s, "cam.toolpath", json!({"setup": "Top"}));
+        let op = &r["operations"][0];
+        assert!(op.get("error").is_none(), "{op}");
+        let mut min = [f64::MAX; 2];
+        let mut max = [f64::MIN; 2];
+        let mut lowest = f64::MAX;
+        for (p, k) in op["points"].as_array().unwrap().iter().zip(op["kinds"].as_array().unwrap()) {
+            if k.as_str() == Some("rapid") {
+                continue;
+            }
+            let (x, y, z) = (p[0].as_f64().unwrap(), p[1].as_f64().unwrap(), p[2].as_f64().unwrap());
+            min = [min[0].min(x), min[1].min(y)];
+            max = [max[0].max(x), max[1].max(y)];
+            lowest = lowest.min(z);
+        }
+        assert!((min[0] + 3.0).abs() < 0.05 && (max[0] - 43.0).abs() < 0.05, "x runs {min:?}..{max:?}, not -3..43");
+        assert!((min[1] + 3.0).abs() < 0.05 && (max[1] - 33.0).abs() < 0.05, "y runs {min:?}..{max:?}, not -3..33");
+        assert!((lowest - 2.0).abs() < 1e-6, "the floor is the origin's Z (5) plus the bottom (-3), got {lowest}");
+    }
+
+    /// A broken operation reports its error, the others still return, and a named operation or
+    /// an unknown setup is refused.
+    #[test]
+    fn a_broken_operation_reports_its_error_and_the_others_still_return() {
+        let mut s = Session::default();
+        run(&mut s, "cam.tool.define", json!({"number": 1, "diameter": 6, "flute_length": 20, "feed": 600, "plunge_feed": 200, "stepdown": 3}));
+        run(&mut s, "cam.setup", json!({"name": "Top"}));
+        run(
+            &mut s,
+            "cam.op.contour",
+            json!({"setup": "Top", "name": "Outside", "tool": 1, "outer": [[0, 0], [40, 0], [40, 30], [0, 30]], "side": "outside", "bottom": -3, "stepdown": 3}),
+        );
+        run(
+            &mut s,
+            "cam.op.pocket",
+            json!({"setup": "Top", "name": "Pocket", "tool": 1, "outer": [[5, 5], [35, 5], [35, 25], [5, 25]], "stepover": 2, "bottom": -3, "stepdown": 3}),
+        );
+        // The pocket's floor stops evaluating after it was accepted.
+        if let Some(CamOperation::Pocket { cut, .. }) = s.doc_mut().cam.setup_mut("Top").and_then(|st| st.operations.get_mut(1)) {
+            cut.bottom = Expr::new("nosuch mm");
+        }
+        let r = run(&mut s, "cam.toolpath", json!({"setup": "Top"}));
+        let ops = r["operations"].as_array().unwrap();
+        assert_eq!(ops.len(), 2);
+        assert!(ops[0].get("error").is_none(), "{}", ops[0]);
+        assert!(!ops[0]["points"].as_array().unwrap().is_empty());
+        assert!(ops[1]["error"].as_str().is_some_and(|e| !e.is_empty()), "{}", ops[1]);
+        assert!(ops[1]["points"].as_array().unwrap().is_empty());
+        let one = run(&mut s, "cam.toolpath", json!({"setup": "Top", "operation": "Outside"}));
+        assert_eq!(one["operations"].as_array().unwrap().len(), 1);
+        assert!(s.execute("cam.toolpath", &json!({"setup": "Top", "operation": "Nope"})).is_err());
+        assert!(s.execute("cam.toolpath", &json!({"setup": "Nope"})).is_err());
     }
 }

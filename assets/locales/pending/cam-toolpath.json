@@ -1,0 +1,7 @@
+{
+  "en": { "cmd.cam.toolpath": "Toolpaths" },
+  "de": { "cmd.cam.toolpath": "Werkzeugwege" },
+  "ja": { "cmd.cam.toolpath": "工具パス" },
+  "ko": { "cmd.cam.toolpath": "공구 경로" },
+  "zh": { "cmd.cam.toolpath": "刀具路径" }
+}

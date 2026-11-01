@@ -54,6 +54,7 @@ mod coverage_tests;
 mod tests;
 
 // The contracts, by command file.
+pub mod cam;
 pub mod component;
 pub mod construct;
 pub mod edit;
