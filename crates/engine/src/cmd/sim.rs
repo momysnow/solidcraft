@@ -1,8 +1,8 @@
 //! Stock-removal simulation of G-code on a box stock (S1). `sim.setup` loads a program, `sim.run`
 //! cuts it forward or back, `sim.status` reports it and `sim.clear` drops it. The state is the
-//! session's runtime state (`sim_jobs.rs`), not the design: none of these is an undo step.
+//! session's runtime state (`sim_jobs.rs`), not the design: none of these is an undo step, and none
+//! reads the evaluated model.
 
-use std::collections::BTreeSet;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -12,13 +12,14 @@ use solidcraft_machining::SimError;
 use solidcraft_machining::dexel::Stock;
 use solidcraft_machining::gcode::{self, CodeTable};
 use solidcraft_machining::sweep::FlatTool;
-use solidcraft_machining::toolpath::{Diag, Severity, Shape, Tool};
+use solidcraft_machining::toolpath::{Diag, NO_TOOL, Severity, Shape, Tool};
 use web_time::Instant;
 
 use super::CommandSpec;
 use crate::params::bad;
 use crate::schema::sim::{
-    BoundsReply, ClearParams, ClearReply, DiagReply, MemoryReply, MoveTarget, RunParams, RunReply, SetupParams, SetupReply, StatusParams, StatusReply,
+    BoundsReply, ClearParams, ClearReply, DiagReply, MemoryReply, MoveTarget, PartialReply, RunParams, RunReply, SetupParams, SetupReply, ShapeName,
+    StatusParams, StatusReply, ToolParams,
 };
 use crate::schema::{TypedContract, output_schema_for};
 use crate::sim_jobs::{Job, Setup};
@@ -30,7 +31,7 @@ const STATUS: TypedContract<StatusParams> = TypedContract::new();
 const CLEAR: TypedContract<ClearParams> = TypedContract::new();
 
 /// The memory cap a setup gets when it names none, in MB.
-const DEFAULT_MEMORY_MB: u64 = 1024;
+const DEFAULT_MEMORY_MB: u64 = 512;
 /// The largest cap a setup may name, in MB: the web build has about 4 GB of address space.
 const MAX_MEMORY_MB: u64 = 1024;
 const MAX_TOOLS: usize = 64;
@@ -49,22 +50,25 @@ pub static COMMANDS: &[CommandSpec] = &[
         .contract(&SETUP)
         .output(output_schema_for::<SetupReply>)
         .noundo()
-        .params("stock: {box: {min: [x,y,z], max: [x,y,z]}}, mm in the workpiece frame; tools: [{id, diameter, flute_length, shape?: \"flat\"}], flat end mills in mm, one for each T the G-code cuts with and no others; gcode: text for a generic 3-axis machine; resolution?: ray spacing h in mm (default: the finest of 0.05 to 20 mm that fits memory_mb); memory_mb?: cap from 1 to 1024 (default 1024). Parses the G-code, builds the stock uncut and resets the cursor to 0, replacing any earlier simulation. Replies moves, bounds, h, memory_estimate {bytes, budget}, diag_count and diagnostics [{line, col, severity, msg}] (the first 200). Bad or too large input is refused and nothing changes. Nothing is cut yet: see sim.run."),
+        .doc_only()
+        .params("stock: {box: {min: [x,y,z], max: [x,y,z]}}, mm in the workpiece frame; tools: [{id, diameter, flute_length, shape?: flat|ball|bull|cone|taper|profile, plus the fields that shape needs}], mm; gcode: text for a generic 3-axis machine; initial_tool?: the tool the moves before the first M6 cut with; resolution?: ray spacing h in mm (default: the finest of 0.05 to 20 mm whose stock fits half of memory_mb); memory_mb?: cap from 1 to 1024 (default 512). Parses the G-code, builds the stock uncut and resets the cursor to 0, replacing any earlier simulation. A move with no tool, or a tool not listed, is a diagnostic. Replies moves, bounds, h, memory_estimate {bytes, budget}, diag_count and diagnostics [{line, col, severity, msg}] (the first 200). Bad or too large input is refused and nothing changes. Nothing is cut yet: see sim.run."),
     CommandSpec::new("sim.run", "Run Simulation", crate::checked!("sim.run", run))
         .contract(&RUN)
         .output(output_schema_for::<RunReply>)
         .noundo()
-        .params("to?: move index, or \"end\" (default); past the last move is an error. budget_s?: wall-clock seconds; the run stops after the move that passes it, with done false. Cuts forward, or rebuilds the stock from the start and cuts back to `to`. Replies at, total, done and removed_volume (mm^3). Errors without sim.setup."),
+        .doc_only()
+        .params("to?: move index, or \"end\" (default); past the last move is an error. budget_s?: wall-clock seconds; the run stops after the first step past it, with reached false, and always cuts at least one step. Cuts forward, or rebuilds the stock from the start and cuts back to `to`. Replies at (moves completed), total, reached (at is to), done (at is total), removed_volume (mm^3), revision (changes when the stock is built again) and partial ({step, steps} of the move in progress). Errors without sim.setup, and forward once a step has failed (see sim.status)."),
     CommandSpec::new("sim.status", "Simulation Status", crate::checked!("sim.status", status))
         .contract(&STATUS)
         .output(output_schema_for::<StatusReply>)
         .noundo()
         .doc_only()
-        .params("offset?: first diagnostic to list (default 0); limit?: most to list (default 100, at most 1000). Read only. Replies cursor, total, stock_volume, remaining_volume, removed_volume (mm^3), memory {bytes, budget}, diag_count and the page of diagnostics. Errors without sim.setup."),
+        .params("offset?: first diagnostic to list (default 0); limit?: most to list (default 100, at most 1000). Read only. Replies cursor, total, stock_volume, remaining_volume, removed_volume (mm^3), memory {bytes, budget}, diag_count, error (why the run stopped, or null), revision, partial and the page of diagnostics. Errors without sim.setup."),
     CommandSpec::new("sim.clear", "Clear Simulation", crate::checked!("sim.clear", clear))
         .contract(&CLEAR)
         .output(output_schema_for::<ClearReply>)
         .noundo()
+        .doc_only()
         .params("No parameters. Drops the simulation and its stock. Replies cleared: whether there was one."),
 ];
 
@@ -95,13 +99,18 @@ fn memory_reply(job: &Job) -> MemoryReply {
     MemoryReply { bytes, budget }
 }
 
-/// The finest spacing of [`RESOLUTIONS`] whose stock fits `budget`. A spacing too fine for this box
-/// is skipped; when none fits, the error says how much the coarsest one needs.
+fn partial_reply(job: &Job) -> Option<PartialReply> {
+    job.partial().map(|(step, steps)| PartialReply { step: count(step), steps: count(steps) })
+}
+
+/// The finest spacing of [`RESOLUTIONS`] whose stock fits half of `budget`, so the cuts have room to
+/// split rays. A spacing too fine for this box is skipped; when none fits, the error says how much
+/// the coarsest one needs.
 fn default_resolution(min: Vec3, max: Vec3, budget: u64) -> std::result::Result<f64, SimError> {
     let mut coarsest_need = None;
     for h in RESOLUTIONS {
         if let Ok(need) = Stock::box_bytes(min, max, h) {
-            if need <= budget {
+            if need <= budget / 2 {
                 return Ok(h);
             }
             coarsest_need = Some(need);
@@ -112,6 +121,53 @@ fn default_resolution(min: Vec3, max: Vec3, budget: u64) -> std::result::Result<
         None => Err(Stock::box_bytes(min, max, RESOLUTIONS[RESOLUTIONS.len() - 1])
             .err()
             .unwrap_or_else(|| SimError::BadInput("no ray spacing fits this box".into()))),
+    }
+}
+
+/// The cutting shape a tool names, with the fields that shape needs. A field that belongs to another
+/// shape is refused, so a misspelt or misplaced field does not pass silently.
+fn shape_of(t: &ToolParams) -> std::result::Result<Shape, String> {
+    let id = t.id;
+    let name = t.shape.unwrap_or_default();
+    let given = [
+        ("corner_radius", t.corner_radius.is_some()),
+        ("tip_diameter", t.tip_diameter.is_some()),
+        ("angle", t.angle.is_some()),
+        ("a0", t.a0.is_some()),
+        ("r0", t.r0.is_some()),
+        ("profile", t.profile.is_some()),
+    ];
+    let wanted: &[&str] = match name {
+        ShapeName::Flat | ShapeName::Ball => &[],
+        ShapeName::Bull => &["corner_radius"],
+        ShapeName::Cone => &["tip_diameter", "angle"],
+        ShapeName::Taper => &["a0", "r0", "angle"],
+        ShapeName::Profile => &["profile"],
+    };
+    if let Some((key, _)) = given.iter().find(|(key, set)| *set && !wanted.contains(key)) {
+        return Err(format!("tool {id}: {key} does not apply to its shape"));
+    }
+    let length = |v: Option<f64>, key: &str| {
+        v.filter(|x| x.is_finite() && *x >= 0.0).ok_or_else(|| format!("tool {id} needs {key}, a length in mm (zero or more)"))
+    };
+    let half_angle = || {
+        t.angle
+            .filter(|a| a.is_finite() && *a > 0.0 && *a < std::f64::consts::FRAC_PI_2)
+            .ok_or_else(|| format!("tool {id} needs angle, in radians from 0 to pi/2"))
+    };
+    match name {
+        ShapeName::Flat => Ok(Shape::Flat),
+        ShapeName::Ball => Ok(Shape::Ball),
+        ShapeName::Bull => Ok(Shape::Bull { rc: length(t.corner_radius, "corner_radius")? }),
+        ShapeName::Cone => Ok(Shape::Cone { tip_d: length(t.tip_diameter, "tip_diameter")?, angle: half_angle()? }),
+        ShapeName::Taper => Ok(Shape::Taper { a0: length(t.a0, "a0")?, r0: length(t.r0, "r0")?, angle: half_angle()? }),
+        ShapeName::Profile => {
+            let points = t.profile.clone().unwrap_or_default();
+            if points.len() < 2 || !points.iter().all(|p| p.iter().all(|x| x.is_finite() && *x >= 0.0)) {
+                return Err(format!("tool {id} needs profile: at least two [a, r] pairs, zero or more mm"));
+            }
+            Ok(Shape::Profile(points))
+        }
     }
 }
 
@@ -134,12 +190,13 @@ fn setup(s: &mut Session, p: &Value) -> Result<Value> {
         if tools.iter().any(|o| o.id == t.id) {
             return Err(bad(C, format!("tool {} is listed twice", t.id)));
         }
+        let shape = shape_of(t).map_err(|e| bad(C, e))?;
         if FlatTool::new(t.diameter / 2.0, t.flute_length, Vec3::Z).is_none() {
             return Err(bad(C, format!("tool {} needs a positive diameter and flute length in mm", t.id)));
         }
         tools.push(Tool {
             id: t.id,
-            shape: Shape::Flat,
+            shape,
             diameter: t.diameter,
             flute_length: t.flute_length,
             shank: Vec::new(),
@@ -148,15 +205,14 @@ fn setup(s: &mut Session, p: &Value) -> Result<Value> {
         });
     }
     let mut program = gcode::parse(&input.gcode, &CodeTable::default());
-    // Every tool the moves cut with must be listed, and every listed tool must be used: a mismatch is
-    // a setup error, not a move that is silently skipped.
-    let used: BTreeSet<u32> = program.moves.iter().map(|m| m.tool).collect();
-    if let Some(&t) = used.iter().find(|t| !tools.iter().any(|d| d.id == **t)) {
-        let line = program.moves.iter().find(|m| m.tool == t).map_or(0, |m| m.source);
-        return Err(bad(C, format!("the G-code cuts with tool {t} (line {line}), which tools does not list")));
-    }
-    if let Some(d) = tools.iter().find(|d| !used.contains(&d.id)) {
-        return Err(bad(C, format!("tool {} is listed, but the G-code never selects it", d.id)));
+    // Moves before the first tool change take the initial tool, when the caller names one. Otherwise
+    // the simulator reports them. A tool a move cuts with and the list lacks is reported per move too.
+    if let Some(initial) = input.initial_tool {
+        for m in &mut program.moves {
+            if m.tool == NO_TOOL {
+                m.tool = initial;
+            }
+        }
     }
     program.tools = tools;
     let (min, max) = (Vec3::from(input.stock.boxed.min), Vec3::from(input.stock.boxed.max));
@@ -166,7 +222,8 @@ fn setup(s: &mut Session, p: &Value) -> Result<Value> {
         None => default_resolution(min, max, budget_bytes).map_err(|e| sim_error(C, e))?,
     };
     let setup = Setup { min, max, h, budget_bytes, program };
-    let job = Job::new(setup).map_err(|e| sim_error(C, e))?;
+    let revision = s.sim.fresh_revision();
+    let job = Job::new(setup, revision).map_err(|e| sim_error(C, e))?;
     let (min, max) = job.bounds();
     let reply = SetupReply {
         moves: count(job.total()),
@@ -202,7 +259,15 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
     };
     job.seek(to, until).map_err(|e| sim_error(C, e))?;
     let at = job.cursor();
-    let reply = RunReply { at: count(at), total: count(total), done: at == total, removed_volume: job.removed_volume() };
+    let reply = RunReply {
+        at: count(at),
+        total: count(total),
+        reached: at == to,
+        done: at == total,
+        removed_volume: job.removed_volume(),
+        revision: job.revision(),
+        partial: partial_reply(job),
+    };
     serde_json::to_value(reply).map_err(|e| bad(C, e.to_string()))
 }
 
@@ -220,6 +285,9 @@ fn status(s: &mut Session, p: &Value) -> Result<Value> {
         removed_volume: job.removed_volume(),
         memory: memory_reply(job),
         diag_count: count(job.diagnostics().count()),
+        error: job.error().map(|e| e.to_string()),
+        revision: job.revision(),
+        partial: partial_reply(job),
         diagnostics: job.diagnostics().skip(offset).take(limit).map(diag_reply).collect(),
     };
     serde_json::to_value(reply).map_err(|e| bad(C, e.to_string()))
