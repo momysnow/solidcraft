@@ -91,40 +91,19 @@ impl Stock {
     /// A solid box `min..max` with rays about `h` apart. Refused (not panicked) when `h` or the box
     /// is bad, or when the memory estimate is over `budget_bytes`.
     pub fn new_box(min: Vec3, max: Vec3, h: f64, budget_bytes: u64) -> Result<Stock, SimError> {
-        if !h.is_finite() || h <= 0.0 {
-            return Err(SimError::BadInput("cell size must be positive and finite".into()));
+        let layout = BoxLayout::new(min, max, h)?;
+        if layout.need > budget_bytes {
+            return Err(SimError::Budget { need: layout.need, budget: budget_bytes });
         }
-        let lo: [f64; 3] = min.into();
-        let hi: [f64; 3] = max.into();
-        let mut n = [0usize; 3];
-        let mut cell = [0.0f64; 3];
-        for (k, n_k) in n.iter_mut().enumerate() {
-            let (a, b) = (lo[k], hi[k]);
-            if !(a.is_finite() && b.is_finite()) || a >= b || a.abs() > MAX_ABS_COORD || b.abs() > MAX_ABS_COORD {
-                return Err(SimError::BadInput("stock box must be finite, non-empty and within 100 m".into()));
-            }
-            let cells = ((b - a) / h).ceil();
-            if !(1.0..=MAX_CELLS_PER_AXIS).contains(&cells) {
-                return Err(SimError::BadInput("stock has too many cells along an axis".into()));
-            }
-            *n_k = cells as usize;
-            if let Some(c) = cell.get_mut(k) {
-                *c = (b - a) / cells;
-            }
-        }
-        let mut need = 0u64;
-        for axis in 0..3 {
-            let (nu, nv) = (n_at(&n, (axis + 1) % 3), n_at(&n, (axis + 2) % 3));
-            let rays = (nu as u64).saturating_mul(nv as u64);
-            // The per-ray estimate, plus the start sentinel of each tile (4 bytes).
-            let tiles = (nu.div_ceil(TILE) as u64).saturating_mul(nv.div_ceil(TILE) as u64);
-            need = need.saturating_add(rays.saturating_mul(BYTES_PER_RAY)).saturating_add(tiles.saturating_mul(4));
-        }
-        if need > budget_bytes {
-            return Err(SimError::Budget { need, budget: budget_bytes });
-        }
+        let (lo, hi, n) = (layout.lo, layout.hi, layout.n);
         let grids = [build_grid(0, &n, &lo, &hi), build_grid(1, &n, &lo, &hi), build_grid(2, &n, &lo, &hi)];
-        Ok(Stock { min: lo, max: hi, cell, n, grids, used: need, budget: budget_bytes, dirty: std::collections::BTreeSet::new() })
+        Ok(Stock { min: lo, max: hi, cell: layout.cell, n, grids, used: layout.need, budget: budget_bytes, dirty: std::collections::BTreeSet::new() })
+    }
+
+    /// Bytes a box of `min..max` at ray spacing `h` takes, before any cut: what [`Stock::new_box`]
+    /// checks against its budget, so a caller can pick `h` without building the stock.
+    pub fn box_bytes(min: Vec3, max: Vec3, h: f64) -> Result<u64, SimError> {
+        BoxLayout::new(min, max, h).map(|l| l.need)
     }
 
     /// Cuts the stock with a sweep. Only rays the sweep can reach are visited. `tag` is recorded on
@@ -429,6 +408,50 @@ fn node_span(min: f64, cell: f64, n: i64, lo: f64, hi: f64) -> Option<(i64, i64)
 
 fn real(i: i64, n: i64) -> bool {
     i >= 0 && i < n
+}
+
+/// The cell counts and sizes of a box at ray spacing `h`, and the bytes its grids take.
+struct BoxLayout {
+    lo: [f64; 3],
+    hi: [f64; 3],
+    n: [usize; 3],
+    cell: [f64; 3],
+    need: u64,
+}
+
+impl BoxLayout {
+    fn new(min: Vec3, max: Vec3, h: f64) -> Result<BoxLayout, SimError> {
+        if !h.is_finite() || h <= 0.0 {
+            return Err(SimError::BadInput("cell size must be positive and finite".into()));
+        }
+        let lo: [f64; 3] = min.into();
+        let hi: [f64; 3] = max.into();
+        let mut n = [0usize; 3];
+        let mut cell = [0.0f64; 3];
+        for (k, n_k) in n.iter_mut().enumerate() {
+            let (a, b) = (lo[k], hi[k]);
+            if !(a.is_finite() && b.is_finite()) || a >= b || a.abs() > MAX_ABS_COORD || b.abs() > MAX_ABS_COORD {
+                return Err(SimError::BadInput("stock box must be finite, non-empty and within 100 m".into()));
+            }
+            let cells = ((b - a) / h).ceil();
+            if !(1.0..=MAX_CELLS_PER_AXIS).contains(&cells) {
+                return Err(SimError::BadInput("stock has too many cells along an axis".into()));
+            }
+            *n_k = cells as usize;
+            if let Some(c) = cell.get_mut(k) {
+                *c = (b - a) / cells;
+            }
+        }
+        let mut need = 0u64;
+        for axis in 0..3 {
+            let (nu, nv) = (n_at(&n, (axis + 1) % 3), n_at(&n, (axis + 2) % 3));
+            let rays = (nu as u64).saturating_mul(nv as u64);
+            // The per-ray estimate, plus the start sentinel of each tile (4 bytes).
+            let tiles = (nu.div_ceil(TILE) as u64).saturating_mul(nv.div_ceil(TILE) as u64);
+            need = need.saturating_add(rays.saturating_mul(BYTES_PER_RAY)).saturating_add(tiles.saturating_mul(4));
+        }
+        Ok(BoxLayout { lo, hi, n, cell, need })
+    }
 }
 
 fn n_at(n: &[usize; 3], k: usize) -> usize {

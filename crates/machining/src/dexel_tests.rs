@@ -209,6 +209,19 @@ fn stock_refuses_bad_sizes_and_budgets() {
 }
 
 #[test]
+fn box_bytes_is_what_a_box_is_checked_against() {
+    let (ok, far) = (Vec3::new(0.0, 0.0, 0.0), Vec3::new(10.0, 10.0, 10.0));
+    // A 1 mm cube at h = 1: 3 rays of 20 bytes and 3 tile sentinels of 4 (see the budget test below).
+    assert_eq!(Stock::box_bytes(ok, Vec3::new(1.0, 1.0, 1.0), 1.0), Ok(72));
+    let need = Stock::box_bytes(ok, far, 0.5).expect("box");
+    assert!(matches!(Stock::new_box(ok, far, 0.5, need - 1), Err(SimError::Budget { need: n, .. }) if n == need));
+    let stock = Stock::new_box(ok, far, 0.5, need).expect("a budget of exactly the estimate");
+    assert_eq!(stock.memory(), (need, need));
+    assert!(Stock::box_bytes(far, ok, 1.0).is_err());
+    assert!(Stock::box_bytes(ok, far, f64::NAN).is_err());
+}
+
+#[test]
 fn budget_is_enforced_as_cuts_split_rays() {
     // A 1 mm cube at h = 1 is 3 rays of 20 bytes. A cut that splits a ray adds bytes, so a budget
     // with only 8 bytes to spare refuses it, and the stock is unchanged. The estimate is 72 bytes:
