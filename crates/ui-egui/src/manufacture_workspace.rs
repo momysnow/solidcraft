@@ -135,6 +135,10 @@ pub fn start_hook(app: &mut SolveApp, id: &str) -> bool {
             crate::manufacture_setup::open_new(app);
             false
         }
+        "manufacture.post.simulate" => {
+            crate::sim_stock::simulate_active(app);
+            false
+        }
         id if id.starts_with("manufacture.") => {
             enter(app);
             if let Some(tab) = tab_for_command(id) {
@@ -169,6 +173,7 @@ pub fn tick(app: &mut SolveApp, ctx: &egui::Context) {
 
 pub fn panel(app: &mut SolveApp, ui: &mut egui::Ui) {
     crate::manufacture_setup::show_dialogs(app, ui);
+    crate::sim_stock::panel(app, ui);
 }
 
 pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
@@ -411,5 +416,169 @@ mod tests {
         h.step(&json!({"click": {"handle": "row:op:Top/Pocket"}})).unwrap_or_else(|e| panic!("{e}"));
         h.frames(2);
         assert!(h.app.manufacture_workspace.selected_op.is_none());
+    }
+
+    /// Two cuts far apart on a 200 x 100 mm stock: the first cut meshes the chunks it reached, and the
+    /// second meshes only the chunks it dirtied, while the first cut keeps its surface.
+    #[test]
+    fn sim_stock_meshes_the_chunks_a_cut_reached_and_only_those_it_dirties() {
+        use crate::sim_stock::{meshed_chunks, meshed_count, settle};
+        let mut h = Harness::new();
+        // The stock is drawn in Manufacture only.
+        h.app.manufacture_workspace.active = true;
+        let gcode = "T0 M6\nG21 G90\nG0 X10 Y10 Z5\nG1 Z-2 F100\nG1 X40 F300\nG0 Z5\nG0 X180 Y90\nG1 Z-2 F100\nG1 X190 F300\nG0 Z5";
+        h.app
+            .session
+            .execute(
+                "sim.setup",
+                &json!({"stock": {"box": {"min": [0, 0, -10], "max": [200, 100, 0]}}, "tools": [{"id": 0, "diameter": 6, "flute_length": 20}], "gcode": gcode, "resolution": 0.5}),
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+        settle(&mut h.app);
+        assert!(meshed_chunks(&h.app).is_empty(), "an uncut stock has no chunk mesh");
+        h.app.session.execute("sim.run", &json!({"to": 3})).unwrap_or_else(|e| panic!("{e}"));
+        settle(&mut h.app);
+        let first = meshed_chunks(&h.app);
+        let touched = h.app.session.sim_stock().map_or(0, |s| s.touched_chunks().len());
+        assert!(!first.is_empty() && first.len() <= touched, "the first cut has a surface: {} of {touched}", first.len());
+        assert!(!crate::viewport::build_scene(&h.app).blocks.is_empty(), "the stock is drawn");
+        let before = meshed_count(&h.app);
+        h.app.session.execute("sim.run", &json!({})).unwrap_or_else(|e| panic!("{e}"));
+        settle(&mut h.app);
+        let added = meshed_count(&h.app) - before;
+        let total = h.app.session.sim_stock().map_or(0, |s| s.touched_chunks().len());
+        assert!(added > 0 && added < total, "{added} chunks meshed of {total} cut: only the dirty ones");
+        let now = meshed_chunks(&h.app);
+        assert!(first.iter().all(|c| now.contains(c)), "the first cut keeps its surface");
+    }
+
+    /// Outside Manufacture a simulation leaves the bodies shown: the stock is Manufacture's view.
+    #[test]
+    fn the_stock_hides_the_bodies_in_manufacture_only() {
+        let mut h = Harness::new();
+        let setup = json!({"stock": {"box": {"min": [0, 0, -10], "max": [60, 20, 0]}}, "tools": [{"id": 0, "diameter": 6, "flute_length": 20}], "gcode": "T0 M6
+G21 G90
+G0 X10 Y10 Z5
+G1 Z-2 F100
+G1 X50 F300
+G0 Z5", "resolution": 0.5});
+        h.app.session.execute("sim.setup", &setup).unwrap_or_else(|e| panic!("{e}"));
+        assert!(!crate::sim_stock::hides_bodies(&h.app), "Design keeps its bodies");
+        h.app.manufacture_workspace.active = true;
+        assert!(crate::sim_stock::hides_bodies(&h.app), "Manufacture shows the stock instead");
+    }
+
+    /// A new simulation replaces the stock: its meshes go, and the uncut box covers the whole stock.
+    #[test]
+    fn a_new_simulation_starts_from_the_uncut_box() {
+        use crate::sim_stock::{meshed_chunks, settle};
+        let mut h = Harness::new();
+        // The stock is drawn in Manufacture only.
+        h.app.manufacture_workspace.active = true;
+        let setup = json!({"stock": {"box": {"min": [0, 0, -10], "max": [60, 20, 0]}}, "tools": [{"id": 0, "diameter": 6, "flute_length": 20}], "gcode": "T0 M6\nG21 G90\nG0 X10 Y10 Z5\nG1 Z-2 F100\nG1 X50 F300\nG0 Z5", "resolution": 0.1});
+        h.app.session.execute("sim.setup", &setup).unwrap_or_else(|e| panic!("{e}"));
+        h.app.session.execute("sim.run", &json!({})).unwrap_or_else(|e| panic!("{e}"));
+        settle(&mut h.app);
+        assert!(!meshed_chunks(&h.app).is_empty());
+        h.app.session.execute("sim.setup", &setup).unwrap_or_else(|e| panic!("{e}"));
+        settle(&mut h.app);
+        assert!(meshed_chunks(&h.app).is_empty(), "the new stock is uncut");
+        assert!(!crate::viewport::build_scene(&h.app).tris.is_empty(), "the uncut box is drawn");
+    }
+
+    /// A cursor step over a move in the air cuts nothing: the stock's blocks keep their keys and their
+    /// bytes, so the window uploads none of them again (only the tool moves).
+    #[test]
+    fn a_cursor_step_that_cuts_nothing_keeps_the_stock_blocks() {
+        use crate::sim_stock::settle;
+        let mut h = Harness::new();
+        // The stock is drawn in Manufacture only.
+        h.app.manufacture_workspace.active = true;
+        let gcode = "T0 M6\nG21 G90\nG0 X10 Y10 Z5\nG1 Z-2 F100\nG1 X40 F300\nG0 Z5\nG0 X180 Y90\nG1 Z-2 F100\nG1 X190 F300\nG0 Z5";
+        h.app
+            .session
+            .execute(
+                "sim.setup",
+                &json!({"stock": {"box": {"min": [0, 0, -10], "max": [200, 100, 0]}}, "tools": [{"id": 0, "diameter": 6, "flute_length": 20}], "gcode": gcode, "resolution": 0.5}),
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+        h.app.session.execute("sim.run", &json!({"to": 4})).unwrap_or_else(|e| panic!("{e}"));
+        settle(&mut h.app);
+        let before = crate::viewport::build_scene(&h.app).blocks;
+        // Move 4 (G0 X180 Y90) runs at Z 5, above the stock: the cursor moves, the cut does not. (Move 3
+        // rises through the cut it just made, which re-meshes its chunks: not a cut-free step.)
+        h.app.session.execute("sim.run", &json!({"to": 5})).unwrap_or_else(|e| panic!("{e}"));
+        settle(&mut h.app);
+        let after = crate::viewport::build_scene(&h.app).blocks;
+        assert!(!before.is_empty(), "the first cut is drawn as blocks");
+        let keys = |blocks: &[crate::gpu::SceneBlock]| blocks.iter().map(|b| b.key).collect::<Vec<_>>();
+        assert_eq!(keys(&before), keys(&after), "a cursor step that cuts nothing keeps every stock block");
+        assert!(
+            before.iter().zip(&after).all(|(a, b)| std::sync::Arc::ptr_eq(&a.bytes, &b.bytes)),
+            "the kept blocks keep their bytes, so the GPU keeps their buffers"
+        );
+    }
+
+    /// The model scene keys on the stock's meshes and on the cursor; the scene key the sketch and highlight
+    /// scenes share keeps neither, so a re-mesh or a cursor step leaves them as they were.
+    #[test]
+    fn the_model_scene_keys_on_the_stock_and_cursor_but_not_the_shared_scene_key() {
+        use crate::sim_stock::settle;
+        let mut h = Harness::new();
+        let gcode = "T0 M6\nG21 G90\nG0 X10 Y10 Z5\nG1 Z-2 F100\nG1 X40 F300\nG0 Z5\nG0 X180 Y90\nG1 Z-2 F100\nG1 X190 F300\nG0 Z5";
+        h.app
+            .session
+            .execute(
+                "sim.setup",
+                &json!({"stock": {"box": {"min": [0, 0, -10], "max": [200, 100, 0]}}, "tools": [{"id": 0, "diameter": 6, "flute_length": 20}], "gcode": gcode, "resolution": 0.5}),
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+        settle(&mut h.app);
+        let (scene0, model0) = (crate::viewport::scene_key(&h.app), crate::viewport::model_scene_key(&h.app));
+        h.app.session.execute("sim.run", &json!({"to": 3})).unwrap_or_else(|e| panic!("{e}"));
+        settle(&mut h.app);
+        let (scene1, model1) = (crate::viewport::scene_key(&h.app), crate::viewport::model_scene_key(&h.app));
+        assert_eq!(scene0, scene1, "a re-mesh leaves the shared scene key as it was");
+        assert_ne!(model0, model1, "a re-mesh rebuilds the model scene");
+        h.app.session.execute("sim.run", &json!({"to": 4})).unwrap_or_else(|e| panic!("{e}"));
+        settle(&mut h.app);
+        let (scene2, model2) = (crate::viewport::scene_key(&h.app), crate::viewport::model_scene_key(&h.app));
+        assert_eq!(scene1, scene2, "a cursor step leaves the shared scene key as it was");
+        assert_ne!(model1, model2, "a cursor step rebuilds the model scene");
+    }
+
+    /// The Simulate button is on the Post group, and pressing it (the start path) posts the active
+    /// setup and sets its stock up; playing then advances the move index and hides the body.
+    #[test]
+    fn simulate_sets_up_the_active_setup_and_playing_advances_the_moves() {
+        let mut h = Harness::new();
+        let s = &mut h.app.session;
+        s.execute("cam.tool.define", &json!({"number": 1, "diameter": 6, "flute_length": 20, "feed": 600, "plunge_feed": 200, "stepdown": 3}))
+            .unwrap_or_else(|e| panic!("{e}"));
+        s.execute("cam.setup", &json!({"name": "Top", "stock": {"min": [0, 0, -10], "max": [40, 30, 0]}})).unwrap_or_else(|e| panic!("{e}"));
+        s.execute(
+            "cam.op.contour",
+            &json!({"setup": "Top", "name": "Outside", "tool": 1, "outer": [[0, 0], [40, 0], [40, 30], [0, 30]], "side": "outside", "bottom": -3, "stepdown": 3}),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        crate::manufacture_workspace::enter(&mut h.app);
+        h.app.manufacture_workspace.active_setup = "Top".into();
+        h.frames(3);
+        assert!(crate::scenario::handle_at("button:manufacture.post.simulate").is_some(), "Simulate is on the Post group");
+        assert!(!crate::sim_stock::hides_bodies(&h.app));
+        crate::sim_stock::simulate_active(&mut h.app);
+        assert!(h.app.session.sim_stock().is_some(), "Simulate sets up the active setup's stock");
+        assert!(crate::sim_stock::hides_bodies(&h.app), "the body is hidden while the stock shows");
+        let (before, total) = h.app.session.sim_progress().unwrap_or((0, 0));
+        assert!(total > 0 && before == 0, "a fresh simulation starts at its first move");
+        let ctx = egui::Context::default();
+        for _ in 0..200 {
+            crate::sim_stock::poll(&mut h.app, &ctx);
+            if h.app.session.sim_progress().is_some_and(|(at, n)| at == n) {
+                break;
+            }
+        }
+        let (after, _) = h.app.session.sim_progress().unwrap_or((0, 0));
+        assert!(after > before, "playing advances the move index: {before} -> {after}");
     }
 }

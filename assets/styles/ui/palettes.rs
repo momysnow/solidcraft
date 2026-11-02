@@ -245,6 +245,7 @@ impl Tokens {
             cam_rapid: Color32::from_rgb(120, 140, 165),
             cam_selected: Color32::from_rgb(230, 110, 20),
             cam_dimmed: Color32::from_rgb(176, 186, 200),
+            cam_stock: Color32::from_rgb(120, 142, 166),
             continuity: [
                 Color32::from_rgb(0, 158, 115),
                 Color32::from_rgb(0, 114, 178),
@@ -372,6 +373,7 @@ impl Tokens {
         t.cam_rapid = Color32::from_rgb(120, 136, 160);
         t.cam_selected = Color32::from_rgb(255, 176, 64);
         t.cam_dimmed = Color32::from_rgb(70, 80, 96);
+        t.cam_stock = Color32::from_rgb(159, 177, 198);
         t.sketch_point = Color32::from_rgb(232, 234, 238);
         t.sketch_locked = Color32::from_rgb(96, 204, 116);
         // Sketch dimensions: Light's plum, lightened for the dark view (#7861).

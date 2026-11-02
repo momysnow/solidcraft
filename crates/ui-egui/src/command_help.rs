@@ -143,6 +143,7 @@ pub const DOCUMENTED: &[&str] = &[
     "manufacture.part_handling.tool_call",
     "manufacture.post.process",
     "manufacture.post.sheet",
+    "manufacture.post.simulate",
     "manufacture.post.time",
     "manufacture.setup.new",
     "manufacture.tools.library",

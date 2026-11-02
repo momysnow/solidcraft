@@ -1214,6 +1214,9 @@ pub struct Tokens {
     pub cam_rapid: Color32,
     pub cam_selected: Color32,
     pub cam_dimmed: Color32,
+    /// The stock of a G-code simulation in the viewport. Opaque (alpha 255): a translucent stock would
+    /// show the model through the cut, and the model is hidden while the stock shows.
+    pub cam_stock: Color32,
     /// Continuity Analysis seams, best to worst as `inspect.continuity` judges them: smooth (G2),
     /// tangent with a curvature jump (G1), a crease (G0) and a gap. Bluish green, blue, yellow
     /// and reddish purple stay apart in every colour vision mode, so no mode changes them.
@@ -1384,6 +1387,7 @@ impl Tokens {
             cam_rapid: view.cam_rapid,
             cam_selected: view.cam_selected,
             cam_dimmed: view.cam_dimmed,
+            cam_stock: view.cam_stock,
             continuity: view.continuity,
             analysis: view.analysis,
             ..self

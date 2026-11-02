@@ -90,6 +90,7 @@
     "cam_rapid": "#7c6f64",
     "cam_selected": "#076678",
     "cam_dimmed": "#d5c4a1",
+    "cam_stock": "#7c6f64ff",
     "icons.agent": "#8f3f71",
     "surface_fill": "#df663c",
     "surface_soft": "#edd7ad",

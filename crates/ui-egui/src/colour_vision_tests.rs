@@ -342,7 +342,13 @@ fn groups(t: &Tokens) -> Vec<Group> {
         group("interference", &[("interference", t.interference)], &[("body", t.body)]),
         group(
             "cam toolpaths",
-            &[("cam_feed", t.cam_feed), ("cam_rapid", t.cam_rapid), ("cam_selected", t.cam_selected), ("cam_dimmed", t.cam_dimmed)],
+            &[
+                ("cam_feed", t.cam_feed),
+                ("cam_rapid", t.cam_rapid),
+                ("cam_selected", t.cam_selected),
+                ("cam_dimmed", t.cam_dimmed),
+                ("cam_stock", t.cam_stock),
+            ],
             &[("viewport_top", t.viewport_top)],
         ),
         group(

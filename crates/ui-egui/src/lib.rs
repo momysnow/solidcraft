@@ -242,6 +242,7 @@ pub mod shell;
 #[cfg(test)]
 mod shell_face_sketch_ui_tests;
 pub mod shortcut_box;
+pub mod sim_stock;
 pub mod sketch3d;
 #[cfg(test)]
 mod sketch3d_frame_ui_tests;
@@ -535,6 +536,8 @@ pub struct SolveApp {
     pub viewport: viewport::ViewportState,
     pub render_workspace: render_workspace::State,
     pub manufacture_workspace: manufacture_workspace::State,
+    /// The G-code simulation's stock as drawn in the viewport (see [`sim_stock`]).
+    pub sim_stock: sim_stock::State,
     pub tool: Option<tools::Tool>,
     pub dialog: Option<dialogs::Dialog>,
     /// The Change Parameters window, when open.
@@ -791,6 +794,7 @@ impl SolveApp {
             viewport: viewport::ViewportState::default(),
             render_workspace,
             manufacture_workspace: manufacture_workspace::State::default(),
+            sim_stock: sim_stock::State::default(),
             tool: None,
             dialog: None,
             params: None,
@@ -2718,6 +2722,7 @@ impl SolveApp {
         render_workspace::sync_backend(self);
         render_workspace::tick(self, ctx);
         manufacture_workspace::tick(self, ctx);
+        sim_stock::poll(self, ctx);
         file_load::tick(self, ctx);
         save_job::tick(self, false);
         edit_in_place::tick(self);

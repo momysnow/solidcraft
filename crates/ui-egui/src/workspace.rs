@@ -164,7 +164,7 @@ const MFG_MODIFY: &[&str] = &[
     "manufacture.modify.replace_tool",
     "manufacture.modify.move_entry",
 ];
-const MFG_POST: &[&str] = &["manufacture.post.process", "manufacture.post.time", "manufacture.post.sheet"];
+const MFG_POST: &[&str] = &["manufacture.post.process", "manufacture.post.simulate", "manufacture.post.time", "manufacture.post.sheet"];
 
 /// Commands that stay for agents, MCP and scripts but are not offered to people: the sketch solves
 /// itself after every edit, so a Solve button (and the search hit for it) only confuses; drawn 3D
@@ -398,29 +398,29 @@ pub const SECTIONS: &[Section] = &[
     Section { tab: "MILLING", panel: "3D", promoted: 4, ids: MFG_3D },
     Section { tab: "MILLING", panel: "MULTI-AXIS", promoted: 4, ids: MFG_MULTIAXIS },
     Section { tab: "MILLING", panel: "MODIFY", promoted: 4, ids: MFG_MODIFY },
-    Section { tab: "MILLING", panel: "POST", promoted: 3, ids: MFG_POST },
+    Section { tab: "MILLING", panel: "POST", promoted: 4, ids: MFG_POST },
     Section { tab: "MILLING", panel: "SELECT", promoted: 0, ids: &[] },
     Section { tab: "TURNING", panel: "SETUP", promoted: 1, ids: MFG_SETUP },
     Section { tab: "TURNING", panel: "MANAGE", promoted: 4, ids: MFG_MANAGE },
     Section { tab: "TURNING", panel: "TURNING", promoted: 4, ids: MFG_TURNING },
     Section { tab: "TURNING", panel: "PART", promoted: 4, ids: MFG_PART },
     Section { tab: "TURNING", panel: "MODIFY", promoted: 4, ids: MFG_MODIFY },
-    Section { tab: "TURNING", panel: "POST", promoted: 3, ids: MFG_POST },
+    Section { tab: "TURNING", panel: "POST", promoted: 4, ids: MFG_POST },
     Section { tab: "TURNING", panel: "SELECT", promoted: 0, ids: &[] },
     Section { tab: "ADDITIVE", panel: "SETUP", promoted: 1, ids: MFG_SETUP },
     Section { tab: "ADDITIVE", panel: "MANAGE", promoted: 4, ids: MFG_MANAGE },
     Section { tab: "ADDITIVE", panel: "ADDITIVE", promoted: 3, ids: MFG_ADDITIVE },
-    Section { tab: "ADDITIVE", panel: "POST", promoted: 3, ids: MFG_POST },
+    Section { tab: "ADDITIVE", panel: "POST", promoted: 4, ids: MFG_POST },
     Section { tab: "ADDITIVE", panel: "SELECT", promoted: 0, ids: &[] },
     Section { tab: "INSPECTION", panel: "SETUP", promoted: 1, ids: MFG_SETUP },
     Section { tab: "INSPECTION", panel: "MANAGE", promoted: 4, ids: MFG_MANAGE },
     Section { tab: "INSPECTION", panel: "PROBE", promoted: 4, ids: MFG_PROBE },
-    Section { tab: "INSPECTION", panel: "POST", promoted: 3, ids: MFG_POST },
+    Section { tab: "INSPECTION", panel: "POST", promoted: 4, ids: MFG_POST },
     Section { tab: "INSPECTION", panel: "SELECT", promoted: 0, ids: &[] },
     Section { tab: "FABRICATION", panel: "SETUP", promoted: 1, ids: MFG_SETUP },
     Section { tab: "FABRICATION", panel: "MANAGE", promoted: 4, ids: MFG_MANAGE },
     Section { tab: "FABRICATION", panel: "CUTTING", promoted: 2, ids: MFG_CUTTING },
-    Section { tab: "FABRICATION", panel: "POST", promoted: 3, ids: MFG_POST },
+    Section { tab: "FABRICATION", panel: "POST", promoted: 4, ids: MFG_POST },
     Section { tab: "FABRICATION", panel: "SELECT", promoted: 0, ids: &[] },
 ];
 
@@ -576,6 +576,7 @@ pub const RIBBON_LABELS: &[(&str, &str)] = &[
     ("manufacture.part_handling.tool_call", "Tool Call"),
     ("manufacture.post.process", "Post"),
     ("manufacture.post.sheet", "Setup Sheet"),
+    ("manufacture.post.simulate", "Simulate"),
     ("manufacture.post.time", "Cycle Time"),
     ("manufacture.setup.new", "New Setup"),
     ("manufacture.tools.library", "Tool Library"),

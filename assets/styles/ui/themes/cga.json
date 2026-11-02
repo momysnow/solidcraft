@@ -97,6 +97,7 @@
     "cam_rapid": "#55ffff",
     "cam_selected": "#ffff55",
     "cam_dimmed": "#555555",
+    "cam_stock": "#55ffffff",
     "joint_axis": "#aaaaaa",
     "joint_manipulator": "#ffff55",
     "logo": [

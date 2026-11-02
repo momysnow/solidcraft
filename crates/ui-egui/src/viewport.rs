@@ -18,7 +18,7 @@ use crate::theme::Tokens;
 use crate::{SolveApp, icons};
 
 fn cam_body_visible(app: &SolveApp, name: &str) -> bool {
-    app.body_visible(name) && crate::manufacture_workspace::setup_shows_body(app, name)
+    app.body_visible(name) && crate::manufacture_workspace::setup_shows_body(app, name) && !crate::sim_stock::hides_bodies(app)
 }
 
 #[cfg(test)]
@@ -554,7 +554,17 @@ fn in_view(proj: &Proj, b: &solidcraft_engine::geom::Aabb3) -> bool {
     }
 }
 
-fn scene_key(app: &SolveApp) -> u64 {
+/// The key of the model scene: its own scene key, and what only it draws, the simulation's stock and
+/// cutting tool. The sketch and highlight scenes are keyed by `scene_key` alone, so a re-mesh or a
+/// cursor step leaves them as they were.
+pub(crate) fn model_scene_key(app: &SolveApp) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    scene_key(app).hash(&mut h);
+    crate::sim_stock::model_key(app).hash(&mut h);
+    h.finish()
+}
+
+pub(crate) fn scene_key(app: &SolveApp) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     // Not the session revision: selection and view-only commands bump it without changing the
     // model. The document identity catches edits, including appearance-only ones (whose world
@@ -584,6 +594,8 @@ fn scene_key(app: &SolveApp) -> u64 {
     app.session.visibility.hidden_profiles.hash(&mut h);
     crate::manufacture_workspace::setup_body_key(app).hash(&mut h);
     crate::manufacture_toolpaths::key(app).hash(&mut h);
+    // Whether the simulation hides the bodies: the stock itself is only in the model scene's key.
+    crate::sim_stock::hides_bodies(app).hash(&mut h);
     app.session.active_component.hash(&mut h);
     app.session.active_occurrence_path.hash(&mut h);
     app.preview.effective_replaced().hash(&mut h);
@@ -1671,7 +1683,12 @@ pub(crate) fn build_scene(app: &SolveApp) -> GpuScene {
         }
     }
     crate::edit_in_place::draw_context(app, &mut sc);
-    crate::manufacture_toolpaths::draw(&mut sc, app);
+    // While a simulation's stock is shown the toolpaths would hide the cut, so only one is drawn.
+    if crate::sim_stock::hides_bodies(app) {
+        crate::sim_stock::draw(&mut sc, app);
+    } else {
+        crate::manufacture_toolpaths::draw(&mut sc, app);
+    }
 
     sc
 }
@@ -4341,7 +4358,7 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
     }
     crate::frame_watch::step(app, "display refinement");
-    let key = scene_key(app);
+    let key = model_scene_key(app);
     let t0 = crate::now_ms();
     // Drawn on the GPU; without one (the headless harness, tests) the model is not drawn.
     if app.viewport.gpu.is_some() {

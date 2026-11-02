@@ -124,6 +124,7 @@
     "cam_rapid": "#9aa5ce",
     "cam_selected": "#4775ce",
     "cam_dimmed": "#262938",
+    "cam_stock": "#9aa5ceff",
     "logo": [
       "#7aa2f7",
       "#4775ce",

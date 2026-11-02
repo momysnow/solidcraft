@@ -13,6 +13,8 @@ solidcraft-engine = { workspace = true }
 egui = { workspace = true }
 egui-wgpu = { workspace = true }
 solidcraft-gpu = { workspace = true }
+# The G-code simulation's stock: its chunk meshes and uncut box (L1, like the engine's sim).
+solidcraft-machining = { workspace = true }
 solidcraft-space-mouse = { workspace = true, features = ["serde"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
