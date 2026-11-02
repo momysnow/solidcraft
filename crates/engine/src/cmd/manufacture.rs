@@ -3,8 +3,11 @@
 //! Recut of the #1782 ribbon onto the cam document. Op dialogs land in the stacked UI PRs.
 
 use serde_json::{Value, json};
+use solidcraft_cam::ToolKind;
+use solidcraft_geom::Vec3;
 
 use super::CommandSpec;
+use crate::params::{bad, str_};
 use crate::{Result, Session};
 
 fn opened(_s: &mut Session, _params: &Value) -> Result<Value> {
@@ -13,6 +16,59 @@ fn opened(_s: &mut Session, _params: &Value) -> Result<Value> {
 
 const fn chrome(id: &'static str, label: &'static str, panel: &'static str, icon: &'static str, params: &'static str) -> CommandSpec {
     CommandSpec::new(id, label, opened).icon(icon).noundo().doc_only().at("MANUFACTURE", panel).params(params)
+}
+
+/// Posts a setup in memory and sets its G-code up for the simulation: the setup's stock box and its
+/// flat end mills, the box in the setup's work frame like the G-code. A 0.25 mm ray spacing is tried
+/// first, then coarser up to 2 mm, so a large stock still fits the memory cap. Replies sim.setup's reply
+/// plus `frame` {origin, x, y, z}, the work frame in the model. Nothing is written to the design.
+fn simulate(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "manufacture.post.simulate";
+    let name = str_(p, "setup").map(str::trim).filter(|n| !n.is_empty()).ok_or_else(|| bad(cmd, "`setup` is required"))?.to_string();
+    let setup = s.doc.cam.setup(&name).ok_or_else(|| bad(cmd, format!("no setup `{name}`")))?;
+    let stock = setup.stock.ok_or_else(|| bad(cmd, format!("setup `{name}` has no stock box")))?;
+    // The G-code is in the setup's work frame, so the stock box goes there too: the box around its
+    // corners (the same box when the tool axis is a model axis).
+    let frame = super::cam::work_frame(setup).map_err(|e| bad(cmd, e))?;
+    let (mut min, mut max) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+    for i in 0..8 {
+        let pick = |k: usize| if i >> k & 1 == 0 { stock.min[k] } else { stock.max[k] };
+        let w = frame.local(Vec3::new(pick(0), pick(1), pick(2)));
+        for (k, v) in [w.x, w.y, w.z].into_iter().enumerate() {
+            min[k] = min[k].min(v);
+            max[k] = max[k].max(v);
+        }
+    }
+    let posted = s.execute("cam.post", &json!({"setup": name}))?;
+    let gcode = posted["gcode"].as_str().unwrap_or_default().to_string();
+    let tools: Vec<Value> = s
+        .doc
+        .cam
+        .tools
+        .iter()
+        .filter(|t| t.kind == ToolKind::FlatEndmill)
+        .map(|t| json!({"id": t.number, "diameter": t.diameter, "flute_length": t.flute_length}))
+        .collect();
+    let mut last = None;
+    for resolution in [0.25, 0.5, 1.0, 2.0] {
+        let params = json!({"stock": {"box": {"min": min, "max": max}}, "tools": tools, "gcode": gcode, "resolution": resolution});
+        let reply = s.execute("sim.setup", &params);
+        let done = reply.is_ok();
+        last = Some(reply);
+        if done {
+            break;
+        }
+    }
+    let mut reply = last.unwrap_or_else(|| Err(bad(cmd, "no ray spacing to try")))?;
+    reply["setup"] = json!(name);
+    // The stock is in the work frame: the window draws it back in the model with this.
+    let o = frame.model(Vec3::ZERO);
+    let axis = |w: Vec3| {
+        let d = frame.model(w) - o;
+        [d.x, d.y, d.z]
+    };
+    reply["frame"] = json!({"origin": [o.x, o.y, o.z], "x": axis(Vec3::new(1.0, 0.0, 0.0)), "y": axis(Vec3::new(0.0, 1.0, 0.0)), "z": axis(Vec3::new(0.0, 0.0, 1.0))});
+    Ok(reply)
 }
 
 pub static COMMANDS: &[CommandSpec] = &[
@@ -92,6 +148,12 @@ pub static COMMANDS: &[CommandSpec] = &[
     chrome("manufacture.post.process", "Post", "POST", "export", "Opens Post Process on the active Manufacture setup."),
     chrome("manufacture.post.time", "Cycle Time", "POST", "params", "Opens Machining Time on the active Manufacture setup."),
     chrome("manufacture.post.sheet", "Setup Sheet", "POST", "list", "Opens a Setup Sheet for the active Manufacture setup."),
+    CommandSpec::new("manufacture.post.simulate", "Simulate", simulate)
+        .icon("camera")
+        .noundo()
+        .doc_only()
+        .at("MANUFACTURE", "POST")
+        .params("setup: name. Posts the setup in memory and sets its G-code up for the stock-removal simulation: the setup's stock box and its flat end mills. Refused without a stock box. Replies the sim.setup reply with the setup name; then sim.run plays it."),
 ];
 
 #[cfg(test)]
@@ -113,6 +175,45 @@ mod tests {
         let r = s.execute("manufacture.2d.contour", &json!({})).unwrap();
         assert_eq!(r["opened"], true);
         assert!(s.doc.cam.setups.is_empty());
+    }
+
+    #[test]
+    fn simulate_sets_up_the_stock_of_a_posted_setup() {
+        let mut s = Session::default();
+        s.execute("cam.tool.define", &json!({"number": 1, "diameter": 6, "flute_length": 20, "feed": 600, "plunge_feed": 200, "stepdown": 3}))
+            .unwrap_or_else(|e| panic!("{e}"));
+        s.execute("cam.setup", &json!({"name": "Top", "stock": {"min": [0, 0, -10], "max": [40, 30, 0]}})).unwrap_or_else(|e| panic!("{e}"));
+        s.execute(
+            "cam.op.contour",
+            &json!({"setup": "Top", "name": "Outside", "tool": 1, "outer": [[0, 0], [40, 0], [40, 30], [0, 30]], "side": "outside", "bottom": -3, "stepdown": 3}),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert!(s.sim_stock().is_none());
+        let reply = s.execute("manufacture.post.simulate", &json!({"setup": "Top"})).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(reply["setup"], "Top");
+        assert!(s.sim_stock().is_some(), "the posted setup has a stock to cut");
+        assert!(s.sim_program().is_some_and(|p| !p.moves.is_empty()), "the posted G-code is the program");
+        assert!(s.execute("manufacture.post.simulate", &json!({"setup": "Nope"})).is_err());
+        assert!(s.execute("manufacture.post.simulate", &json!({})).is_err());
+    }
+
+    #[test]
+    fn simulate_puts_the_stock_in_the_work_frame_of_the_g_code() {
+        // Part zero on the stock's top, as on a mill: the G-code's Z 0 is the model's Z 10.
+        let mut s = Session::default();
+        s.execute("cam.tool.define", &json!({"number": 1, "diameter": 6, "flute_length": 20, "feed": 600, "plunge_feed": 200, "stepdown": 3}))
+            .unwrap_or_else(|e| panic!("{e}"));
+        s.execute("cam.setup", &json!({"name": "Top", "work_origin": [0, 0, 10], "stock": {"min": [0, 0, 0], "max": [40, 30, 10]}}))
+            .unwrap_or_else(|e| panic!("{e}"));
+        s.execute(
+            "cam.op.contour",
+            &json!({"setup": "Top", "name": "Outside", "tool": 1, "outer": [[0, 0], [40, 0], [40, 30], [0, 30]], "side": "outside", "bottom": -3, "stepdown": 3}),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let reply = s.execute("manufacture.post.simulate", &json!({"setup": "Top"})).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(reply["frame"]["origin"], json!([0.0, 0.0, 10.0]));
+        let (lo, hi) = (reply["bounds"]["min"][2].as_f64().unwrap_or(f64::NAN), reply["bounds"]["max"][2].as_f64().unwrap_or(f64::NAN));
+        assert!((lo + 10.0).abs() < 0.5 && hi.abs() < 0.5, "stock from z {lo} to {hi}, not -10 to 0: {}", reply["bounds"]);
     }
 
     #[test]

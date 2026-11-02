@@ -567,7 +567,7 @@ fn resolve_post(cam: &CamSettings, name: &str) -> std::result::Result<Post, Stri
     Post::builtin(name).ok_or_else(|| format!("unknown post `{name}` (built-in: {}; or save one on the design)", Post::BUILTIN.join(", ")))
 }
 
-struct WorkFrame {
+pub(super) struct WorkFrame {
     o: Vec3,
     x: Vec3,
     y: Vec3,
@@ -575,13 +575,13 @@ struct WorkFrame {
 }
 
 impl WorkFrame {
-    fn local(&self, p: Vec3) -> Vec3 {
+    pub(super) fn local(&self, p: Vec3) -> Vec3 {
         let d = p - self.o;
         Vec3::new(d.dot(self.x), d.dot(self.y), d.dot(self.z))
     }
 
     /// The inverse of `local`: a work point in model coordinates.
-    fn model(&self, w: Vec3) -> Vec3 {
+    pub(super) fn model(&self, w: Vec3) -> Vec3 {
         self.o + self.x * w.x + self.y * w.y + self.z * w.z
     }
 }
@@ -655,7 +655,7 @@ fn axes(axis: Vec3) -> Option<(Vec3, Vec3, Vec3)> {
     Some((x, z.cross(x), z))
 }
 
-fn work_frame(setup: &CamSetup) -> std::result::Result<WorkFrame, String> {
+pub(super) fn work_frame(setup: &CamSetup) -> std::result::Result<WorkFrame, String> {
     let z = setup.tool_axis_vec().normalized().filter(|z| z.is_finite()).ok_or("the setup's tool axis is not a direction")?;
     let x = match setup.x_axis {
         Some(a) => {

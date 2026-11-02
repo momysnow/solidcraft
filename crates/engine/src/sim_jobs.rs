@@ -236,4 +236,9 @@ impl Session {
     pub fn sim_take_dirty(&mut self) -> Vec<[usize; 3]> {
         self.sim.job_mut().map_or_else(Vec::new, Job::take_dirty)
     }
+
+    /// Moves completed and moves in the program, for the simulation's progress. `None` without one.
+    pub fn sim_progress(&self) -> Option<(usize, usize)> {
+        self.sim.job().map(|j| (j.cursor(), j.total()))
+    }
 }
