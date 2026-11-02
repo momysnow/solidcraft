@@ -330,6 +330,11 @@ impl Stock {
         self.grids.iter().flat_map(|g| g.tiles.iter()).map(|t| t.segs.len()).sum()
     }
 
+    /// The box's minimum and maximum corners, in the stored frame.
+    pub(crate) fn bounds(&self) -> ([f64; 3], [f64; 3]) {
+        (self.min, self.max)
+    }
+
     /// Cells per axis; the lattice nodes run from `-1` to `n` on each axis.
     pub(crate) fn cell_counts(&self) -> [usize; 3] {
         self.n

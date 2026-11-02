@@ -4,20 +4,21 @@
 //! of their three rays. Each lattice edge with a sign change lies on a ray, so its crossing is a
 //! ray end. Within each cell the sign-changing edges are paired on every face (a face with two
 //! sign changes pairs them; a checkerboard face with four pairs the edges around each outside
-//! corner), and the pairs join into groups. Each group gets one vertex, at the mean of its
-//! crossings. Each quad of the surface takes, from each of its four cells, the vertex of the group
-//! holding its edge.
+//! corner), and the pairs join into groups. Each group gets one vertex, the dual-contouring QEF
+//! point: the least-squares point of the planes through its crossings, whose normals are estimated
+//! from the neighbouring edges (see `Builder::estimate`), so a sharp edge stays sharp. A vertex may
+//! sit up to half a cell outside its cell, the usual dual-contouring trade-off, fine for display.
+//! Each quad of the surface takes, from each of its four cells, the vertex of the group holding its
+//! edge.
 //!
 //! The result is closed and oriented: every edge is shared by an even number of triangles, two in
 //! the usual case. Where one group holds both pairs of a checkerboard face, the edge can be shared
 //! by four. That is not a manifold surface there, and it is not claimed to be.
 //!
 //! Edges are owned by their lower node, so each quad is emitted once, by the chunk that owns it,
-//! and the chunks share their cell vertices bit for bit. Each chunk caches the inside or outside
-//! state of its nodes once, instead of evaluating each node about twenty times.
-//!
-//! shortcut: a group's vertex is the mean of its crossings, so sharp edges are rounded by up to one
-//! cell size; upgrade to a QEF with the tags' normals in S8.
+//! and the chunks share their cell vertices bit for bit. Each chunk caches the inside state of its
+//! nodes, and the crossing and normal of each edge it meets, so each is evaluated once per chunk
+//! rather than once per cell that touches it.
 
 use std::collections::HashMap;
 
@@ -36,6 +37,13 @@ pub trait Lattice {
     fn cell_counts(&self) -> [i64; 3];
     fn inside(&self, node: [i64; 3]) -> bool;
     fn crossing(&self, axis: usize, lower: [i64; 3]) -> Option<Vec3>;
+
+    /// The coordinate of lattice node `i` along `axis`. Crossings sit on the node positions across
+    /// their edge, so this is the same spacing the crossings use. A lattice on integer nodes keeps
+    /// the default.
+    fn node_position(&self, _axis: usize, i: i64) -> f64 {
+        i as f64
+    }
 }
 
 impl Lattice for Stock {
@@ -49,6 +57,10 @@ impl Lattice for Stock {
 
     fn crossing(&self, axis: usize, lower: [i64; 3]) -> Option<Vec3> {
         self.edge_crossing(axis, lower)
+    }
+
+    fn node_position(&self, axis: usize, i: i64) -> f64 {
+        self.pos(axis, i)
     }
 }
 
@@ -107,15 +119,25 @@ pub fn chunk_mesh_lod(stock: &Stock, idx: [usize; 3], step: u32) -> Option<Mesh>
     if step == 1 {
         return chunk_mesh(stock, idx);
     }
-    let c = idx.map(|x| x as i64);
-    // Fine chunks that the coarse chunk's nodes can reach, with one chunk of margin either side.
-    let reached = stock.touched_chunks().into_iter().any(|t| (0..3).all(|k| (t[k] as i64) + 1 >= c[k] * step && (t[k] as i64) <= (c[k] + 1) * step));
-    if !reached {
+    if !display_reached(stock, idx, step as u32) {
         return None;
     }
+    let c = idx.map(|x| x as i64);
     let n = stock.cell_counts().map(|x| x as i64);
     let counts = n.map(|x| (x + step - 1) / step);
     chunk_mesh_of(&Strided { stock, step, counts }, c)
+}
+
+/// Whether a cut reached display chunk `idx` at `step`: where it did not, the chunk is the uncut box
+/// and [`chunk_mesh_lod`] has no mesh; where it did, no mesh means the cut took all of it.
+pub fn display_reached(stock: &Stock, idx: [usize; 3], step: u32) -> bool {
+    let step = i64::from(step.clamp(1, 8));
+    if step == 1 {
+        return stock.is_touched(idx);
+    }
+    let c = idx.map(|x| x as i64);
+    // Fine chunks that the coarse chunk's nodes can reach, with one chunk of margin either side.
+    stock.touched_chunks().into_iter().any(|t| (0..3).all(|k| (t[k] as i64) + 1 >= c[k] * step && (t[k] as i64) <= (c[k] + 1) * step))
 }
 
 /// A lattice sampled every `step` nodes: coarse node `k` is fine node `k * step`, and a coarse edge
@@ -155,6 +177,121 @@ impl Lattice for Strided<'_> {
         };
         Some(Vec3::new(mid(0), mid(1), mid(2)))
     }
+
+    fn node_position(&self, axis: usize, i: i64) -> f64 {
+        self.stock.pos(axis, i * self.step)
+    }
+}
+
+/// The most display chunks a display draws before it coarsens (see [`display_step`]).
+const DISPLAY_CHUNKS: usize = 128;
+
+/// The display step (1, 2, 4 or 8) for a stock with `touched` chunks reached by cuts: the least step
+/// whose coarse chunk count, `touched / step^3`, is at most [`DISPLAY_CHUNKS`]. A coarse chunk costs
+/// about as much to mesh as a fine one, and there are a step cubed times fewer of them.
+pub fn display_step(touched: usize) -> u32 {
+    let mut step = 1u32;
+    while step < 8 && touched / (step as usize).pow(3) > DISPLAY_CHUNKS {
+        step *= 2;
+    }
+    step
+}
+
+/// Chunk counts per axis of the display at `step` (1, 2, 4 or 8), as [`chunk_mesh_lod`] indexes them.
+pub fn display_counts(stock: &Stock, step: u32) -> [usize; 3] {
+    let step = i64::from(step.clamp(1, 8));
+    let counts = stock.cell_counts().map(|x| (x as i64 + step - 1) / step);
+    chunk_counts(&Strided { stock, step, counts }).map(|c| c.max(0) as usize)
+}
+
+/// The display chunks at `step` whose mesh a change to fine chunk `fine` can alter. At step 1 that is
+/// the chunk itself: the stock already marks the neighbours a cut can change. A display chunk spans
+/// `step` fine ones, so at a coarser step the chunks within two of `fine / step` either side are taken.
+pub fn display_chunks_for(fine: [usize; 3], step: u32, counts: [usize; 3]) -> Vec<[usize; 3]> {
+    if step <= 1 {
+        return vec![fine];
+    }
+    let s = step as usize;
+    let per_axis: [Vec<usize>; 3] = std::array::from_fn(|k| {
+        let base = fine[k] / s;
+        (base.saturating_sub(2)..(base + 3).min(counts[k])).collect()
+    });
+    let mut out = Vec::new();
+    for &x in &per_axis[0] {
+        for &y in &per_axis[1] {
+            for &z in &per_axis[2] {
+                out.push([x, y, z]);
+            }
+        }
+    }
+    out
+}
+
+/// The uncut box's faces at `step`, for the display chunks `covered` says have a mesh of their own.
+/// Each face is cut into one quad per display chunk, so a chunk with its own surface (see
+/// [`chunk_mesh_lod`]) leaves its part of the box open, as the design note of [`chunk_mesh`] says. A
+/// quad belongs to the chunk that owns its edge, so a chunk's box faces are the ones its mesh draws.
+pub fn box_faces(stock: &Stock, step: u32, covered: impl Fn([usize; 3]) -> bool) -> Mesh {
+    let step = step.clamp(1, 8);
+    let s = i64::from(step);
+    let n = stock.cell_counts().map(|x| (x as i64).max(1));
+    let counts = display_counts(stock, step);
+    let (lo, hi) = stock.bounds();
+    let cell: [f64; 3] = std::array::from_fn(|k| stock.pos(k, 1) - stock.pos(k, 0));
+    let (mut positions, mut normals, mut triangles) = (Vec::new(), Vec::new(), Vec::new());
+    for a in 0..3 {
+        let (u, v) = ((a + 1) % 3, (a + 2) % 3);
+        for low in [true, false] {
+            // The face's quads are the edges along `a` at one lower node: -1 for the low face, the last
+            // material node for the high one (in display nodes).
+            let l_a = if low { -1 } else { (n[a] - 1) / s };
+            let sign = if low { -1.0 } else { 1.0 };
+            let plane = if low { lo[a] } else { hi[a] };
+            let last = [(n[u] - 1) / s, (n[v] - 1) / s];
+            let owner = ((l_a - LOWEST) / CHUNK) as usize;
+            // The lower nodes chunk `c` owns along an axis, clipped to the box.
+            let span = |c: usize, last: i64| {
+                let first = (c as i64) * CHUNK + LOWEST;
+                let (from, to) = (first.max(0), (first + CHUNK - 1).min(last));
+                (from <= to).then_some((from, to))
+            };
+            for cu in 0..counts[u] {
+                for cv in 0..counts[v] {
+                    let mut idx = [0usize; 3];
+                    idx[a] = owner;
+                    idx[u] = cu;
+                    idx[v] = cv;
+                    if covered(idx) {
+                        continue;
+                    }
+                    let (Some((ul0, ul1)), Some((vl0, vl1))) = (span(cu, last[0]), span(cv, last[1])) else { continue };
+                    let at = |k: usize, from: i64, to: i64| {
+                        let stride = s as f64 * cell[k];
+                        (lo[k] + from as f64 * stride, (lo[k] + (to + 1) as f64 * stride).min(hi[k]))
+                    };
+                    let (u0, u1) = at(u, ul0, ul1);
+                    let (v0, v1) = at(v, vl0, vl1);
+                    let corners = [(u0, v0), (u1, v0), (u1, v1), (u0, v1)].map(|(pu, pv)| {
+                        let mut p = [0.0f64; 3];
+                        p[a] = plane;
+                        p[u] = pu;
+                        p[v] = pv;
+                        Vec3::from(p)
+                    });
+                    let mut nrm = [0.0f64; 3];
+                    nrm[a] = sign;
+                    let Ok(base) = u32::try_from(positions.len()) else { continue };
+                    positions.extend(corners);
+                    normals.extend([Vec3::from(nrm); 4]);
+                    // Counter-clockwise seen from outside: the (u, v) order of the corners gives +a.
+                    let quad = if low { [[0, 2, 1], [0, 3, 2]] } else { [[0, 1, 2], [0, 2, 3]] };
+                    triangles.extend(quad.map(|t| t.map(|i| base + i)));
+                }
+            }
+        }
+    }
+    let tri_face = vec![0u32; triangles.len()];
+    Mesh { positions, normals, triangles, tri_face, ..Mesh::default() }
 }
 
 /// The chunks whose surface may have changed since the last [`Stock::clear_dirty`]: each once. A cut
@@ -191,7 +328,8 @@ pub(crate) fn chunks_for_nodes(lo: [i64; 3], hi: [i64; 3], counts: [i64; 3]) -> 
 
 /// The volume of the cut stock from its surface, by the divergence theorem. The chunk meshes share
 /// their boundary vertices exactly, so their signed volumes add. It is not uniformly more precise than
-/// [`Stock::volume`]: its vertices are cell means, which round sharp edges by up to a cell.
+/// [`Stock::volume`]: its vertices are QEF points, which keep sharp edges sharp and sit within half a
+/// cell of their cell.
 pub fn mesh_volume(stock: &Stock) -> f64 {
     chunk_meshes(stock).iter().map(|m| m.measure().volume).sum()
 }
@@ -246,6 +384,66 @@ fn corner_offset(c: usize) -> [i64; 3] {
     [(c & 1) as i64, ((c >> 1) & 1) as i64, ((c >> 2) & 1) as i64]
 }
 
+/// The QEF vertex of a group from its crossings (position, normal): the point that minimises the
+/// squared distances to the planes through the crossings, plus `0.05 * count` times the squared
+/// distance to their mean. Both terms are squared lengths, so the weight is dimensionless and the
+/// solve needs no cell size. The mean stands in when the solve fails or the point leaves the cell
+/// grown by half a cell. `None` when the group has no crossing.
+fn group_vertex<L: Lattice>(lat: &L, cell: [i64; 3], crossings: &[(Vec3, Vec3)]) -> Option<Vec3> {
+    if crossings.is_empty() {
+        return None;
+    }
+    let count = crossings.len() as f64;
+    let mean = crossings.iter().fold(Vec3::ZERO, |acc, (p, _)| acc + *p) / count;
+    let mut ata = [[0.0f64; 3]; 3];
+    let mut atb = [0.0f64; 3];
+    for (p, n) in crossings {
+        let b = n.dot(*p - mean);
+        let n: [f64; 3] = (*n).into();
+        for r in 0..3 {
+            atb[r] += b * n[r];
+            for c in 0..3 {
+                ata[r][c] += n[r] * n[c];
+            }
+        }
+    }
+    // The weight keeps the solve definite: along a flat direction the vertex stays at the mean.
+    for (k, row) in ata.iter_mut().enumerate() {
+        row[k] += 0.05 * count;
+    }
+    let mean_arr: [f64; 3] = mean.into();
+    let Some(offset) = solve3(ata, atb) else { return Some(mean) };
+    let x: [f64; 3] = std::array::from_fn(|k| mean_arr[k] + offset[k]);
+    let inside_cell = (0..3).all(|k| {
+        let (a, b) = (lat.node_position(k, cell[k]), lat.node_position(k, cell[k] + 1));
+        let half = 0.5 * (b - a).abs();
+        x[k] >= a.min(b) - half && x[k] <= a.max(b) + half
+    });
+    Some(if inside_cell { Vec3::from(x) } else { mean })
+}
+
+/// Solves the 3 by 3 system `m x = b` by Cramer's rule. `None` when the determinant is too small to
+/// trust or the answer is not finite.
+fn solve3(m: [[f64; 3]; 3], b: [f64; 3]) -> Option<[f64; 3]> {
+    let det = |c: [[f64; 3]; 3]| {
+        c[0][0] * (c[1][1] * c[2][2] - c[1][2] * c[2][1]) - c[0][1] * (c[1][0] * c[2][2] - c[1][2] * c[2][0])
+            + c[0][2] * (c[1][0] * c[2][1] - c[1][1] * c[2][0])
+    };
+    let d = det(m);
+    if !(d.is_finite() && d.abs() > 1e-12) {
+        return None;
+    }
+    let mut x = [0.0f64; 3];
+    for (k, xk) in x.iter_mut().enumerate() {
+        let mut c = m;
+        for (r, row) in c.iter_mut().enumerate() {
+            row[k] = b[r];
+        }
+        *xk = det(c) / d;
+    }
+    x.iter().all(|v| v.is_finite()).then_some(x)
+}
+
 /// The inside or outside state of a box of nodes, evaluated once.
 struct NodeCache {
     origin: [i64; 3],
@@ -285,6 +483,8 @@ struct Builder<'a, L: Lattice> {
     nodes: NodeCache,
     /// Per cell: the vertex of each sign-changing edge of the cell, by edge index.
     cells: HashMap<[i64; 3], [Option<u32>; 12]>,
+    /// Per edge (axis, lower node): its crossing and surface normal, or `None` when it has no crossing.
+    edges: HashMap<(usize, [i64; 3]), Option<(Vec3, Vec3)>>,
     positions: Vec<Vec3>,
     triangles: Vec<[u32; 3]>,
 }
@@ -292,14 +492,89 @@ struct Builder<'a, L: Lattice> {
 impl<'a, L: Lattice> Builder<'a, L> {
     /// A builder for the chunk whose first lower node is `first`. Quads and cell patches of the
     /// chunk read nodes from `first - 2` to `first + CHUNK + 1` on each axis, so the cache covers that.
+    /// The normal of an edge reads one node further each way, which the cache also covers.
     fn new(lat: &'a L, n: [i64; 3], first: [i64; 3]) -> Self {
         let origin = first.map(|f| f - 2);
         let nodes = NodeCache::build(lat, origin, [CHUNK + 4; 3]);
-        Builder { lat, n, nodes, cells: HashMap::new(), positions: Vec::new(), triangles: Vec::new() }
+        Builder { lat, n, nodes, cells: HashMap::new(), edges: HashMap::new(), positions: Vec::new(), triangles: Vec::new() }
     }
 
     fn inside(&self, node: [i64; 3]) -> bool {
         self.nodes.get(self.lat, node)
+    }
+
+    /// Whether the edge from `node` along `axis` is sign-changing.
+    fn changes(&self, axis: usize, node: [i64; 3]) -> bool {
+        let mut upper = node;
+        upper[axis] += 1;
+        self.inside(node) != self.inside(upper)
+    }
+
+    /// The crossing and the surface normal of the edge from `lower` along `axis`, memoised per chunk.
+    fn surface(&mut self, axis: usize, lower: [i64; 3]) -> Option<(Vec3, Vec3)> {
+        if let Some(v) = self.edges.get(&(axis, lower)) {
+            return *v;
+        }
+        let v = self.estimate(axis, lower);
+        self.edges.insert((axis, lower), v);
+        v
+    }
+
+    /// The crossing of the edge from `lower` along `axis`, and its normal pointing from material to air.
+    /// The normal is estimated from the square of edges around the crossing. Along each perpendicular
+    /// axis `k` the surface height has a slope from each side: the square towards `k` (the parallel
+    /// neighbour, the two `k` edges at its ends) must hold exactly one more sign change, so one sheet
+    /// crosses it, and the slope is that crossing's height difference over its `k` difference. A
+    /// square with three more changes is a saddle and gives no slope, and so does a side with none.
+    /// Of the two sides the smaller-magnitude slope is taken, so a crossing beside a crease takes its
+    /// own face's slope. Slopes are clamped to +-1e3. Air-to-material crossings need no separate case:
+    /// they are the same single-change squares, and their normal flips with the sign below.
+    fn estimate(&self, axis: usize, lower: [i64; 3]) -> Option<(Vec3, Vec3)> {
+        let here = self.lat.crossing(axis, lower)?;
+        let mut raw = [0.0f64; 3];
+        raw[axis] = 1.0;
+        for k in [(axis + 1) % 3, (axis + 2) % 3] {
+            let s = match (self.side_slope(axis, k, lower, -1, here), self.side_slope(axis, k, lower, 1, here)) {
+                (Some(a), Some(b)) => {
+                    if a.abs() <= b.abs() {
+                        a
+                    } else {
+                        b
+                    }
+                }
+                (Some(a), None) | (None, Some(a)) => a,
+                (None, None) => 0.0,
+            };
+            raw[k] = -s;
+        }
+        // The height gradient points from material to air when the lower end is material, so flip it
+        // when the lower end is air.
+        let sign = if self.inside(lower) { 1.0 } else { -1.0 };
+        let normal = Vec3::from(raw.map(|x| sign * x)).normalized().unwrap_or(Vec3::ZERO);
+        Some((here, normal))
+    }
+
+    /// The slope along `k` of the surface through the crossing `here` of the edge from `lower`, towards
+    /// `side` (-1 or +1) along `k`, from the one other sign change in that square (see [`Self::estimate`]).
+    fn side_slope(&self, axis: usize, k: usize, lower: [i64; 3], side: i64, here: Vec3) -> Option<f64> {
+        let mut nb = lower;
+        nb[k] += side;
+        let mut bottom = lower;
+        bottom[k] += side.min(0);
+        let mut top = bottom;
+        top[axis] += 1;
+        let others = [(axis, nb), (k, bottom), (k, top)];
+        let mut changed = others.into_iter().filter(|&(dir, node)| self.changes(dir, node));
+        let (dir, node) = changed.next()?;
+        if changed.next().is_some() {
+            return None;
+        }
+        let other = self.lat.crossing(dir, node)?;
+        let (h, t) = (<[f64; 3]>::from(here), <[f64; 3]>::from(other));
+        let (dh, dk) = (t[axis] - h[axis], t[k] - h[k]);
+        let s = dh / dk;
+        // A zero over zero (both crossings at one point) has no slope; an infinite one is clamped.
+        Some(if s.is_nan() { 0.0 } else { s.clamp(-1e3, 1e3) })
     }
 
     /// Emits the quads of the edges owned by the chunk whose first lower node is `first`.
@@ -356,7 +631,7 @@ impl<'a, L: Lattice> Builder<'a, L> {
     }
 
     /// The vertices of one cell: pair the sign-changing edges on each face, group the pairs, and
-    /// give each group a vertex at the mean of its crossings.
+    /// give each group its QEF vertex (see [`group_vertex`]).
     fn patch(&mut self, cell: [i64; 3]) -> [Option<u32>; 12] {
         let mut sign = [false; 8];
         for (c, s) in sign.iter_mut().enumerate() {
@@ -404,8 +679,8 @@ impl<'a, L: Lattice> Builder<'a, L> {
                 }
             }
         }
-        // One vertex per group, at the mean of its crossings.
-        let mut groups: HashMap<usize, (Vec3, u32, Vec<usize>)> = HashMap::new();
+        // One vertex per group, from the position and normal of each of its crossings.
+        let mut groups: HashMap<usize, (Vec<usize>, Vec<(Vec3, Vec3)>)> = HashMap::new();
         for (id, ch) in change.iter().enumerate() {
             if !ch {
                 continue;
@@ -413,22 +688,19 @@ impl<'a, L: Lattice> Builder<'a, L> {
             let root = find(&mut parent, id);
             let (axis, off0) = edge_offset(id);
             let lower: [i64; 3] = std::array::from_fn(|k| cell[k] + off0[k]);
-            let entry = groups.entry(root).or_insert((Vec3::ZERO, 0, Vec::new()));
-            entry.2.push(id);
-            if let Some(p) = self.lat.crossing(axis, lower) {
-                entry.0 += p;
-                entry.1 += 1;
+            let entry = groups.entry(root).or_insert_with(|| (Vec::new(), Vec::new()));
+            entry.0.push(id);
+            if let Some(crossing) = self.surface(axis, lower) {
+                entry.1.push(crossing);
             }
         }
         let mut patch = [None; 12];
         let mut roots: Vec<usize> = groups.keys().copied().collect();
         roots.sort_unstable();
         for root in roots {
-            let Some((sum, count, edges)) = groups.get(&root) else { continue };
-            if *count == 0 {
-                continue;
-            }
-            self.positions.push(*sum / f64::from(*count));
+            let Some((edges, crossings)) = groups.get(&root) else { continue };
+            let Some(p) = group_vertex(self.lat, cell, crossings) else { continue };
+            self.positions.push(p);
             let Ok(id) = u32::try_from(self.positions.len() - 1) else { continue };
             for e in edges {
                 if let Some(slot) = patch.get_mut(*e) {
