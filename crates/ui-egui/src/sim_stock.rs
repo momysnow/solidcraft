@@ -1,7 +1,7 @@
 //! The stock of the G-code simulation (`sim.setup`, `sim.run`) in the viewport: the uncut box, and the
 //! surface of each chunk a cut has reached (`solidcraft_machining::mesh`), opaque with its crease edges
-//! dark, as a STEP model's body edges. The cutting tool stands at the tip of the move the cursor has
-//! reached.
+//! dark, as a STEP model's body edges. The cutting tool stands where the engine's playhead puts it (its
+//! pose, interpolated within the move).
 //!
 //! Only the chunks the stock marks dirty are meshed, on a worker thread (or inline where there is none,
 //! as on wasm), one batch at a time, like the toolpaths. A batch made for an older stock, revision or
@@ -11,6 +11,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::f64::consts::TAU;
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, mpsc::Receiver, mpsc::TryRecvError};
 use std::time::Duration;
 
@@ -20,12 +21,20 @@ use solidcraft_machining::dexel::Stock;
 use solidcraft_machining::mesh;
 
 use crate::gpu::{BlockBuilder, BlockBytes, GpuScene, PaletteIndex, SceneBlock, TriClass};
-use crate::{SolveApp, i18n::tr, theme::Tokens, viewport::c4};
+use crate::{SolveApp, i18n::tr, theme::Tokens, ui_kit, viewport::c4};
 
 /// How often the window asks again while a batch is being meshed.
 const POLL: Duration = Duration::from_millis(100);
 /// How long one frame may play the simulation, in seconds: the window stays responsive meanwhile.
 const PLAY_SLICE_S: f64 = 0.03;
+/// How long one frame may run a scrub, in seconds: a backward seek restores a checkpoint, so it is cheap.
+const SCRUB_SLICE_S: f64 = 0.05;
+/// The playback speed a simulation starts at, in machine seconds per real second, and its range.
+const DEFAULT_SPEED: f64 = 10.0;
+const MIN_SPEED: f64 = 1.0;
+const MAX_SPEED: f64 = 500.0;
+/// The longest real time one frame moves the playhead for, so a stalled frame does not jump the cut.
+const MAX_FRAME_S: f64 = 0.1;
 /// The cosine of 30 degrees: faces that turn further than this from each other meet at a crease, so
 /// their edge is drawn and each side keeps its own shading.
 const CREASE_COS: f64 = 0.866;
@@ -33,6 +42,13 @@ const CREASE_COS: f64 = 0.866;
 const EDGE_WIDTH: f32 = 1.3;
 /// The sides of the cutting tool's cylinder: round at the size it is drawn.
 const TOOL_SIDES: usize = 24;
+/// The playback bar's width: this share of the view, within these limits. A view too narrow for the
+/// minimum hides the bar.
+const BAR_SHARE: f32 = 0.7;
+const BAR_MIN_WIDTH: f32 = 520.0;
+const BAR_MAX_WIDTH: f32 = 1100.0;
+/// The speed slider's width, in points.
+const SPEED_WIDTH: f32 = 90.0;
 
 /// The meshes of the chunks in one batch, by display index: `None` for a chunk with no surface now.
 type Batch = Vec<([usize; 3], Option<Surface>)>;
@@ -63,7 +79,6 @@ impl Surface {
 }
 
 /// What the viewport draws of the simulation's stock.
-#[derive(Default)]
 pub struct State {
     /// The stock's revision these meshes belong to; 0 without a simulation.
     revision: u64,
@@ -82,15 +97,28 @@ pub struct State {
     job: Option<Job>,
     /// Changes whenever the drawn geometry does.
     generation: u64,
-    /// The uncut box, for the chunks without a mesh, built for `box_for`.
+    /// The uncut box, for the chunks without a mesh, built for `box_gen` (the box's own key: bumped only
+    /// when a chunk gains or loses its mesh, so a cursor step or a tool move does not rebuild it).
     boxed: Surface,
+    box_gen: u64,
     box_for: Option<u64>,
-    /// Whether the simulation plays: each frame runs it on for a short slice.
+    /// The box's block, with the key it was built for (see `box_gen`); built in `draw`, kept while the key
+    /// comes back.
+    box_block: Mutex<Option<(u64, Arc<BlockBytes>)>>,
+    /// Whether the simulation plays: each frame moves the playhead on by its share of real time times
+    /// `speed`.
     playing: bool,
+    /// The playback speed, in machine seconds per real second; kept across Simulate runs.
+    pub(crate) speed: f64,
+    /// The time a scrub (the timeline slider) is still on its way to: the engine may cut only part of
+    /// the way per frame, so the seek goes on over the following frames.
+    scrub: Option<f64>,
     /// The work frame the stock is in, as origin and X, Y, Z axes in the model; `None` is the model's.
     /// shortcut: kept from the last Simulate only, so a `sim.setup` sent another way draws in the frame
     /// of the last Simulate; take it from the simulation when it records one.
     frame: Option<[[f32; 3]; 4]>,
+    /// The playback bar's rectangle as last drawn over the view; `None` while it is not drawn.
+    bar: Option<egui::Rect>,
     /// Chunks meshed so far (tests only).
     #[cfg(test)]
     meshed: usize,
@@ -99,6 +127,8 @@ pub struct State {
 struct Job {
     revision: u64,
     step: u32,
+    /// Set when the batch is let go of: the thread stops at its next chunk instead of meshing on.
+    cancel: Arc<AtomicBool>,
     rx: Receiver<Batch>,
 }
 
@@ -112,6 +142,33 @@ enum Start {
 struct Work {
     stock: Stock,
     chunks: Vec<[usize; 3]>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl Default for State {
+    fn default() -> State {
+        State {
+            revision: 0,
+            step: 0,
+            meshes: BTreeMap::new(),
+            serials: 0,
+            blocks: Mutex::default(),
+            pending: BTreeSet::new(),
+            job: None,
+            generation: 0,
+            boxed: Surface::default(),
+            box_gen: 0,
+            box_for: None,
+            box_block: Mutex::default(),
+            playing: false,
+            speed: DEFAULT_SPEED,
+            scrub: None,
+            frame: None,
+            bar: None,
+            #[cfg(test)]
+            meshed: 0,
+        }
+    }
 }
 
 impl State {
@@ -127,6 +184,7 @@ pub fn simulate_active(app: &mut SolveApp) {
     match app.run("manufacture.post.simulate", json!({"setup": setup})) {
         Ok(reply) => {
             app.sim_stock.frame = frame(&reply["frame"]);
+            app.sim_stock.scrub = None;
             app.sim_stock.playing = true;
         }
         Err(e) => app.set_status(e, true),
@@ -149,19 +207,52 @@ pub fn hides_bodies(app: &SolveApp) -> bool {
     crate::manufacture_workspace::active(app) && app.session.sim_revision() != 0
 }
 
-/// Runs the simulation on for one slice while it plays, so a long program takes many frames and the
-/// window never waits for it.
+/// The playhead one frame on: `dt` real seconds at `speed` machine seconds each, with `dt` capped at
+/// `MAX_FRAME_S`, and never past `total`.
+pub fn next_time(time: f64, total: f64, dt: f64, speed: f64) -> f64 {
+    (time + dt.min(MAX_FRAME_S) * speed).min(total)
+}
+
+/// Whether the playhead is at the program's end, allowing for float error in the engine's time.
+fn at_end(time: f64, total: f64) -> bool {
+    time >= total - 1e-9
+}
+
+/// Moves the simulation to where the playhead is to go this frame: the pending scrub while there is
+/// one, else one frame on while it plays. The engine's reply is the truth: it cuts only as far as the
+/// budget allows, so the next frame goes on from the playhead it reports, never from the target.
 fn advance(app: &mut SolveApp, ctx: &egui::Context) {
-    if !app.sim_stock.playing {
-        return;
-    }
-    // Cleared elsewhere (a `sim.clear` command, a new setup) while it played: stop quietly, no error.
-    if app.session.sim_progress().is_none() {
+    // Not in Manufacture the stock is not drawn: playback pauses rather than cut what no one sees.
+    if !crate::manufacture_workspace::active(app) {
         app.sim_stock.playing = false;
         return;
     }
-    match app.session.execute("sim.run", &json!({"to": "end", "budget_s": PLAY_SLICE_S})) {
-        Ok(reply) if reply["done"].as_bool() == Some(true) => app.sim_stock.playing = false,
+    // Cleared elsewhere (a `sim.clear` command, a new setup) while it played: stop quietly, no error.
+    let Some((time, total)) = app.session.sim_time() else {
+        app.sim_stock.playing = false;
+        app.sim_stock.scrub = None;
+        return;
+    };
+    if let Some(target) = app.sim_stock.scrub {
+        match app.session.execute("sim.run", &json!({"time": target, "budget_s": SCRUB_SLICE_S})) {
+            Ok(reply) if reply["reached"].as_bool() == Some(true) => app.sim_stock.scrub = None,
+            Ok(_) => ctx.request_repaint(),
+            Err(e) => {
+                app.sim_stock.scrub = None;
+                app.set_status(e.to_string(), true);
+            }
+        }
+        return;
+    }
+    if !app.sim_stock.playing {
+        return;
+    }
+    let dt = f64::from(ctx.input(|i| i.stable_dt));
+    let target = next_time(time, total, dt, app.sim_stock.speed.clamp(MIN_SPEED, MAX_SPEED));
+    match app.session.execute("sim.run", &json!({"time": target, "budget_s": PLAY_SLICE_S})) {
+        Ok(reply) if reply["done"].as_bool() == Some(true) || reply["time"].as_f64().is_some_and(|t| at_end(t, total)) => {
+            app.sim_stock.playing = false;
+        }
         Ok(_) => ctx.request_repaint(),
         Err(e) => {
             app.sim_stock.playing = false;
@@ -170,32 +261,176 @@ fn advance(app: &mut SolveApp, ctx: &egui::Context) {
     }
 }
 
-/// The play, pause and clear controls and the progress of the simulation, in the Manufacture panel.
-pub fn panel(app: &mut SolveApp, ui: &mut egui::Ui) {
-    let Some((cursor, total)) = app.session.sim_progress() else { return };
-    ui.horizontal(|ui| {
-        let playing = app.sim_stock.playing;
-        if ui.button(if playing { tr("sim.stock.pause") } else { tr("sim.stock.play") }).clicked() {
-            if playing {
-                app.sim_stock.playing = false;
-            } else {
-                // A finished run plays again from the start.
-                let restart = if cursor >= total { app.session.execute("sim.run", &json!({"to": 0})).map(|_| ()) } else { Ok(()) };
-                match restart {
-                    Ok(()) => app.sim_stock.playing = true,
-                    Err(e) => app.set_status(e.to_string(), true),
-                }
-            }
-        }
-        let (cursor, total) = (cursor.to_string(), total.to_string());
-        ui.label(crate::i18n::format("sim.stock.progress", &[("cursor", &cursor), ("total", &total)]));
-        if ui.button(tr("sim.stock.clear")).clicked() {
-            app.sim_stock.playing = false;
-            if let Err(e) = app.session.execute("sim.clear", &json!({})) {
-                app.set_status(e.to_string(), true);
-            }
-        }
+/// Plays the simulation on from the playhead; a finished run plays again from the start.
+pub fn play(app: &mut SolveApp) {
+    if app.session.sim_time().is_some_and(|(time, total)| at_end(time, total)) {
+        app.sim_stock.scrub = Some(0.0);
+    }
+    app.sim_stock.playing = true;
+}
+
+/// Moves the playhead to `time` (the timeline): playback pauses, and the frames that follow run the
+/// simulation there, as far as each frame's budget allows.
+pub fn seek(app: &mut SolveApp, time: f64) {
+    app.sim_stock.playing = false;
+    app.sim_stock.scrub = Some(time);
+}
+
+/// Minutes and seconds, as `01:05`, for the playhead and the program's length.
+fn clock(seconds: f64) -> String {
+    let s = seconds.max(0.0) as u64;
+    format!("{:02}:{:02}", s / 60, s % 60)
+}
+
+/// Clears the simulation from the playback bar's Clear button: stops playback and drops the stock.
+fn clear(app: &mut SolveApp) {
+    app.sim_stock.playing = false;
+    app.sim_stock.scrub = None;
+    if let Err(e) = app.session.execute("sim.clear", &json!({})) {
+        app.set_status(e.to_string(), true);
+    }
+}
+
+/// The bar's place: centred on the view at `BAR_SHARE` of its width within the limits, and just above the
+/// navigation bar when one sits on the bottom edge (`nav`), else at the view's bottom. `None` when the
+/// view cannot hold the minimum bar.
+fn bar_rect(view: egui::Rect, nav: Option<egui::Rect>) -> Option<egui::Rect> {
+    let t = Tokens::get();
+    if view.width() < BAR_MIN_WIDTH + 2.0 * t.space_16 {
+        return None;
+    }
+    let width = (view.width() * BAR_SHARE).clamp(BAR_MIN_WIDTH, BAR_MAX_WIDTH).min(view.width() - 2.0 * t.space_16);
+    let height = t.control_height + 2.0 * t.space_4;
+    let bottom = nav.map_or(view.bottom() - t.space_8, |nav| nav.top() - t.space_8);
+    Some(egui::Rect::from_center_size(egui::pos2(view.center().x, bottom - height / 2.0), egui::vec2(width, height)))
+}
+
+/// Which optional controls the row shows, for `inner` points: the move count, then the speed control,
+/// go first when the timeline would keep less than half the row. `core` is what the row always shows,
+/// the timeline excepted. `None` when even the core leaves the timeline under half: the bar is hidden.
+fn row_items(inner: f32, core: f32, moves: f32, speed: f32) -> Option<(bool, bool)> {
+    [(true, true), (false, true), (false, false)].into_iter().find(|&(moves_on, speed_on)| {
+        let used = core + if moves_on { moves } else { 0.0 } + if speed_on { speed } else { 0.0 };
+        inner - used >= inner * 0.5
+    })
+}
+
+/// The slider's position for a speed: 0 at `MIN_SPEED`, 1 at `MAX_SPEED`, on a log scale so the slow
+/// speeds keep room on the slider.
+fn speed_level(speed: f64) -> f64 {
+    (speed.clamp(MIN_SPEED, MAX_SPEED) / MIN_SPEED).ln() / (MAX_SPEED / MIN_SPEED).ln()
+}
+
+/// The speed at a slider position (the inverse of `speed_level`).
+fn speed_at(level: f64) -> f64 {
+    MIN_SPEED * (MAX_SPEED / MIN_SPEED).powf(level.clamp(0.0, 1.0))
+}
+
+/// The play or pause control: History's transport glyph, with its hover fill and a hand cursor.
+fn transport(ui: &mut egui::Ui, size: f32, playing: bool) -> egui::Response {
+    let t = Tokens::get();
+    let label = tr(if playing { "sim.stock.pause" } else { "sim.stock.play" });
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::click());
+    if response.hovered() {
+        ui.painter().rect_filled(rect, t.radius_sm, t.hover);
+    }
+    crate::icons::glyphs::transport_glyph(ui.painter(), rect.center(), if playing { "pause" } else { "play" }, t.icon);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label));
+    response.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(label)
+}
+
+/// The width of `text` in `font`, as the painter lays it out.
+fn text_width(ui: &egui::Ui, text: &str, font: egui::FontId) -> f32 {
+    ui.painter().layout_no_wrap(text.to_owned(), font, Tokens::get().text).size().x
+}
+
+/// The bar's rectangle as last drawn over the view, for the overlays that keep clear of it.
+pub fn playback_rect(app: &SolveApp) -> Option<egui::Rect> {
+    app.sim_stock.bar
+}
+
+/// The playback bar over the 3D viewport, one row: play or pause, the elapsed time, the timeline, the
+/// program's length, the move count, the speed and Clear. Shown while Manufacture shows a simulation,
+/// and only where it fits (`row_items`). Its widgets claim the pointer over the bar, so the camera and
+/// picking beneath get no clicks from it.
+pub fn playback(app: &mut SolveApp, ui: &mut egui::Ui, viewport: egui::Rect) {
+    app.sim_stock.bar = None;
+    if !crate::manufacture_workspace::active(app) {
+        return;
+    }
+    let (Some((cursor, total)), Some((time, total_time))) = (app.session.sim_progress(), app.session.sim_time()) else { return };
+    let view = crate::shell::bottom_overlay_rect(app, crate::shell::content_rect(app, viewport));
+    let nav = app.viewport.layout.as_ref().map(|l| l.navigation).filter(|n| {
+        n.is_positive() && n.is_finite() && app.ui.show_navigation_bar && app.preferences.navigation_bar.edge == crate::navigation_bar::Edge::Bottom
     });
+    let Some(rect) = bar_rect(view, nav).filter(|r| r.is_finite() && r.is_positive()) else { return };
+    let t = Tokens::get();
+    let h = t.control_height;
+    let inner = rect.width() - 2.0 * t.space_8;
+    let gap = ui.spacing().item_spacing.x;
+    let (cursor, total) = (cursor.to_string(), total.to_string());
+    let moves = crate::i18n::format("sim.stock.progress", &[("cursor", &cursor), ("total", &total)]);
+    let (elapsed, length) = (clock(time), clock(total_time));
+    let speed = format!("{:.0}{}", app.sim_stock.speed, tr("sim.stock.speed_suffix"));
+    let elapsed_w = text_width(ui, &elapsed, egui::FontId::monospace(t.font_label));
+    let clear_w = text_width(ui, tr("sim.stock.clear"), egui::TextStyle::Small.resolve(ui.style())) + 2.0 * ui.spacing().button_padding.x;
+    let core = h + elapsed_w + text_width(ui, &length, egui::FontId::monospace(t.font_small)) + clear_w + 4.0 * gap;
+    let moves_w = text_width(ui, &moves, egui::FontId::proportional(t.font_small)) + 2.0 * gap;
+    let speed_w = text_width(ui, &speed, egui::FontId::proportional(t.font_small)) + SPEED_WIDTH + 2.0 * gap;
+    let Some((moves_on, speed_on)) = row_items(inner, core, moves_w, speed_w) else { return };
+
+    ui_kit::playback_surface(ui, rect, app.preferences.navigation_bar.size);
+    // Claimed before the row's widgets, so they stay on top of it and the viewport gets no press on the bar.
+    ui.interact(rect, ui.id().with("sim_playback"), egui::Sense::click_and_drag());
+    app.sim_stock.bar = Some(rect);
+
+    let playing = app.sim_stock.playing;
+    let mut level = speed_level(app.sim_stock.speed);
+    // While a scrub is on its way the timeline holds the target, not the playhead that lags it.
+    let mut shown = app.sim_stock.scrub.unwrap_or(time);
+    let (mut toggle, mut wipe) = (false, false);
+    let row = egui::Rect::from_center_size(rect.center(), egui::vec2(inner, h));
+    // The row is laid out from the right, so the timeline takes the width the controls on its left leave.
+    ui.scope_builder(egui::UiBuilder::new().max_rect(row).layout(egui::Layout::right_to_left(egui::Align::Center)), |ui| {
+        ui.set_clip_rect(rect);
+        wipe = ui_kit::button(ui, tr("sim.stock.clear"), ui_kit::Button::Small).clicked();
+        if speed_on {
+            ui.label(egui::RichText::new(speed).size(t.font_small).color(t.text_dim));
+            ui.allocate_ui_with_layout(egui::vec2(SPEED_WIDTH, h), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                let slider = ui_kit::slider(ui, &mut level, 0.0..=1.0, ui_kit::Slider { show_value: false, ..Default::default() });
+                if slider.on_hover_text(tr("sim.stock.speed")).changed() {
+                    app.sim_stock.speed = speed_at(level);
+                }
+            });
+        }
+        if moves_on {
+            ui.label(egui::RichText::new(moves).size(t.font_small).color(t.text_dim));
+        }
+        ui.label(egui::RichText::new(length).monospace().size(t.font_small).color(t.text_dim));
+        let width = (ui.available_width() - h - elapsed_w - 2.0 * gap).max(0.0);
+        if total_time > 0.0 {
+            ui.allocate_ui_with_layout(egui::vec2(width, h), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                let timeline = ui_kit::slider(ui, &mut shown, 0.0..=total_time, ui_kit::Slider { show_value: false, ..Default::default() });
+                if timeline.on_hover_text(tr("sim.stock.playhead")).changed() {
+                    seek(app, shown);
+                }
+            });
+        } else {
+            ui.allocate_exact_size(egui::vec2(width, h), egui::Sense::hover());
+        }
+        ui.label(egui::RichText::new(elapsed).monospace().size(t.font_label).color(t.text));
+        toggle = transport(ui, h, playing).clicked();
+    });
+    if toggle {
+        if playing {
+            app.sim_stock.playing = false;
+        } else {
+            play(app);
+        }
+    }
+    if wipe {
+        clear(app);
+    }
 }
 
 /// Meshes the stock's dirty chunks and collects what is done. Called every frame.
@@ -211,6 +446,7 @@ pub fn poll(app: &mut SolveApp, ctx: &egui::Context) {
         state.meshes.clear();
         forget_blocks(state);
         state.pending.clear();
+        state.box_gen += 1;
         state.changed();
     }
     let Some(stock) = stock else { return };
@@ -229,20 +465,29 @@ pub fn poll(app: &mut SolveApp, ctx: &egui::Context) {
             forget_blocks(state);
             let touched = stock.touched_chunks();
             state.pending = touched.into_iter().flat_map(|c| mesh::display_chunks_for(c, step, counts)).collect();
+            state.box_gen += 1;
             state.changed();
         }
     }
 
+    // A batch made for an older revision or step is never applied, so it is let go of here rather than
+    // waited for: its worker stops at the next chunk, and the work for the stock as it is now starts at
+    // once. Its chunks are dirty again (a new revision marks the cut's chunks, a new step all of them).
     if let Some(job) = state.job.take() {
-        match job.rx.try_recv() {
-            Ok(batch) => apply(state, job.revision, job.step, batch),
-            Err(TryRecvError::Empty) => state.job = Some(job),
-            Err(TryRecvError::Disconnected) => {}
+        if job.revision == state.revision && job.step == state.step {
+            match job.rx.try_recv() {
+                Ok(batch) => apply(state, job.revision, job.step, batch),
+                Err(TryRecvError::Empty) => state.job = Some(job),
+                Err(TryRecvError::Disconnected) => {}
+            }
+        } else {
+            job.cancel.store(true, Ordering::Relaxed);
         }
     }
 
     if state.job.is_none() && !state.pending.is_empty() {
-        let work = Work { stock: stock.clone(), chunks: std::mem::take(&mut state.pending).into_iter().collect() };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let work = Work { stock: stock.clone(), chunks: std::mem::take(&mut state.pending).into_iter().collect(), cancel };
         let (revision, step) = (state.revision, state.step);
         match start(work, revision, step) {
             Start::Thread(job) => state.job = Some(job),
@@ -250,12 +495,14 @@ pub fn poll(app: &mut SolveApp, ctx: &egui::Context) {
         }
     }
 
-    if state.box_for != Some(state.generation) {
+    if state.box_for != Some(state.box_gen) {
         let meshes = &state.meshes;
         let mesh = mesh::box_faces(stock, state.step, |idx| meshes.contains_key(&idx));
         // The box is rebuilt on this thread, a few hundred quads: its crease edges are found here too.
+        // Its serial is its generation, so its block's key changes with it and only with it.
         state.boxed = Surface::by_position(mesh);
-        state.box_for = Some(state.generation);
+        state.boxed.serial = state.box_gen;
+        state.box_for = Some(state.box_gen);
     }
 
     if state.job.is_some() || !state.pending.is_empty() {
@@ -267,6 +514,7 @@ pub fn poll(app: &mut SolveApp, ctx: &egui::Context) {
 /// hold its bytes (and GPU buffers) for nothing, since `draw` returns early without a simulation.
 fn forget_blocks(state: &mut State) {
     state.blocks.get_mut().unwrap_or_else(PoisonError::into_inner).clear();
+    *state.box_block.get_mut().unwrap_or_else(PoisonError::into_inner) = None;
 }
 
 /// Takes a batch in, if it was made for the stock and step the state holds now.
@@ -274,6 +522,8 @@ fn apply(state: &mut State, revision: u64, step: u32, batch: Batch) {
     if revision != state.revision || step != state.step {
         return;
     }
+    // The box covers the chunks that have a mesh, so only a chunk gaining or losing its mesh changes it.
+    let mut covered_changed = false;
     for (idx, surface) in batch {
         #[cfg(test)]
         {
@@ -283,12 +533,15 @@ fn apply(state: &mut State, revision: u64, step: u32, batch: Batch) {
             Some(mut surface) => {
                 state.serials += 1;
                 surface.serial = state.serials;
-                state.meshes.insert(idx, surface);
+                covered_changed |= state.meshes.insert(idx, surface).is_none();
             }
             None => {
-                state.meshes.remove(&idx);
+                covered_changed |= state.meshes.remove(&idx).is_some();
             }
         }
+    }
+    if covered_changed {
+        state.box_gen += 1;
     }
     state.changed();
 }
@@ -301,6 +554,7 @@ fn start(work: Work, revision: u64, step: u32) -> Start {
     #[cfg(not(target_arch = "wasm32"))]
     {
         let (tx, rx) = std::sync::mpsc::channel();
+        let cancel = Arc::clone(&work.cancel);
         let slot = Arc::new(Mutex::new(Some(work)));
         let worker = Arc::clone(&slot);
         let spawned = std::thread::Builder::new().name("cam-sim-stock".into()).spawn(move || {
@@ -310,7 +564,7 @@ fn start(work: Work, revision: u64, step: u32) -> Start {
             }
         });
         if spawned.is_ok() {
-            return Start::Thread(Job { revision, step, rx });
+            return Start::Thread(Job { revision, step, cancel, rx });
         }
         // No thread could be started: mesh here, from the work the thread never took.
         let taken = slot.lock().ok().and_then(|mut w| w.take());
@@ -322,7 +576,8 @@ fn compute(work: &Work, step: u32) -> Batch {
     // A chunk the cut took all of has an empty mesh, so the uncut box is not drawn there.
     let surface =
         |c| mesh::chunk_mesh_lod(&work.stock, c, step).or_else(|| mesh::display_reached(&work.stock, c, step).then(Mesh::default)).map(Surface::new);
-    work.chunks.iter().map(|&c| (c, surface(c))).collect()
+    // Stops before the next chunk once the batch is let go of: its result would only be dropped.
+    work.chunks.iter().take_while(|_| !work.cancel.load(Ordering::Relaxed)).map(|&c| (c, surface(c))).collect()
 }
 
 /// The edges where two faces meet at more than 30 degrees, as end points in the mesh's frame. `key`
@@ -439,26 +694,26 @@ fn cylinder(tip: Vec3, axis: Vec3, diameter: f64, length: f64) -> Vec<[(Vec3, Ve
     tris
 }
 
-/// The cutting tool at the tip of the move the cursor has reached (the move before it, or the first
-/// move before any cut), in the work frame. Its flute is a cylinder of the tool's diameter and flute
-/// length along the move's axis, tip to spindle; ball and bull tools are drawn flat-bottomed too. A
-/// tool the program does not list draws nothing.
+/// The cutting tool at the playhead, in the work frame: the engine's pose there (its tip, and its axis
+/// turned within the move). Its flute is a cylinder of the tool's diameter and flute length along the
+/// axis, tip to spindle; ball and bull tools are drawn flat-bottomed too. A tool the program does not
+/// list draws nothing.
 // shortcut: no shank drawn, since the engine sends an empty shank and a zero stickout; draw the shank
 // above the flute once it sends them.
 fn tool_triangles(app: &SolveApp) -> Vec<[(Vec3, Vec3); 3]> {
-    let (Some(program), Some((cursor, _))) = (app.session.sim_program(), app.session.sim_progress()) else { return Vec::new() };
-    let Some(mv) = program.moves.get(cursor.saturating_sub(1)) else { return Vec::new() };
-    let Some(tool) = program.tools.iter().find(|t| t.id == mv.tool) else { return Vec::new() };
-    cylinder(Vec3::from(mv.tip), Vec3::from(mv.axis), tool.diameter, tool.flute_length)
+    let (Some(program), Some((id, tip, axis))) = (app.session.sim_program(), app.session.sim_tool_pose()) else { return Vec::new() };
+    let Some(tool) = program.tools.iter().find(|t| t.id == id) else { return Vec::new() };
+    cylinder(Vec3::from(tip), Vec3::from(axis), tool.diameter, tool.flute_length)
 }
 
 /// What the model scene keys on for the simulation: the stock's meshes and box (`generation`) and the
-/// cursor the cutting tool stands at. Only the model scene draws these, so the sketch and highlight
-/// scenes keep their keys across a re-mesh or a cursor step.
+/// cutting tool's pose, bit for bit (it moves within a move, so a cursor step alone would miss it). Only
+/// the model scene draws these, so the sketch and highlight scenes keep their keys across a re-mesh or a
+/// playhead step.
 pub fn model_key(app: &SolveApp) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     app.sim_stock.generation.hash(&mut h);
-    app.session.sim_progress().hash(&mut h);
+    app.session.sim_tool_pose().map(|(id, tip, axis)| (id, tip.map(f64::to_bits), axis.map(f64::to_bits))).hash(&mut h);
     h.finish()
 }
 
@@ -528,16 +783,20 @@ pub fn draw(sc: &mut GpuScene, app: &SolveApp) {
     cache.retain(|idx, _| state.meshes.contains_key(idx));
     drop(cache);
 
-    for &t in &state.boxed.mesh.triangles {
-        if let Some(corners) = shaded_corners(&state.boxed.mesh, t) {
-            for (p, n) in corners {
-                sc.tri(frame.place(p.to_f32()), frame.turn(n.to_f32()), stock);
-            }
+    // The uncut box is one block too, kept while its generation, the frame and the colours come back: a
+    // tool move rebuilds the model scene, and must not tessellate the box again.
+    let box_key = block_key([usize::MAX; 3], &state.boxed, frame, [(stock, stock_rgba), (edge, edge_rgba)]);
+    let mut box_cache = state.box_block.lock().unwrap_or_else(|e| e.into_inner());
+    let bytes = match &*box_cache {
+        Some((k, bytes)) if *k == box_key => bytes.clone(),
+        _ => {
+            let bytes = surface_block(&state.boxed, frame, stock, edge);
+            *box_cache = Some((box_key, bytes.clone()));
+            bytes
         }
-    }
-    for e in &state.boxed.edges {
-        sc.line(frame.place(e[0]), frame.place(e[1]), edge, EDGE_WIDTH, false);
-    }
+    };
+    drop(box_cache);
+    sc.blocks.push(SceneBlock { key: box_key, bytes });
     let tool = sc.color(opaque(tk.body));
     for corners in tool_triangles(app) {
         for (p, n) in corners {
@@ -576,10 +835,22 @@ pub fn meshed_chunks(app: &SolveApp) -> Vec<[usize; 3]> {
     app.sim_stock.meshes.keys().copied().collect()
 }
 
+/// The triangles of each chunk's mesh now, by display index (tests only).
+#[cfg(test)]
+pub fn meshed_triangles(app: &SolveApp) -> BTreeMap<[usize; 3], usize> {
+    app.sim_stock.meshes.iter().map(|(idx, s)| (*idx, s.mesh.triangles.len())).collect()
+}
+
 /// Chunks meshed so far, over every batch (tests only).
 #[cfg(test)]
 pub fn meshed_count(app: &SolveApp) -> usize {
     app.sim_stock.meshed
+}
+
+/// The cutting tool's triangles as drawn, each corner with its normal (tests only).
+#[cfg(test)]
+pub fn drawn_tool(app: &SolveApp) -> Vec<[(Vec3, Vec3); 3]> {
+    tool_triangles(app)
 }
 
 #[cfg(test)]
@@ -652,6 +923,54 @@ mod tests {
                 assert!(on_outline, "an edge end {p:?} is off the box's outline");
             }
         }
+    }
+
+    #[test]
+    fn the_playback_bar_is_a_share_of_the_view_within_its_limits() {
+        let view = |w: f32| egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(w, 600.0));
+        let width = |w: f32| bar_rect(view(w), None).map(|r| r.width());
+        assert_eq!(width(1000.0), Some(700.0), "70 per cent of the view");
+        assert_eq!(width(2000.0), Some(BAR_MAX_WIDTH), "at most 1100");
+        assert_eq!(width(600.0), Some(BAR_MIN_WIDTH), "at least 520, and within the view");
+    }
+
+    #[test]
+    fn the_playback_bar_is_hidden_when_the_view_cannot_hold_the_minimum() {
+        let t = Tokens::get();
+        let fits = BAR_MIN_WIDTH + 2.0 * t.space_16;
+        let view = |w: f32| egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(w, 600.0));
+        assert!(bar_rect(view(fits), None).is_some(), "the minimum fits exactly");
+        assert!(bar_rect(view(fits - 1.0), None).is_none(), "one point less hides it");
+        assert!(bar_rect(view(500.0), None).is_none());
+    }
+
+    #[test]
+    fn the_playback_bar_sits_centred_just_above_the_navigation_bar() {
+        let t = Tokens::get();
+        let nav = egui::Rect::from_min_size(egui::pos2(400.0, 560.0), egui::vec2(200.0, 32.0));
+        let bar = bar_rect(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 600.0)), Some(nav)).unwrap_or(nav);
+        assert!((bar.bottom() - (560.0 - t.space_8)).abs() < 1e-3, "a gap above the navigation bar");
+        assert!((bar.center().x - 500.0).abs() < 1e-3, "centred on the view");
+    }
+
+    #[test]
+    fn the_timeline_keeps_half_the_row_and_the_optional_controls_go_first() {
+        // (inner, core, moves, speed) and the controls shown: all of them while the timeline keeps half.
+        assert_eq!(row_items(1000.0, 200.0, 100.0, 150.0), Some((true, true)), "room for all");
+        assert_eq!(row_items(1000.0, 300.0, 100.0, 150.0), Some((false, true)), "the move count goes first");
+        assert_eq!(row_items(1000.0, 400.0, 100.0, 150.0), Some((false, false)), "then the speed control");
+        assert_eq!(row_items(1000.0, 500.0, 100.0, 150.0), Some((false, false)), "exactly half still fits");
+        assert_eq!(row_items(1000.0, 600.0, 100.0, 150.0), None, "the core alone leaves less than half: hidden");
+    }
+
+    #[test]
+    fn the_speed_slider_is_a_log_scale_from_one_to_500() {
+        assert!(speed_level(MIN_SPEED).abs() < 1e-12);
+        assert!((speed_level(MAX_SPEED) - 1.0).abs() < 1e-12);
+        for speed in [1.0, 10.0, 37.5, 500.0] {
+            assert!((speed_at(speed_level(speed)) - speed).abs() < 1e-9, "round trip at {speed}");
+        }
+        assert!((speed_at(0.5) - (MIN_SPEED * MAX_SPEED).sqrt()).abs() < 1e-9, "the middle is the geometric mean");
     }
 
     #[test]

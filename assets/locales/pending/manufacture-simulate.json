@@ -1,50 +1,90 @@
 {
   "en": {
     "cmd.manufacture.post.simulate": "Simulate",
-    "help.manufacture.post.simulate": "Simulate posts the active setup and cuts its stock on screen, move by move, with the model hidden so the cut shows. Use it to check the toolpaths against the stock before you run the program on a machine. Play, pause and clear are in the Manufacture panel.",
+    "help.manufacture.post.simulate": "Simulate posts the active setup and cuts its stock on screen, move by move, with the model hidden so the cut shows. Playback runs on machine time. A playback bar at the bottom of the view has play, pause, a timeline, a speed control and Clear. Use it to check the toolpaths against the stock before you run the program on a machine.",
     "sim.stock.play": "Play",
     "sim.stock.pause": "Pause",
     "sim.stock.clear": "Clear",
-    "sim.stock.progress": "Move {cursor} / {total}"
+    "sim.stock.progress": "Move {cursor} / {total}",
+    "sim.stock.playhead": "Playhead",
+    "sim.stock.speed": "Speed",
+    "sim.stock.speed_suffix": "×"
   },
   "ar": {
     "cmd.manufacture.post.simulate": "Simulate",
-    "help.manufacture.post.simulate": "Simulate posts the active setup and cuts its stock on screen, move by move, with the model hidden so the cut shows. Use it to check the toolpaths against the stock before you run the program on a machine. Play, pause and clear are in the Manufacture panel.",
+    "help.manufacture.post.simulate": "Simulate posts the active setup and cuts its stock on screen, move by move, with the model hidden so the cut shows. Playback runs on machine time. A playback bar at the bottom of the view has play, pause, a timeline, a speed control and Clear. Use it to check the toolpaths against the stock before you run the program on a machine.",
     "sim.stock.play": "Play",
     "sim.stock.pause": "Pause",
     "sim.stock.clear": "Clear",
-    "sim.stock.progress": "Move {cursor} / {total}"
+    "sim.stock.progress": "Move {cursor} / {total}",
+    "sim.stock.playhead": "Playhead",
+    "sim.stock.speed": "Speed",
+    "sim.stock.speed_suffix": "×"
+  },
+  "de": {
+    "cmd.manufacture.post.simulate": "Simulieren",
+    "help.manufacture.post.simulate": "Simulieren führt den Postprozessor für die aktive Einrichtung aus und schneidet ihren Rohling auf dem Bildschirm Bewegung für Bewegung, mit ausgeblendetem Modell, damit der Schnitt sichtbar ist. Die Wiedergabe läuft in Maschinenzeit. Eine Wiedergabeleiste am unteren Rand der Ansicht enthält Abspielen, Pause, eine Zeitleiste, einen Geschwindigkeitsregler und Leeren. Prüfen Sie damit die Werkzeugwege am Rohling, bevor Sie das Programm an einer Maschine ausführen.",
+    "sim.stock.play": "Abspielen",
+    "sim.stock.pause": "Pause",
+    "sim.stock.clear": "Leeren",
+    "sim.stock.progress": "Bewegung {cursor} / {total}",
+    "sim.stock.playhead": "Abspielposition",
+    "sim.stock.speed": "Geschwindigkeit",
+    "sim.stock.speed_suffix": "×"
   },
   "he": {
     "cmd.manufacture.post.simulate": "Simulate",
-    "help.manufacture.post.simulate": "Simulate posts the active setup and cuts its stock on screen, move by move, with the model hidden so the cut shows. Use it to check the toolpaths against the stock before you run the program on a machine. Play, pause and clear are in the Manufacture panel.",
+    "help.manufacture.post.simulate": "Simulate posts the active setup and cuts its stock on screen, move by move, with the model hidden so the cut shows. Playback runs on machine time. A playback bar at the bottom of the view has play, pause, a timeline, a speed control and Clear. Use it to check the toolpaths against the stock before you run the program on a machine.",
     "sim.stock.play": "Play",
     "sim.stock.pause": "Pause",
     "sim.stock.clear": "Clear",
-    "sim.stock.progress": "Move {cursor} / {total}"
+    "sim.stock.progress": "Move {cursor} / {total}",
+    "sim.stock.playhead": "Playhead",
+    "sim.stock.speed": "Speed",
+    "sim.stock.speed_suffix": "×"
   },
   "ja": {
     "cmd.manufacture.post.simulate": "シミュレート",
-    "help.manufacture.post.simulate": "シミュレートは有効なセットアップをポストし、ストックを画面上で一移動ずつ切削します。切削が見えるようモデルは隠します。プログラムを機械で実行する前に、工具経路をストックと照らして確認できます。再生・一時停止・クリアは製造パネルにあります。",
+    "help.manufacture.post.simulate": "シミュレートは有効なセットアップをポストし、ストックを画面上で一移動ずつ切削します。切削が見えるようモデルは隠します。再生は機械時間で進みます。ビュー下端の再生バーには、再生・一時停止、タイムライン、速度調整、クリアがあります。プログラムを機械で実行する前に、工具経路をストックと照らして確認できます。",
     "sim.stock.play": "再生",
     "sim.stock.pause": "一時停止",
     "sim.stock.clear": "クリア",
-    "sim.stock.progress": "移動 {cursor} / {total}"
+    "sim.stock.progress": "移動 {cursor} / {total}",
+    "sim.stock.playhead": "再生位置",
+    "sim.stock.speed": "速度",
+    "sim.stock.speed_suffix": "×"
+  },
+  "ko": {
+    "cmd.manufacture.post.simulate": "시뮬레이션",
+    "help.manufacture.post.simulate": "시뮬레이션은 활성 설정을 포스트 처리하고, 모델을 숨긴 채 소재를 이동 단위로 화면에서 절삭해 절삭 결과가 보이게 합니다. 재생은 기계 시간으로 진행됩니다. 뷰 하단의 재생 막대에는 재생, 일시 정지, 타임라인, 속도 조절, 지우기 버튼이 있습니다. 프로그램을 기계에서 실행하기 전에 공구 경로를 소재와 대조해 확인하는 데 사용하세요.",
+    "sim.stock.play": "재생",
+    "sim.stock.pause": "일시 정지",
+    "sim.stock.clear": "지우기",
+    "sim.stock.progress": "이동 {cursor} / {total}",
+    "sim.stock.playhead": "재생 위치",
+    "sim.stock.speed": "속도",
+    "sim.stock.speed_suffix": "×"
   },
   "vi": {
     "cmd.manufacture.post.simulate": "Simulate",
-    "help.manufacture.post.simulate": "Simulate posts the active setup and cuts its stock on screen, move by move, with the model hidden so the cut shows. Use it to check the toolpaths against the stock before you run the program on a machine. Play, pause and clear are in the Manufacture panel.",
+    "help.manufacture.post.simulate": "Simulate posts the active setup and cuts its stock on screen, move by move, with the model hidden so the cut shows. Playback runs on machine time. A playback bar at the bottom of the view has play, pause, a timeline, a speed control and Clear. Use it to check the toolpaths against the stock before you run the program on a machine.",
     "sim.stock.play": "Play",
     "sim.stock.pause": "Pause",
     "sim.stock.clear": "Clear",
-    "sim.stock.progress": "Move {cursor} / {total}"
+    "sim.stock.progress": "Move {cursor} / {total}",
+    "sim.stock.playhead": "Playhead",
+    "sim.stock.speed": "Speed",
+    "sim.stock.speed_suffix": "×"
   },
   "zh": {
     "cmd.manufacture.post.simulate": "模拟",
-    "help.manufacture.post.simulate": "模拟会为有效的设置后处理，并在屏幕上逐个移动地切削其毛坯，同时隐藏模型以便看到切削结果。在把程序交给机床运行之前，用它来核对刀路与毛坯。播放、暂停和清除位于制造面板中。",
+    "help.manufacture.post.simulate": "模拟会为有效的设置后处理，并在屏幕上逐个移动地切削其毛坯，同时隐藏模型以便看到切削结果。播放按机床时间推进。视图底部的播放条中有播放、暂停、时间轴、速度调节和清除。在把程序交给机床运行之前，用它来核对刀路与毛坯。",
     "sim.stock.play": "播放",
     "sim.stock.pause": "暂停",
     "sim.stock.clear": "清除",
-    "sim.stock.progress": "移动 {cursor} / {total}"
+    "sim.stock.progress": "移动 {cursor} / {total}",
+    "sim.stock.playhead": "播放位置",
+    "sim.stock.speed": "速度",
+    "sim.stock.speed_suffix": "×"
   }
 }

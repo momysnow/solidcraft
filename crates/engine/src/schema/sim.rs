@@ -90,10 +90,14 @@ pub struct SetupParams {
     #[serde(default)]
     pub resolution: Option<f64>,
     /// Memory cap in MB, 1 to 1024 (default 512). It covers the stock's ray grids as `memory_estimate`
-    /// reports them. A move with several arc revolutions is cut into a copy of the stock that shares
-    /// its unchanged tiles; the copy's extra tiles are not counted.
+    /// reports them. Backward-seek checkpoints may take up to a quarter of it more, counted by the tiles
+    /// each adds to the one before. A move of more than one step keeps an undo log of the tiles it
+    /// replaces, which is not counted.
     #[serde(default)]
     pub memory_mb: Option<u64>,
+    /// Rapid feed in mm/min, above 0 (default 5000). It times rapids and moves with no feed.
+    #[serde(default)]
+    pub rapid_mm_min: Option<f64>,
 }
 
 /// A problem in the G-code or the simulation: `severity` is `error` or `warning`.
@@ -118,8 +122,8 @@ pub struct MemoryReply {
     pub budget: u64,
 }
 
-/// The move after the `at` moves of a run that is part-cut: `step` of its `steps` revolutions or
-/// pieces are cut. They are not in the stock until the last one, so `at` does not move meanwhile.
+/// The move after the `at` moves of a run that is part-cut: `step` of its `steps` steps (arc quarter
+/// turns or line pieces) are cut and in the stock. `at` does not move until the last one.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct PartialReply {
     pub step: u64,
@@ -161,8 +165,13 @@ pub struct RunParams {
     /// Move count to cut up to (default `"end"`). Past the last move is an error.
     #[serde(default)]
     pub to: Option<MoveTarget>,
-    /// Wall-clock budget in seconds. The run stops after the first step past it (a move, or one arc
-    /// revolution), with `reached` false. At least one step is always cut.
+    /// Playhead in seconds of machine time, from 0 and clamped to the program's total. Cannot be given
+    /// with `to`.
+    #[serde(default)]
+    pub time: Option<f64>,
+    /// Wall-clock budget in seconds. The run stops after the first step past it (a line piece of about
+    /// 2 mm, or an arc piece of at most a quarter turn), with `reached` false. At least one step is
+    /// always cut.
     #[serde(default)]
     pub budget_s: Option<f64>,
 }
@@ -172,17 +181,29 @@ pub struct RunReply {
     /// Moves cut so far.
     pub at: u64,
     pub total: u64,
-    /// Whether the requested `to` was reached (`at` is `to`).
+    /// Whether the requested `to` or `time` was reached.
     pub reached: bool,
     /// Whether the whole program is cut (`at` is `total`).
     pub done: bool,
     /// Material taken away so far, mm^3.
     pub removed_volume: f64,
-    /// Moves when the stock was last built again: setup, a backward seek or clear. Changes when the
-    /// surface is redrawn in full.
+    /// Changes when the stock is rebuilt from the setup: setup, a backward seek with no checkpoint before
+    /// it, or clear. A restore from a checkpoint keeps it, and only the chunks it changed are redrawn.
     pub revision: u64,
     /// The move in progress, when a run stopped part-way through one.
     pub partial: Option<PartialReply>,
+    /// The playhead, s of machine time: the time asked for when it was reached, else where the cut got to.
+    pub time: f64,
+    /// The program's machine time, s.
+    pub total_time: f64,
+}
+
+/// The tool at the playhead: its id, tip and axis, in mm in the workpiece frame.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ToolPoseReply {
+    pub id: u32,
+    pub tip: [f64; 3],
+    pub axis: [f64; 3],
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -214,6 +235,12 @@ pub struct StatusReply {
     pub error: Option<String>,
     pub revision: u64,
     pub partial: Option<PartialReply>,
+    /// The playhead, s of machine time.
+    pub time: f64,
+    /// The program's machine time, s.
+    pub total_time: f64,
+    /// The tool at the playhead, or null without moves or when that move has no tool.
+    pub tool: Option<ToolPoseReply>,
     /// The page of problems asked for.
     pub diagnostics: Vec<DiagReply>,
 }

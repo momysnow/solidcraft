@@ -5042,6 +5042,7 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
     axis_view(app, ui, rect);
     crate::view_angles::show(app, ui, rect);
     crate::navigation_bar_view::show(app, ui, rect);
+    crate::sim_stock::playback(app, ui, rect);
     crate::viewport_status::show(app, ui.ctx(), rect);
     crate::viewport_status_fixture::show(app, ui.ctx(), rect);
     // The notices and the agent chip first, so the 3D mouse picture can keep clear of them.
@@ -5056,7 +5057,8 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
         let calibration = app.preferences.space_mouse_calibrations.get(device);
         let position = app.preferences.space_mouse_ghost_position;
         let navigation = app.viewport.layout.as_ref().map(|layout| layout.navigation);
-        let obstacles = navigation.into_iter().chain(toasts).collect::<Vec<_>>();
+        let playback = crate::sim_stock::playback_rect(app);
+        let obstacles = navigation.into_iter().chain(playback).chain(toasts).collect::<Vec<_>>();
         // The Viewport positions sit in the content area (right of the browser), Left Window in the
         // corner of the whole window; both stay above the floating History card, like the legend.
         let area = if position == SpaceMouseGhost::LeftWindow { rect } else { crate::shell::content_rect(app, rect) };
@@ -5190,6 +5192,7 @@ pub(crate) fn transient_messages(app: &mut SolveApp, ui: &egui::Ui, viewport: Re
         obstacles.extend([layout.navigation, layout.axis_view]);
     }
     obstacles.extend(readout);
+    obstacles.extend(crate::sim_stock::playback_rect(app));
     let view = crate::shell::content_rect(app, viewport);
     let mut free = crate::viewport_layout::free_rect(view, &obstacles).shrink(t.space_8);
     if ToastPlace::current(ui.ctx()) == ToastPlace::Corner {

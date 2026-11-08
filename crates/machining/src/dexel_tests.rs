@@ -5,7 +5,7 @@ use solidcraft_geom::Vec3;
 use super::Stock;
 use crate::SimError;
 use crate::gcode::{CodeTable, parse};
-use crate::sim::{Cutter, simulate};
+use crate::sim::{Cutter, simulate, step_count};
 use crate::sweep::{ArcFixedAxis, FlatTool, LinearFixedAxis};
 use crate::toolpath::{Program, Shape, Tool};
 
@@ -548,4 +548,74 @@ fn a_multi_piece_cut_that_fails_partway_leaves_the_stock_unchanged() {
     let pieces: [&dyn crate::sweep::Sweep; 2] = [&good, &Holes];
     assert!(s.apply_all(&pieces, 1).is_err());
     assert_eq!((s.segments(), s.state_hash()), before);
+}
+
+#[test]
+fn step_count_is_what_start_cuts_for_every_move() {
+    // Lines (none, short, long, zero-length, rapid), a full arc, arcs with turns, and a move with no tool.
+    let text = "G1 X-1 Y1 Z-1 F100\nT0 M6\nG0 X1 Y1 Z5\nG1 Z-2 F100\nG1 X1.5 F300\nG1 X30 F300\nG1 X30 F300\nG0 X30 Y30 Z5\nG2 X40 Y30 I5 J0 F200\nG3 X30 Y30 I-5 J0 F200\nG3 X30 Y30 I-5 J0 P2 F200\nG1 X5 F300";
+    let mut program = parse(text, &CodeTable::default());
+    program.tools = vec![flat_tool(0)];
+    let mut total = 0;
+    for i in 0..program.moves.len() {
+        let want = Cutter::new().start(&program, i).expect("start").map_or(0, |cut| cut.steps());
+        assert_eq!(step_count(&program, i), want, "move {i}");
+        total += want;
+    }
+    assert!(total > 20, "the program must have multi-step moves: {total}");
+}
+
+#[test]
+fn undo_journal_takes_back_a_multi_step_move_exactly() {
+    let mut s = slot_stock(0.2);
+    s.apply(&slot(), 1).expect("first cut");
+    s.clear_dirty();
+    let before = (s.state_hash(), s.volume(), s.touched_chunks(), s.segments());
+    let other = LinearFixedAxis { from: Vec3::new(20.0, 5.0, -6.0), to: Vec3::new(45.0, 5.0, -6.0), tool: tool() };
+    s.begin_journal();
+    s.apply(&other, 2).expect("second cut");
+    s.apply(&LinearFixedAxis { from: Vec3::new(45.0, 5.0, -6.0), to: Vec3::new(45.0, 15.0, -6.0), tool: tool() }, 2).expect("third cut");
+    assert_ne!(s.state_hash(), before.0, "the move changed the stock");
+    s.undo_journal();
+    assert_eq!((s.state_hash(), s.volume(), s.touched_chunks(), s.segments()), before);
+    assert!(!s.dirty_chunks().is_empty(), "the chunks the move changed are dirty");
+    // A committed journal keeps its changes, and undo then does nothing.
+    s.begin_journal();
+    s.apply(&other, 2).expect("cut to keep");
+    let kept = s.state_hash();
+    s.commit_journal();
+    s.undo_journal();
+    assert_eq!(s.state_hash(), kept);
+}
+
+#[test]
+fn a_clone_taken_mid_move_has_no_journal_and_the_original_still_undoes() {
+    let mut s = slot_stock(0.2);
+    s.apply(&slot(), 1).expect("first cut");
+    s.clear_dirty();
+    let before = (s.state_hash(), s.volume(), s.touched_chunks(), s.segments());
+    s.begin_journal();
+    s.apply(&LinearFixedAxis { from: Vec3::new(20.0, 5.0, -6.0), to: Vec3::new(45.0, 5.0, -6.0), tool: tool() }, 2).expect("cut");
+    let copy = s.clone();
+    assert!(copy.journal.is_none(), "a clone keeps no journal");
+    assert!(s.journal.is_some(), "the original keeps its journal");
+    assert_eq!(copy.state_hash(), s.state_hash(), "the clone is the stock as it is now");
+    s.undo_journal();
+    assert_eq!((s.state_hash(), s.volume(), s.touched_chunks(), s.segments()), before);
+}
+
+#[test]
+fn a_multi_piece_cut_inside_a_journal_can_still_be_undone() {
+    let mut s = slot_stock(0.2);
+    s.apply(&slot(), 1).expect("first cut");
+    s.clear_dirty();
+    let before = (s.state_hash(), s.volume(), s.touched_chunks(), s.segments());
+    let first = LinearFixedAxis { from: Vec3::new(20.0, 5.0, -6.0), to: Vec3::new(45.0, 5.0, -6.0), tool: tool() };
+    let second = LinearFixedAxis { from: Vec3::new(45.0, 5.0, -6.0), to: Vec3::new(45.0, 15.0, -6.0), tool: tool() };
+    s.begin_journal();
+    let pieces: [&dyn crate::sweep::Sweep; 2] = [&first, &second];
+    s.apply_all(&pieces, 2).expect("pieces");
+    assert_ne!(s.state_hash(), before.0, "the pieces changed the stock");
+    s.undo_journal();
+    assert_eq!((s.state_hash(), s.volume(), s.touched_chunks(), s.segments()), before);
 }

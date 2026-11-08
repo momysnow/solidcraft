@@ -227,6 +227,18 @@ pub(crate) fn navigation_surface(ui: &Ui, rect: Rect, size: Size, editing: bool)
     super::Container::paint_frame(ui.painter(), frame, rect.shrink(NAV_BORDER));
 }
 
+/// The playback bar's frame over the viewport: the navigation bar's shape and radius, filled with the
+/// opaque body colour that the kit slider's track backing is painted in, so the two match.
+pub(crate) fn playback_surface(ui: &Ui, rect: Rect, size: Size) {
+    let t = Tokens::get();
+    let frame = super::Container::new(ui.ctx(), super::Surface::Navigation)
+        .frame(ui.ctx(), t.dialog_body, crate::frame::Side::Left)
+        .fill(t.dialog_body)
+        .stroke(egui::Stroke::new(NAV_BORDER, t.dialog_border))
+        .corner_radius(NavigationMetrics::for_size(size).radius);
+    super::Container::paint_frame(ui.painter(), frame, rect.shrink(NAV_BORDER));
+}
+
 #[cfg(test)]
 mod active_ink_tests {
     use super::{NavigationFill, navigation_fill, navigation_ink};

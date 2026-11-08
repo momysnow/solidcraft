@@ -71,7 +71,7 @@ struct Grid {
 
 /// A box of material with three tri-dexel grids. Cell `i` along an axis spans `min + i * cell`
 /// to the next; its ray sits at the middle of that cell (the lattice node).
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Stock {
     min: [f64; 3],
     max: [f64; 3],
@@ -86,11 +86,45 @@ pub struct Stock {
     /// Every chunk a cut has reached since this stock was built. A chunk not in here is still the
     /// uncut box, so it is not meshed (see `mesh::chunk_mesh`).
     touched: std::collections::BTreeSet<[usize; 3]>,
+    /// The changes of a multi-step move so far, while a journal is open (see `begin_journal`).
+    journal: Option<Journal>,
+}
+
+/// What a multi-step move has changed in a stock, so `undo_journal` can take it back: each tile it
+/// replaced (the first time only), the sums before it, the chunks it newly reached, and every chunk it
+/// changed.
+#[derive(Clone, Debug)]
+struct Journal {
+    tiles: Vec<(usize, usize, Arc<Tile>)>,
+    replaced: std::collections::BTreeSet<(usize, usize)>,
+    len: [f64; 3],
+    used: u64,
+    reached: Vec<[usize; 3]>,
+    changed: std::collections::BTreeSet<[usize; 3]>,
 }
 
 /// Bytes of a tile's contents: a segment is 16 bytes, a start 4.
 fn tile_bytes(tile: &Tile) -> u64 {
     (tile.segs.len() as u64) * 16 + (tile.start.len() as u64) * 4
+}
+
+/// A clone leaves the open journal behind: a clone taken mid-move (a checkpoint, the UI mesher) must not
+/// keep the undo tiles of that move alive, and only the original can undo it.
+impl Clone for Stock {
+    fn clone(&self) -> Stock {
+        Stock {
+            min: self.min,
+            max: self.max,
+            cell: self.cell,
+            n: self.n,
+            grids: self.grids.clone(),
+            used: self.used,
+            budget: self.budget,
+            dirty: self.dirty.clone(),
+            touched: self.touched.clone(),
+            journal: None,
+        }
+    }
 }
 
 impl Stock {
@@ -113,7 +147,61 @@ impl Stock {
             budget: budget_bytes,
             dirty: std::collections::BTreeSet::new(),
             touched: std::collections::BTreeSet::new(),
+            journal: None,
         })
+    }
+
+    /// Starts a journal: from here on, what `apply` changes is kept, so `undo_journal` can take it back.
+    /// A move of several steps opens one, and ends it with `commit_journal` or `undo_journal`.
+    pub fn begin_journal(&mut self) {
+        let len = [self.grids[0].len, self.grids[1].len, self.grids[2].len];
+        self.journal = Some(Journal {
+            tiles: Vec::new(),
+            replaced: std::collections::BTreeSet::new(),
+            len,
+            used: self.used,
+            reached: Vec::new(),
+            changed: std::collections::BTreeSet::new(),
+        });
+    }
+
+    /// Keeps the changes since `begin_journal` and drops the journal.
+    pub fn commit_journal(&mut self) {
+        self.journal = None;
+    }
+
+    /// Takes back every change since `begin_journal`: the tiles, the sums, and the chunks reached.
+    /// The chunks changed are dirty, so the caller redraws them. Does nothing without a journal.
+    pub fn undo_journal(&mut self) {
+        let Some(j) = self.journal.take() else { return };
+        for (a, tidx, tile) in j.tiles {
+            if let Some(slot) = self.grids.get_mut(a).and_then(|g| g.tiles.get_mut(tidx)) {
+                *slot = tile;
+            }
+        }
+        for (grid, len) in self.grids.iter_mut().zip(j.len) {
+            grid.len = len;
+        }
+        self.used = j.used;
+        for c in &j.reached {
+            self.touched.remove(c);
+        }
+        self.dirty.extend(j.changed);
+    }
+
+    /// Bytes of the tiles this stock holds that `base` does not share (the same tile, by pointer): what
+    /// a checkpoint adds on top of `base`. A stock of another layout shares nothing.
+    pub fn unshared_bytes(&self, base: &Stock) -> u64 {
+        let mut total = 0u64;
+        for (g, grid) in self.grids.iter().enumerate() {
+            for (i, tile) in grid.tiles.iter().enumerate() {
+                let shared = base.grids.get(g).and_then(|bg| bg.tiles.get(i)).is_some_and(|bt| Arc::ptr_eq(bt, tile));
+                if !shared {
+                    total = total.saturating_add(tile_bytes(tile));
+                }
+            }
+        }
+        total
     }
 
     /// Bytes a box of `min..max` at ray spacing `h` takes, before any cut: what [`Stock::new_box`]
@@ -207,6 +295,11 @@ impl Stock {
         }
         for (a, tidx, tile) in staged {
             if let Some(slot) = self.grids[a].tiles.get_mut(tidx) {
+                if let Some(j) = self.journal.as_mut()
+                    && j.replaced.insert((a, tidx))
+                {
+                    j.tiles.push((a, tidx, Arc::clone(slot)));
+                }
                 *slot = Arc::new(tile);
             }
         }
@@ -218,8 +311,16 @@ impl Stock {
         let counts = crate::mesh::chunk_counts(&*self);
         if let Some((lo, hi)) = self.node_box(bmin, bmax) {
             let chunks = crate::mesh::chunks_for_nodes(lo, hi, counts);
-            self.touched.extend(chunks.iter().copied());
-            self.dirty.extend(chunks);
+            for c in chunks {
+                let fresh = self.touched.insert(c);
+                self.dirty.insert(c);
+                if let Some(j) = self.journal.as_mut() {
+                    if fresh {
+                        j.reached.push(c);
+                    }
+                    j.changed.insert(c);
+                }
+            }
         }
         Ok(())
     }
@@ -234,9 +335,15 @@ impl Stock {
             }
             return Ok(());
         }
+        // The trial replaces self, so it takes the open journal (a clone drops it). On an error the
+        // journal goes back: the trial's extra entries hold the values self already has.
         let mut trial = self.clone();
+        trial.journal = self.journal.take();
         for p in pieces {
-            trial.apply(*p, tag)?;
+            if let Err(e) = trial.apply(*p, tag) {
+                self.journal = trial.journal.take();
+                return Err(e);
+            }
         }
         *self = trial;
         Ok(())

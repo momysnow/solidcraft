@@ -476,14 +476,27 @@ impl ArcFixedAxis {
         Some(ArcFixedAxis { centre, e1, e2, theta0: 0.0, r, sweep, lift, tool, axis_normal: n.dot(tool.axis).abs() > 1.0 - AXIS_EPS, normal: n })
     }
 
+    /// The arc's length, mm, its helix length: a lift along the normal counts.
+    pub fn length(&self) -> f64 {
+        let along = self.r * self.sweep.abs();
+        (along * along + self.lift.len2()).sqrt()
+    }
+
+    /// The tool tip after the fraction `f` (0 at the start, 1 at the end) of the arc. The helix runs
+    /// at a steady rate, so the fraction of the angle is the fraction of the length.
+    pub fn point(&self, f: f64) -> Vec3 {
+        self.tip(f.clamp(0.0, 1.0) * self.sweep.abs())
+    }
+
     /// The arc cut into pieces of at most one revolution each, with the same union. The sim applies
     /// them one after another under one move tag, so a long arc can be pumped between revolutions.
     pub fn revolutions(&self) -> Vec<ArcFixedAxis> {
         self.pieces(TAU)
     }
 
-    /// The arc cut into pieces of at most `max` radians each, in order, with the same union. The
-    /// pieces share one circle and one lift per radian, so the pieces are exact parts of the arc.
+    /// The arc cut into equal pieces, the fewest of at most `max` radians each, in order, with the same
+    /// union. Equal pieces make a step a fixed share of the arc, so a time fraction maps onto steps.
+    /// The pieces share one circle and one lift per radian, so the pieces are exact parts of the arc.
     pub fn pieces(&self, max: f64) -> Vec<ArcFixedAxis> {
         let total = self.sweep.abs();
         if !(total > 0.0 && max > 0.0) {
@@ -491,10 +504,10 @@ impl ArcFixedAxis {
         }
         let sign = self.sweep.signum();
         let count = (total / max).ceil().max(1.0) as usize;
+        let len = total / count as f64;
         (0..count)
             .map(|k| {
-                let start_u = k as f64 * max;
-                let len = (total - start_u).min(max);
+                let start_u = k as f64 * len;
                 ArcFixedAxis {
                     centre: self.centre + self.lift * (start_u / total),
                     theta0: self.theta0 + sign * start_u,

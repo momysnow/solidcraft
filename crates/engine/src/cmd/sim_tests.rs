@@ -151,6 +151,9 @@ fn hostile_sim_params_are_refused_not_panicked() {
         ("corner radius on a ball", with("tools", json!([{"id": 0, "diameter": 6, "flute_length": 20, "shape": "ball", "corner_radius": 1}]))),
         ("tool listed twice", with("tools", json!([flat(0), flat(0)]))),
         ("gcode not text", with("gcode", json!(5))),
+        ("rapid rate zero", with("rapid_mm_min", json!(0))),
+        ("rapid rate negative", with("rapid_mm_min", json!(-5000))),
+        ("rapid rate text", with("rapid_mm_min", json!("fast"))),
     ];
     for (name, params) in cases {
         let mut s = Session::default();
@@ -160,11 +163,24 @@ fn hostile_sim_params_are_refused_not_panicked() {
     let mut strict = Session { param_check: ParamCheck::Strict, ..Session::default() };
     assert!(strict.execute("sim.setup", &with("sketch", json!(1))).is_err(), "an unknown key was accepted in strict");
     let mut s = set_up(SLOT);
-    for params in [json!({"to": 99}), json!({"to": -1}), json!({"to": "begin"}), json!({"budget_s": -1}), json!({"budget_s": "soon"})] {
+    for params in [
+        json!({"to": 99}),
+        json!({"to": -1}),
+        json!({"to": "begin"}),
+        json!({"budget_s": -1}),
+        json!({"budget_s": "soon"}),
+        json!({"time": -1}),
+        json!({"time": "soon"}),
+        json!({"time": 1, "to": 1}),
+    ] {
         assert!(s.execute("sim.run", &params).is_err(), "{params} was accepted");
     }
     assert!(s.execute("sim.status", &json!({"limit": 5000000000u64, "offset": -1})).is_err());
     assert_eq!(call(&mut s, "sim.status", &json!({"limit": 5000000000u64})).get("cursor"), Some(&json!(0)));
+    // A line a billion mm long is cut in a bounded number of pieces, and cuts nothing above the box.
+    let mut far = set_up("T0 M6\nG0 X0 Y10 Z5\nG1 X1000000000 F600");
+    assert_eq!(call(&mut far, "sim.run", &json!({}))["done"], true);
+    assert_eq!(call(&mut far, "sim.status", &json!({}))["removed_volume"], 0.0);
 }
 
 #[test]
@@ -188,18 +204,19 @@ fn arc_setup() -> Value {
 }
 
 #[test]
-fn a_budgeted_arc_is_cut_one_revolution_per_call() {
+fn a_budgeted_arc_is_cut_one_step_per_call() {
     let mut s = Session::default();
     call(&mut s, "sim.setup", &arc_setup());
     // With no budget left, each call still cuts one step: the arc is entered and left part-cut.
+    // The plunge before the arc is in pieces too, so wait for the call that is inside the arc.
     let mut reply = call(&mut s, "sim.run", &json!({"budget_s": 0.0}));
     let mut calls = 1;
-    while reply["partial"].is_null() && calls < 50 {
+    while (reply["partial"].is_null() || reply["at"] != 2) && calls < 50 {
         reply = call(&mut s, "sim.run", &json!({"budget_s": 0.0}));
         calls += 1;
     }
     assert!(!reply["partial"].is_null(), "no call stopped inside the arc: {reply}");
-    assert_eq!(reply["at"], 2, "the arc is not in the stock until its last revolution: {reply}");
+    assert_eq!(reply["at"], 2, "the arc counts as cut only at its last revolution: {reply}");
     assert_eq!(reply["partial"]["step"], 1, "{reply}");
     let steps = reply["partial"]["steps"].as_u64().unwrap_or(0);
     assert!(steps >= 2, "{reply}");
@@ -234,6 +251,11 @@ fn a_budget_error_stops_the_run_and_status_says_why() {
     let status = call(&mut s, "sim.status", &json!({}));
     assert!(status["error"].as_str().unwrap_or("").contains("byte budget"), "the stop is not in the status: {status}");
     let cursor = status["cursor"].clone();
+    // The failed move is taken back whole, so the removed volume is the one the completed moves give.
+    let mut fresh = Session::default();
+    call(&mut fresh, "sim.setup", &params);
+    let at_cursor = call(&mut fresh, "sim.run", &json!({"to": cursor}));
+    assert_eq!(status["removed_volume"], at_cursor["removed_volume"], "{status}");
     assert!(s.execute("sim.run", &json!({})).is_err(), "a stopped run must not retry on its own");
     let after = call(&mut s, "sim.status", &json!({}));
     assert_eq!(after["cursor"], cursor);
@@ -439,4 +461,230 @@ fn revisions_never_repeat_across_sessions() {
     assert!(again.is_object());
     let ra2 = call(&mut a, "sim.run", &json!({}))["revision"].as_u64().unwrap_or(0);
     assert!(ra2 > ra && ra2 != rb, "a new setup must hand out a new revision: {ra} {ra2} {rb}");
+}
+
+#[test]
+fn moves_take_their_length_over_their_feed() {
+    // 60 mm at F600 is 6 s. The rapid back is 60 mm at the default 5000 mm/min. The first move has no
+    // start point, so it takes no time.
+    let gcode = "T0 M6\nG21 G90\nG0 X0 Y10 Z5\nG1 X60 F600\nG0 X0 Y10 Z5";
+    let mut s = set_up(gcode);
+    let status = call(&mut s, "sim.status", &json!({}));
+    let total = status["total_time"].as_f64().unwrap_or(f64::NAN);
+    assert!((total - (6.0 + 60.0 * 60.0 / 5000.0)).abs() < 1e-9, "total {total}");
+    assert_eq!(status["time"], 0.0);
+    let run = call(&mut s, "sim.run", &json!({"time": 6.0}));
+    assert_eq!((run["at"].clone(), run["reached"].clone()), (json!(2), json!(true)), "{run}");
+    assert_eq!(run["time"], 6.0);
+    assert_eq!(call(&mut s, "sim.run", &json!({"time": 0}))["removed_volume"], 0.0);
+    // A rapid rate of 600 mm/min makes the same rapid 6 s.
+    let mut params = setup_params(gcode);
+    params["rapid_mm_min"] = json!(600);
+    let mut slow = Session::default();
+    call(&mut slow, "sim.setup", &params);
+    let total = call(&mut slow, "sim.status", &json!({}))["total_time"].as_f64().unwrap_or(f64::NAN);
+    assert!((total - 12.0).abs() < 1e-9, "total {total}");
+}
+
+#[test]
+fn an_arc_takes_its_own_length() {
+    // A half circle of radius 10 at F600 is 31.4 mm, so pi seconds at 10 mm/s.
+    let mut s = set_up("T0 M6\nG21 G90\nG0 X10 Y0 Z5\nG3 X-10 Y0 I-10 J0 F600");
+    let total = call(&mut s, "sim.status", &json!({}))["total_time"].as_f64().unwrap_or(f64::NAN);
+    assert!((total - std::f64::consts::PI).abs() < 1e-9, "total {total}");
+}
+
+#[test]
+fn run_by_time_stops_part_way_along_a_long_cut() {
+    // A plunge of 7 mm at F100 (4.2 s), then 50 mm at F300 (10 s). At 9.2 s the cut is half way along.
+    let gcode = "T0 M6\nG21 G90\nG0 X0 Y10 Z5\nG1 Z-2 F100\nG1 X50 F300\nG0 Z5";
+    let removed_to = |to: u64| {
+        let mut s = set_up(gcode);
+        call(&mut s, "sim.run", &json!({"to": to}))["removed_volume"].as_f64().unwrap_or(f64::NAN)
+    };
+    let before = removed_to(2);
+    let full = removed_to(3);
+    let cut = full - before;
+    assert!(cut > 0.0, "the long cut removes material: {before} to {full}");
+    let mut s = set_up(gcode);
+    let run = call(&mut s, "sim.run", &json!({"time": 9.2}));
+    assert_eq!((run["at"].clone(), run["reached"].clone()), (json!(2), json!(true)), "{run}");
+    assert!(!run["partial"].is_null(), "half way is inside the long move: {run}");
+    let mid = run["removed_volume"].as_f64().unwrap_or(f64::NAN);
+    assert!(((mid - before) - cut / 2.0).abs() <= 0.1 * cut, "half way removed {} of {cut} mm^3", mid - before);
+    assert_eq!(s.sim_time().map(|(t, _)| t), Some(9.2));
+}
+
+#[test]
+fn the_tool_sits_on_its_move_at_a_mid_time() {
+    let gcode = "T0 M6\nG21 G90\nG0 X0 Y10 Z5\nG1 Z-2 F100\nG1 X50 F300\nG0 Z5";
+    let mut s = set_up(gcode);
+    call(&mut s, "sim.run", &json!({"time": 9.2}));
+    let (id, tip, axis) = s.sim_tool_pose().unwrap_or_else(|| panic!("no tool pose at 9.2 s"));
+    assert_eq!(id, 0);
+    // Half way from (0, 10, -2) to (50, 10, -2).
+    for (got, want) in tip.iter().zip([25.0, 10.0, -2.0]) {
+        assert!((got - want).abs() < 1e-6, "tip {tip:?}");
+    }
+    assert_eq!(axis, [0.0, 0.0, 1.0]);
+    let status = call(&mut s, "sim.status", &json!({}));
+    assert_eq!(status["tool"]["id"], 0);
+    assert!((status["tool"]["tip"][0].as_f64().unwrap_or(f64::NAN) - 25.0).abs() < 1e-6, "{status}");
+}
+
+#[test]
+fn a_move_with_no_tool_has_no_tool_pose() {
+    let mut s = set_up("G0 X10 Y10 Z5");
+    let status = call(&mut s, "sim.status", &json!({}));
+    assert!(status["tool"].is_null(), "{status}");
+    assert!(s.sim_tool_pose().is_none());
+}
+
+/// A program of many short moves, so the checkpoints every 256 moves come into play.
+fn long_program(moves: usize) -> String {
+    let mut g = String::from("T0 M6\nG21 G90\nG0 X10 Y10 Z5\nG1 Z-2 F600\n");
+    for k in 0..moves {
+        let x = 10.0 + ((k * 37) % 7) as f64;
+        let y = 8.0 + ((k * 5) % 3) as f64 * 2.0;
+        g.push_str(&format!("G1 X{x} Y{y} F600\n"));
+    }
+    g
+}
+
+fn long_setup(gcode: &str, memory_mb: u64) -> Session {
+    let mut s = Session::default();
+    let params = json!({
+        "stock": {"box": {"min": [0, 0, -10], "max": [40, 20, 0]}},
+        "tools": [{"id": 0, "diameter": 6, "flute_length": 20}],
+        "gcode": gcode, "resolution": 0.25, "memory_mb": memory_mb
+    });
+    call(&mut s, "sim.setup", &params);
+    s
+}
+
+#[test]
+fn backward_seeks_by_time_match_a_fresh_run_across_checkpoints() {
+    // A 4 MB cap keeps 1 MB of checkpoints, so as the program goes on they are thinned and spaced out.
+    // Each backward seek must give the stock a fresh run to the same time gives.
+    let gcode = long_program(2100);
+    let mut s = long_setup(&gcode, 4);
+    let total = call(&mut s, "sim.status", &json!({}))["total_time"].as_f64().unwrap_or(f64::NAN);
+    call(&mut s, "sim.run", &json!({}));
+    for fraction in [0.8, 0.2, 0.6, 0.35] {
+        let t = total * fraction;
+        let restores = s.sim_checkpoint_restores().unwrap_or(0);
+        let revision = s.sim_revision();
+        let back = call(&mut s, "sim.run", &json!({"time": t}));
+        if s.sim_checkpoint_restores().unwrap_or(0) > restores {
+            assert_eq!(s.sim_revision(), revision, "a checkpoint restore keeps the revision, the chunks it changed are dirty");
+        }
+        let mut fresh = long_setup(&gcode, 4);
+        let direct = call(&mut fresh, "sim.run", &json!({"time": t}));
+        assert_eq!(back["at"], direct["at"], "moves cut at {fraction}: {back}");
+        assert_eq!(back["removed_volume"], direct["removed_volume"], "removed at {fraction}: {back}");
+        let hash = |s: &Session| s.sim_stock().map(|st| st.state_hash());
+        assert_eq!(hash(&s), hash(&fresh), "stock at {fraction}");
+    }
+    assert!(s.sim_checkpoint_restores().unwrap_or(0) > 0, "no backward seek used a checkpoint");
+}
+
+#[test]
+fn a_rewind_inside_a_move_is_taken_back_in_place() {
+    // The run stops 9.2 s into the long cut, then goes back to 7.0 s, inside the same move. It must give
+    // the stock a fresh run to 7.0 s gives, under the same revision.
+    let gcode = "T0 M6\nG21 G90\nG0 X0 Y10 Z5\nG1 Z-2 F100\nG1 X50 F300\nG0 Z5";
+    let mut s = set_up(gcode);
+    let first = call(&mut s, "sim.run", &json!({"time": 9.2}));
+    let back = call(&mut s, "sim.run", &json!({"time": 7.0}));
+    assert_eq!(back["revision"], first["revision"], "a rewind inside a move keeps the revision: {back}");
+    let mut fresh = set_up(gcode);
+    let direct = call(&mut fresh, "sim.run", &json!({"time": 7.0}));
+    assert_eq!(back["at"], direct["at"], "{back}");
+    assert_eq!(back["partial"], direct["partial"], "{back}");
+    assert_eq!(back["removed_volume"], direct["removed_volume"], "{back}");
+    let hash = |s: &Session| s.sim_stock().map(|st| st.state_hash());
+    assert_eq!(hash(&s), hash(&fresh));
+}
+
+#[test]
+fn a_chunk_a_rewind_inside_a_move_drops_stays_dirty_across_a_restore() {
+    // The last move runs into chunks no earlier move cut. Seeks go back inside that move, which takes
+    // back the chunks it reached: they are no longer cut, so only their dirtiness says their meshes must
+    // go. No dirty chunk is taken in between, so the restore that follows must keep them dirty.
+    let gcode = format!("{}G1 X38 Y2 F300\n", long_program(600));
+    let mut s = long_setup(&gcode, 4);
+    let total = call(&mut s, "sim.status", &json!({}))["total_time"].as_f64().unwrap_or(f64::NAN);
+    call(&mut s, "sim.run", &json!({"time": total - 0.5}));
+    // The last move takes about 5.6 s in 15 steps. A rewind of 0.5 s takes back one step, and the steps
+    // before it reach the same chunks; 4 s takes it back to about step 4, which drops the chunks the later
+    // steps were the first to reach.
+    let back = call(&mut s, "sim.run", &json!({"time": total - 4.0}));
+    assert_eq!(back["at"], 602, "the rewind stays inside the last move: {back}");
+    let (dirty, touched) =
+        (s.sim_stock().map(|st| st.dirty_chunks()).unwrap_or_default(), s.sim_stock().map(|st| st.touched_chunks()).unwrap_or_default());
+    let dropped: Vec<_> = dirty.into_iter().filter(|c| !touched.contains(c)).collect();
+    assert!(!dropped.is_empty(), "the rewind must leave a dirty chunk that is no longer cut");
+    let restores = s.sim_checkpoint_restores().unwrap_or(0);
+    call(&mut s, "sim.run", &json!({"time": total * 0.5}));
+    assert!(s.sim_checkpoint_restores().unwrap_or(0) > restores, "the last seek must restore a checkpoint");
+    let dirty = s.sim_stock().map(|st| st.dirty_chunks()).unwrap_or_default();
+    for c in &dropped {
+        assert!(dirty.contains(c), "chunk {c:?}, dropped by the rewind, is not dirty after the restore");
+    }
+}
+
+#[test]
+fn a_checkpoint_over_the_cap_is_refused_and_the_spacing_grows() {
+    // The first checkpoint is the whole stock, so a stock over a quarter of the budget keeps none: the
+    // run goes on to the end without a panic, and the spacing between checkpoints doubles at each refusal.
+    let gcode = long_program(600);
+    let mut found = None;
+    for h in [0.25, 0.3, 0.35, 0.4, 0.5, 0.6, 0.7, 0.8, 1.0] {
+        let mut s = Session::default();
+        let params = json!({
+            "stock": {"box": {"min": [0, 0, -10], "max": [40, 20, 0]}},
+            "tools": [{"id": 0, "diameter": 6, "flute_length": 20}],
+            "gcode": gcode, "resolution": h, "memory_mb": 1
+        });
+        let setup = call(&mut s, "sim.setup", &params);
+        let (bytes, budget) = (setup["memory_estimate"]["bytes"].as_u64().unwrap_or(0), setup["memory_estimate"]["budget"].as_u64().unwrap_or(0));
+        if bytes * 4 > budget && bytes <= budget {
+            found = Some(s);
+            break;
+        }
+    }
+    let Some(mut s) = found else { panic!("no resolution puts the box over a quarter of a 1 MB budget") };
+    let run = call(&mut s, "sim.run", &json!({}));
+    assert_eq!(run["done"], true, "{run}");
+    assert!(s.sim_checkpoint_every().unwrap_or(0) > 256, "the refused checkpoints must space them further apart");
+}
+
+/// Wall time of a whole run of a long program of short lines, on a stock at the default resolution.
+/// Not a check: `cargo test -p solidcraft-engine --lib -- --ignored --nocapture sim_full_run_timing`.
+#[test]
+#[ignore]
+fn sim_full_run_timing() {
+    let mut g = String::from("T0 M6\nG21 G90\nG0 X5 Y5 Z5\nG1 Z-2 F600\n");
+    for k in 0..20000usize {
+        let (row, col) = (k / 200, k % 200);
+        let x = if row % 2 == 0 { col } else { 199 - col };
+        g.push_str(&format!("G1 X{:.2} Y{:.2} F1200\n", 5.0 + x as f64 * 0.45, 5.0 + row as f64 * 0.45));
+    }
+    let params = json!({
+        "stock": {"box": {"min": [0, 0, -30], "max": [100, 100, 0]}},
+        "tools": [{"id": 0, "diameter": 6, "flute_length": 20}],
+        "gcode": g
+    });
+    let mut s = Session::default();
+    let setup_started = std::time::Instant::now();
+    let setup = call(&mut s, "sim.setup", &params);
+    let setup_time = setup_started.elapsed();
+    let run_started = std::time::Instant::now();
+    let run = call(&mut s, "sim.run", &json!({}));
+    let run_time = run_started.elapsed();
+    assert_eq!(run["done"], true);
+    eprintln!(
+        "sim timing: {} moves at h {}, setup {:?}, full run {:?}, removed {} mm^3",
+        setup["moves"], setup["h"], setup_time, run_time, run["removed_volume"]
+    );
 }

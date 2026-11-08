@@ -173,7 +173,6 @@ pub fn tick(app: &mut SolveApp, ctx: &egui::Context) {
 
 pub fn panel(app: &mut SolveApp, ui: &mut egui::Ui) {
     crate::manufacture_setup::show_dialogs(app, ui);
-    crate::sim_stock::panel(app, ui);
 }
 
 pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
@@ -572,13 +571,207 @@ G0 Z5", "resolution": 0.5});
         let (before, total) = h.app.session.sim_progress().unwrap_or((0, 0));
         assert!(total > 0 && before == 0, "a fresh simulation starts at its first move");
         let ctx = egui::Context::default();
-        for _ in 0..200 {
+        // Playing runs on with real time, a sixth of a machine second per frame at the default speed, so
+        // the program takes a few hundred frames: the loop stops at its end, not at a frame count.
+        for _ in 0..20_000 {
             crate::sim_stock::poll(&mut h.app, &ctx);
-            if h.app.session.sim_progress().is_some_and(|(at, n)| at == n) {
+            if h.app.session.sim_time().is_some_and(|(t, total)| t >= total) {
                 break;
             }
         }
         let (after, _) = h.app.session.sim_progress().unwrap_or((0, 0));
         assert!(after > before, "playing advances the move index: {before} -> {after}");
+    }
+
+    /// Two moves, the second one in the air above the stock: a cut-free program, so each frame's step is
+    /// quick and the playhead is never cut short by the frame's budget.
+    const TOOL_IN_AIR: &str = "T0 M6\nG21 G90\nG0 X10 Y10 Z5\nG1 X110 Y10 Z5 F1200";
+    /// A few moves that cut the stock (the same program as the Simulate tests above).
+    const CUTTING: &str = "T0 M6\nG21 G90\nG0 X10 Y10 Z5\nG1 Z-2 F100\nG1 X40 F300\nG0 Z5\nG0 X180 Y90\nG1 Z-2 F100\nG1 X190 F300\nG0 Z5";
+
+    /// Sets up a simulation of `gcode` on a 200 x 100 mm stock, with a 6 mm tool.
+    fn sim_setup(h: &mut Harness, gcode: &str) {
+        h.app
+            .session
+            .execute(
+                "sim.setup",
+                &json!({"stock": {"box": {"min": [0, 0, -10], "max": [200, 100, 0]}}, "tools": [{"id": 0, "diameter": 6, "flute_length": 20}], "gcode": gcode, "resolution": 0.5}),
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    /// Playing moves the playhead on by the frame's time, times the speed: one frame at the harness's
+    /// own frame time, then another.
+    #[test]
+    fn playing_moves_the_playhead_by_the_frame_time_times_the_speed() {
+        use crate::sim_stock::{next_time, play};
+        let mut h = Harness::new();
+        h.app.manufacture_workspace.active = true;
+        h.app.sim_stock.speed = 20.0;
+        sim_setup(&mut h, TOOL_IN_AIR);
+        play(&mut h.app);
+        let (_, total) = h.app.session.sim_time().unwrap_or((0.0, 0.0));
+        let (mut expected, mut time, mut frames) = (0.0, 0.0, 0);
+        // A frame may leave the playhead where it was (the engine cuts within the frame's budget): run on,
+        // bounded, until two frames have passed and the playhead has moved.
+        while frames < 200 && (frames < 2 || time <= 0.0) {
+            h.frame();
+            frames += 1;
+            let dt = f64::from(h.ctx.input(|i| i.stable_dt));
+            assert!(dt > 0.0, "the harness gives each frame a time");
+            expected = next_time(expected, total, dt, 20.0);
+            time = h.app.session.sim_time().map_or(f64::NAN, |(t, _)| t);
+            // The engine may cut short of the target within the frame's budget, never past it.
+            assert!(time <= expected + 1e-9, "the playhead is {time} after frame {frames}, at most {expected}");
+        }
+        assert!(time > 0.0, "the playhead moved within 200 frames: {time}");
+        assert!(expected > 0.0 && expected < total, "two frames are a step into the program: {expected} of {total}");
+    }
+
+    /// The playhead's step is the frame's time capped at 0.1 s, times the speed, and never past the end.
+    #[test]
+    fn the_playhead_step_caps_the_frame_and_stops_at_the_end() {
+        use crate::sim_stock::next_time;
+        assert!((next_time(0.0, 100.0, 1.0 / 60.0, 10.0) - 10.0 / 60.0).abs() < 1e-12);
+        assert!((next_time(0.0, 100.0, 0.5, 10.0) - 1.0).abs() < 1e-12, "a stalled frame moves the playhead 0.1 s of time");
+        assert_eq!(next_time(99.9, 100.0, 0.1, 10.0), 100.0);
+    }
+
+    /// Scrubbing back restores the stock of that time: the removed volume and the meshed chunks are those
+    /// of a fresh run to the same time, and the playhead stops there.
+    #[test]
+    fn scrubbing_backward_restores_the_stock_of_that_time() {
+        use crate::sim_stock::{meshed_chunks, seek, settle};
+        let mut h = Harness::new();
+        h.app.manufacture_workspace.active = true;
+        sim_setup(&mut h, CUTTING);
+        let (_, total) = h.app.session.sim_time().unwrap_or((0.0, 0.0));
+        let (hi, lo) = (0.8 * total, 0.3 * total);
+        h.app.session.execute("sim.run", &json!({"time": hi})).unwrap_or_else(|e| panic!("{e}"));
+        settle(&mut h.app);
+        seek(&mut h.app, lo);
+        let ctx = egui::Context::default();
+        for _ in 0..1000 {
+            crate::sim_stock::poll(&mut h.app, &ctx);
+            if h.app.session.sim_time().is_some_and(|(t, _)| (t - lo).abs() < 1e-9) {
+                break;
+            }
+        }
+        settle(&mut h.app);
+        assert!(h.app.session.sim_time().is_some_and(|(t, _)| (t - lo).abs() < 1e-9), "the playhead stopped at the seek's time");
+        let scrubbed = h.app.session.execute("sim.run", &json!({"time": lo})).unwrap_or_else(|e| panic!("{e}"));
+
+        let mut fresh = Harness::new();
+        fresh.app.manufacture_workspace.active = true;
+        sim_setup(&mut fresh, CUTTING);
+        let direct = fresh.app.session.execute("sim.run", &json!({"time": lo})).unwrap_or_else(|e| panic!("{e}"));
+        settle(&mut fresh.app);
+        let (a, b) = (scrubbed["removed_volume"].as_f64().unwrap_or(f64::NAN), direct["removed_volume"].as_f64().unwrap_or(f64::NAN));
+        assert!(b > 0.0 && (a - b).abs() <= 1e-9 * b, "removed {a} after the seek, {b} in a fresh run to the same time");
+        assert_eq!(meshed_chunks(&h.app), meshed_chunks(&fresh.app), "the same chunks have a surface");
+    }
+
+    /// A plunge, then one long X line at F600 (18 s of cut). Scrubbing back inside that line keeps the engine's
+    /// revision, so the UI must remesh what the undo dirtied (`sim_take_dirty`): the surface at 7.0 s is that of
+    /// a fresh run to 7.0 s, chunk by chunk, triangle for triangle.
+    #[test]
+    fn scrubbing_back_inside_one_long_move_keeps_the_revision_and_remeshes_what_it_dirtied() {
+        use crate::sim_stock::{meshed_chunks, meshed_triangles, seek, settle};
+        const LONG: &str = "T0 M6\nG21 G90\nG0 X10 Y10 Z5\nG1 Z-2 F100\nG1 X190 F600\nG0 Z5";
+        let mut h = Harness::new();
+        h.app.manufacture_workspace.active = true;
+        sim_setup(&mut h, LONG);
+        h.app.session.execute("sim.run", &json!({"time": 9.2})).unwrap_or_else(|e| panic!("{e}"));
+        settle(&mut h.app);
+        let revision = h.app.session.sim_revision();
+        let (_, tip, _) = h.app.session.sim_tool_pose().unwrap_or_else(|| panic!("the playhead has a tool pose"));
+        assert!(tip[0] > 10.0 && tip[0] < 190.0, "9.2 s is inside the long move: {tip:?}");
+        let deep = meshed_triangles(&h.app);
+
+        seek(&mut h.app, 7.0);
+        let ctx = egui::Context::default();
+        for _ in 0..1000 {
+            crate::sim_stock::poll(&mut h.app, &ctx);
+            if h.app.session.sim_time().is_some_and(|(t, _)| (t - 7.0).abs() < 1e-9) {
+                break;
+            }
+        }
+        settle(&mut h.app);
+        assert!(h.app.session.sim_time().is_some_and(|(t, _)| (t - 7.0).abs() < 1e-9), "the playhead stopped at 7.0 s");
+        assert_eq!(h.app.session.sim_revision(), revision, "a scrub inside one move keeps the stock's revision");
+        let (_, tip, _) = h.app.session.sim_tool_pose().unwrap_or_else(|| panic!("the playhead has a tool pose"));
+        assert!(tip[0] > 10.0 && tip[0] < 190.0, "7.0 s is still inside the long move: {tip:?}");
+        let scrubbed = h.app.session.execute("sim.run", &json!({"time": 7.0})).unwrap_or_else(|e| panic!("{e}"));
+        let scrubbed_tris = meshed_triangles(&h.app);
+        assert_ne!(scrubbed_tris, deep, "the undo dirtied chunks, and they were remeshed");
+
+        let mut fresh = Harness::new();
+        fresh.app.manufacture_workspace.active = true;
+        sim_setup(&mut fresh, LONG);
+        let direct = fresh.app.session.execute("sim.run", &json!({"time": 7.0})).unwrap_or_else(|e| panic!("{e}"));
+        settle(&mut fresh.app);
+        let (a, b) = (scrubbed["removed_volume"].as_f64().unwrap_or(f64::NAN), direct["removed_volume"].as_f64().unwrap_or(f64::NAN));
+        assert!(b > 0.0 && (a - b).abs() <= 1e-9 * b, "removed {a} after the scrub, {b} in a fresh run to 7.0 s");
+        assert_eq!(meshed_chunks(&h.app), meshed_chunks(&fresh.app), "the same chunks have a surface");
+        assert_eq!(scrubbed_tris, meshed_triangles(&fresh.app), "and each has the same triangles as a fresh run");
+    }
+
+    /// Whether the drawn cutting tool has its base fan at `tip`, facing against `axis`.
+    fn tool_base_at(app: &SolveApp, tip: [f64; 3], axis: [f64; 3]) -> bool {
+        let (tip, axis) = (solidcraft_engine::geom::Vec3::from(tip), solidcraft_engine::geom::Vec3::from(axis));
+        crate::sim_stock::drawn_tool(app)
+            .iter()
+            .flatten()
+            .any(|(p, n)| (p.x - tip.x).abs() < 1e-6 && (p.y - tip.y).abs() < 1e-6 && (p.z - tip.z).abs() < 1e-6 && n.dot(axis) < -0.999)
+    }
+
+    /// The cutting tool is drawn at the engine's pose at the playhead: mid-move, its tip is between the
+    /// move's ends, and the model scene is rebuilt as the tool moves.
+    #[test]
+    fn the_drawn_tool_follows_the_playhead_pose() {
+        use crate::sim_stock::settle;
+        let mut h = Harness::new();
+        sim_setup(&mut h, TOOL_IN_AIR);
+        settle(&mut h.app);
+        let (_, total) = h.app.session.sim_time().unwrap_or((0.0, 0.0));
+        h.app.session.execute("sim.run", &json!({"time": 0.5 * total})).unwrap_or_else(|e| panic!("{e}"));
+        let key = crate::viewport::model_scene_key(&h.app);
+        let (_, tip, axis) = h.app.session.sim_tool_pose().unwrap_or_else(|| panic!("the playhead has a tool pose"));
+        assert!(tip[0] > 10.0 && tip[0] < 110.0, "the tip is mid-move: {tip:?}");
+        assert!(tool_base_at(&h.app, tip, axis), "the drawn tool stands at the pose's tip");
+        assert!(!tool_base_at(&h.app, [110.0, 10.0, 5.0], axis), "not at the move's end, where the cursor's move ends");
+
+        h.app.session.execute("sim.run", &json!({"time": 0.75 * total})).unwrap_or_else(|e| panic!("{e}"));
+        let (_, tip2, axis2) = h.app.session.sim_tool_pose().unwrap_or_else(|| panic!("the playhead has a tool pose"));
+        assert!(tip2[0] > tip[0] && tool_base_at(&h.app, tip2, axis2), "the tool moved on along the move");
+        assert_ne!(crate::viewport::model_scene_key(&h.app), key, "the tool moved, so the model scene is rebuilt");
+    }
+
+    /// Moving the tool within an air move redraws the model scene but keeps every stock block, bytes and
+    /// all, and the uncut box's: only the tool's triangles are built again.
+    #[test]
+    fn a_tool_move_keeps_the_stock_and_box_blocks() {
+        use crate::sim_stock::settle;
+        let mut h = Harness::new();
+        h.app.manufacture_workspace.active = true;
+        sim_setup(&mut h, CUTTING);
+        settle(&mut h.app);
+        // Move 4 (G0 X180 Y90) runs at Z 5, above the stock: the playhead moves along it, nothing is cut.
+        h.app.session.execute("sim.run", &json!({"to": 4})).unwrap_or_else(|e| panic!("{e}"));
+        settle(&mut h.app);
+        let before = crate::viewport::build_scene(&h.app).blocks;
+        let pose = h.app.session.sim_tool_pose();
+        let (time, _) = h.app.session.sim_time().unwrap_or((0.0, 0.0));
+        h.app.session.execute("sim.run", &json!({"time": time + 0.01})).unwrap_or_else(|e| panic!("{e}"));
+        settle(&mut h.app);
+        let after = crate::viewport::build_scene(&h.app).blocks;
+        assert_ne!(h.app.session.sim_tool_pose(), pose, "the tool moved");
+        assert!(!before.is_empty(), "the cut and the box are drawn as blocks");
+        let keys = |blocks: &[crate::gpu::SceneBlock]| blocks.iter().map(|b| b.key).collect::<Vec<_>>();
+        assert_eq!(keys(&before), keys(&after), "a tool move keeps every block's key");
+        assert!(
+            before.iter().zip(&after).all(|(a, b)| std::sync::Arc::ptr_eq(&a.bytes, &b.bytes)),
+            "the kept blocks keep their bytes, so the GPU keeps their buffers"
+        );
     }
 }
