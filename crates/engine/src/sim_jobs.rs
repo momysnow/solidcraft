@@ -41,6 +41,16 @@ pub(crate) struct Setup {
     /// The rapid rate, mm/min.
     pub rapid_mm_min: f64,
     pub program: Program,
+    /// The operations in order, each with the G-code line it starts at.
+    pub sections: Vec<(String, u32)>,
+}
+
+/// One operation of the program on the machine clock (see `Job::sections`).
+pub(crate) struct SectionInfo {
+    pub name: String,
+    pub first_move: usize,
+    pub start_time: f64,
+    pub end_time: f64,
 }
 
 /// The stock after `cursor` whole moves, with the cutter's reports so far: where a backward seek
@@ -446,6 +456,39 @@ impl Job {
         self.time
     }
 
+    /// Where move `i` starts on the machine clock, s; the end of the program for `i` past the last move.
+    pub fn move_start(&self, i: usize) -> f64 {
+        self.starts.get(i).copied().unwrap_or_else(|| self.total_time())
+    }
+
+    /// The machine time, s, up to which a stock state is ready: the playhead, or the start of the move
+    /// the last checkpoint is at when that is later. Never below the playhead.
+    pub fn computed_time(&self) -> f64 {
+        let ahead = self.checkpoints.last().and_then(|c| self.starts.get(c.cursor)).copied().unwrap_or(0.0);
+        self.time.max(ahead).min(self.total_time())
+    }
+
+    /// The operations on the machine clock: each starts at its first move at or after the G-code line it
+    /// was given, and ends where the next one starts (the last, at the end of the program). A program
+    /// given none is one section.
+    pub fn sections(&self) -> Vec<SectionInfo> {
+        let moves = &self.setup.program.moves;
+        let total = self.total_time();
+        let first_at = |line: u32| moves.iter().position(|m| m.source >= line).unwrap_or(moves.len());
+        let mut found: Vec<(String, usize)> = self.setup.sections.iter().map(|(name, line)| (name.clone(), first_at(*line))).collect();
+        if found.is_empty() {
+            found.push(("Program".to_string(), 0));
+        }
+        found.sort_by_key(|(_, first)| *first);
+        let time_of = |i: usize| self.starts.get(i).copied().unwrap_or(total);
+        let mut out = Vec::with_capacity(found.len());
+        for (k, (name, first)) in found.iter().enumerate() {
+            let end = found.get(k + 1).map_or(total, |(_, next)| time_of(*next));
+            out.push(SectionInfo { name: name.clone(), first_move: *first, start_time: time_of(*first), end_time: end });
+        }
+        out
+    }
+
     /// Hands out the chunks whose surface changed since the last call, and forgets them.
     pub fn take_dirty(&mut self) -> Vec<[usize; 3]> {
         let dirty = self.stock.dirty_chunks();
@@ -548,6 +591,24 @@ impl Session {
     /// The playhead and the program's machine time, both s. `None` without a simulation.
     pub fn sim_time(&self) -> Option<(f64, f64)> {
         self.sim.job().map(|j| (j.playhead(), j.total_time()))
+    }
+
+    /// The operations of the program on the machine clock: name, start and end (s) and first move. Empty
+    /// without a simulation.
+    pub fn sim_sections(&self) -> Vec<(String, f64, f64, usize)> {
+        self.sim.job().map(|j| j.sections().into_iter().map(|x| (x.name, x.start_time, x.end_time, x.first_move)).collect()).unwrap_or_default()
+    }
+
+    /// Where move `i` starts on the machine clock, s; the program's end for `i` past the last move. `None`
+    /// without a simulation.
+    pub fn sim_move_start(&self, i: usize) -> Option<f64> {
+        self.sim.job().map(|j| j.move_start(i))
+    }
+
+    /// The machine time, s, up to which the stock is ready (see `Job::computed_time`). `None` without a
+    /// simulation.
+    pub fn sim_computed_time(&self) -> Option<f64> {
+        self.sim.job().map(Job::computed_time)
     }
 
     /// The tool at the playhead: its tool's id, tip and axis. `None` without a simulation, or when the

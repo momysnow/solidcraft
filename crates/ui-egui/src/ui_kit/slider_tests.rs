@@ -27,6 +27,7 @@ fn every_slider_option_uses_the_same_token_thumb_in_both_themes() {
                                         show_value,
                                         integer,
                                         workspace_accent: false,
+                                        on_view: false,
                                     },
                                 );
                             });

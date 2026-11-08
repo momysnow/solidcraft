@@ -48,7 +48,6 @@ const BAR_SHARE: f32 = 0.7;
 const BAR_MIN_WIDTH: f32 = 520.0;
 const BAR_MAX_WIDTH: f32 = 1100.0;
 /// The speed slider's width, in points.
-const SPEED_WIDTH: f32 = 90.0;
 
 /// The meshes of the chunks in one batch, by display index: `None` for a chunk with no surface now.
 type Batch = Vec<([usize; 3], Option<Surface>)>;
@@ -119,6 +118,11 @@ pub struct State {
     frame: Option<[[f32; 3]; 4]>,
     /// The playback bar's rectangle as last drawn over the view; `None` while it is not drawn.
     bar: Option<egui::Rect>,
+    /// What the Simulation window's View tab has set.
+    pub(crate) view: crate::sim_view::ViewOptions,
+    /// The toolpath's lines, one block per chunk of moves, kept while the key built from the stock's revision,
+    /// the frame, the colours and the View flags comes back.
+    path_blocks: Mutex<BTreeMap<usize, (u64, Arc<BlockBytes>)>>,
     /// Chunks meshed so far (tests only).
     #[cfg(test)]
     meshed: usize,
@@ -165,6 +169,8 @@ impl Default for State {
             scrub: None,
             frame: None,
             bar: None,
+            view: crate::sim_view::ViewOptions::default(),
+            path_blocks: Mutex::default(),
             #[cfg(test)]
             meshed: 0,
         }
@@ -186,6 +192,8 @@ pub fn simulate_active(app: &mut SolveApp) {
             app.sim_stock.frame = frame(&reply["frame"]);
             app.sim_stock.scrub = None;
             app.sim_stock.playing = true;
+            app.sim_stock.view.open = true;
+            crate::manufacture_workspace::show_simulation_tab(app);
         }
         Err(e) => app.set_status(e, true),
     }
@@ -204,7 +212,13 @@ fn frame(v: &serde_json::Value) -> Option<[[f32; 3]; 4]> {
 /// visible. Other workspaces keep their bodies.
 pub fn hides_bodies(app: &SolveApp) -> bool {
     // The session's revision, not the state's: Simulate hides the body at once, before the next poll.
-    crate::manufacture_workspace::active(app) && app.session.sim_revision() != 0
+    crate::manufacture_workspace::active(app) && app.session.sim_revision() != 0 && app.sim_stock.view.model_opacity <= 0.0
+}
+
+/// The factor the model's opacity is multiplied by while a simulation runs: the View tab's Opacity, so a
+/// model shown through the stock is see-through. 1 outside a simulation.
+pub fn model_opacity(app: &SolveApp) -> f32 {
+    if crate::manufacture_workspace::active(app) && app.session.sim_revision() != 0 { app.sim_stock.view.model_opacity.clamp(0.0, 1.0) } else { 1.0 }
 }
 
 /// The playhead one frame on: `dt` real seconds at `speed` machine seconds each, with `dt` capped at
@@ -276,13 +290,21 @@ pub fn seek(app: &mut SolveApp, time: f64) {
     app.sim_stock.scrub = Some(time);
 }
 
-/// Minutes and seconds, as `01:05`, for the playhead and the program's length.
-fn clock(seconds: f64) -> String {
-    let s = seconds.max(0.0) as u64;
-    format!("{:02}:{:02}", s / 60, s % 60)
+/// Clears the simulation from the playback bar's Clear button: stops playback and drops the stock.
+/// Whether a simulation is on screen in the Manufacture workspace: the ribbon shows the Simulation tab,
+/// the history bar is hidden and the playback bar is drawn.
+pub fn simulating(app: &SolveApp) -> bool {
+    crate::manufacture_workspace::active(app) && app.session.sim_progress().is_some()
 }
 
-/// Clears the simulation from the playback bar's Clear button: stops playback and drops the stock.
+/// Ends the simulation (Exit Simulation): drops the stock and closes the View window. The ribbon goes
+/// back to the Manufacture tabs on the next frame.
+pub fn exit_simulation(app: &mut SolveApp) {
+    clear(app);
+    app.sim_stock.view.open = false;
+    crate::manufacture_workspace::sync_tab(app);
+}
+
 fn clear(app: &mut SolveApp) {
     app.sim_stock.playing = false;
     app.sim_stock.scrub = None;
@@ -300,19 +322,9 @@ fn bar_rect(view: egui::Rect, nav: Option<egui::Rect>) -> Option<egui::Rect> {
         return None;
     }
     let width = (view.width() * BAR_SHARE).clamp(BAR_MIN_WIDTH, BAR_MAX_WIDTH).min(view.width() - 2.0 * t.space_16);
-    let height = t.control_height + 2.0 * t.space_4;
+    let height = (1.0 + BUTTON_SCALE) * t.control_height + 3.0 * t.space_4;
     let bottom = nav.map_or(view.bottom() - t.space_8, |nav| nav.top() - t.space_8);
     Some(egui::Rect::from_center_size(egui::pos2(view.center().x, bottom - height / 2.0), egui::vec2(width, height)))
-}
-
-/// Which optional controls the row shows, for `inner` points: the move count, then the speed control,
-/// go first when the timeline would keep less than half the row. `core` is what the row always shows,
-/// the timeline excepted. `None` when even the core leaves the timeline under half: the bar is hidden.
-fn row_items(inner: f32, core: f32, moves: f32, speed: f32) -> Option<(bool, bool)> {
-    [(true, true), (false, true), (false, false)].into_iter().find(|&(moves_on, speed_on)| {
-        let used = core + if moves_on { moves } else { 0.0 } + if speed_on { speed } else { 0.0 };
-        inner - used >= inner * 0.5
-    })
 }
 
 /// The slider's position for a speed: 0 at `MIN_SPEED`, 1 at `MAX_SPEED`, on a log scale so the slow
@@ -326,39 +338,81 @@ fn speed_at(level: f64) -> f64 {
     MIN_SPEED * (MAX_SPEED / MIN_SPEED).powf(level.clamp(0.0, 1.0))
 }
 
-/// The play or pause control: History's transport glyph, with its hover fill and a hand cursor.
-fn transport(ui: &mut egui::Ui, size: f32, playing: bool) -> egui::Response {
-    let t = Tokens::get();
-    let label = tr(if playing { "sim.stock.pause" } else { "sim.stock.play" });
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::click());
-    if response.hovered() {
-        ui.painter().rect_filled(rect, t.radius_sm, t.hover);
-    }
-    crate::icons::glyphs::transport_glyph(ui.painter(), rect.center(), if playing { "pause" } else { "play" }, t.icon);
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label));
-    response.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(label)
-}
-
-/// The width of `text` in `font`, as the painter lays it out.
-fn text_width(ui: &egui::Ui, text: &str, font: egui::FontId) -> f32 {
-    ui.painter().layout_no_wrap(text.to_owned(), font, Tokens::get().text).size().x
-}
-
 /// The bar's rectangle as last drawn over the view, for the overlays that keep clear of it.
 pub fn playback_rect(app: &SolveApp) -> Option<egui::Rect> {
     app.sim_stock.bar
 }
 
-/// The playback bar over the 3D viewport, one row: play or pause, the elapsed time, the timeline, the
-/// program's length, the move count, the speed and Clear. Shown while Manufacture shows a simulation,
-/// and only where it fits (`row_items`). Its widgets claim the pointer over the bar, so the camera and
-/// picking beneath get no clicks from it.
+/// What a transport button does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Control {
+    Start,
+    PreviousOperation,
+    StepBack,
+    Toggle,
+    StepForward,
+    NextOperation,
+    End,
+}
+
+/// How much larger than the History bar's the simulation's transport glyphs are drawn.
+const GLYPH_SCALE: f32 = 1.6;
+
+/// How much larger than a control row the simulation's transport buttons are.
+const BUTTON_SCALE: f32 = 1.25;
+
+/// One transport button on the view: the History bar's artwork, larger, with a shadow so it reads over
+/// the model, and a step and an operation glyph of its own.
+fn transport_button(ui: &mut egui::Ui, size: f32, glyph: &str, label: &str) -> egui::Response {
+    let t = Tokens::get();
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::click());
+    if response.hovered() {
+        ui.painter().rect_filled(rect, t.radius_sm, t.hover);
+    }
+    let ink = if response.hovered() { t.accent } else { t.icon };
+    crate::icons::glyphs::transport_glyph_scaled(ui.painter(), rect.center() + egui::vec2(1.0, 1.0), glyph, t.overlay, GLYPH_SCALE);
+    crate::icons::glyphs::transport_glyph_scaled(ui.painter(), rect.center(), glyph, ink, GLYPH_SCALE);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label));
+    response.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(label)
+}
+
+/// Where the playhead goes to for the previous or next operation: forward, the start of the next one (the
+/// end of the program after the last); back, the start of the one before the playhead, or of the current
+/// one when the playhead is more than a second into it.
+fn operation_jump(sections: &[(String, f64, f64, usize)], shown: f64, total: f64, forward: bool) -> f64 {
+    if forward {
+        sections.iter().map(|s| s.1).find(|&start| start > shown + 1.0e-6).unwrap_or(total)
+    } else {
+        sections.iter().map(|s| s.1).filter(|&start| start < shown - 1.0).last().unwrap_or(0.0)
+    }
+}
+
+/// Moves the playhead one move on or back (the step buttons): to the start of the move the playhead is in
+/// when stepping back from inside one.
+fn step_move(app: &mut SolveApp, forward: bool) {
+    let (Some((cursor, total)), Some((time, _))) = (app.session.sim_progress(), app.session.sim_time()) else { return };
+    let inside = app.session.sim_move_start(cursor).is_some_and(|start| time > start + 1.0e-6);
+    let target = match (forward, inside) {
+        (true, _) => (cursor + 1).min(total),
+        (false, true) => cursor,
+        (false, false) => cursor.saturating_sub(1),
+    };
+    if let Some(at) = app.session.sim_move_start(target) {
+        seek(app, at);
+    }
+}
+
+/// The playback bar over the 3D viewport, in two rows: the transport buttons (start, previous operation,
+/// step back, play or pause, step forward, next operation, end) and the speed slider under them, as wide as
+/// the buttons. Where the playhead is shows on the bar along the bottom of the window, not here. Shown while Manufacture shows a simulation, and
+/// only where it fits. Its widgets claim the pointer over the bar, so the camera and picking beneath get no
+/// clicks from it.
 pub fn playback(app: &mut SolveApp, ui: &mut egui::Ui, viewport: egui::Rect) {
     app.sim_stock.bar = None;
     if !crate::manufacture_workspace::active(app) {
         return;
     }
-    let (Some((cursor, total)), Some((time, total_time))) = (app.session.sim_progress(), app.session.sim_time()) else { return };
+    let Some((time, total_time)) = app.session.sim_time() else { return };
     let view = crate::shell::bottom_overlay_rect(app, crate::shell::content_rect(app, viewport));
     let nav = app.viewport.layout.as_ref().map(|l| l.navigation).filter(|n| {
         n.is_positive() && n.is_finite() && app.ui.show_navigation_bar && app.preferences.navigation_bar.edge == crate::navigation_bar::Edge::Bottom
@@ -366,70 +420,135 @@ pub fn playback(app: &mut SolveApp, ui: &mut egui::Ui, viewport: egui::Rect) {
     let Some(rect) = bar_rect(view, nav).filter(|r| r.is_finite() && r.is_positive()) else { return };
     let t = Tokens::get();
     let h = t.control_height;
-    let inner = rect.width() - 2.0 * t.space_8;
-    let gap = ui.spacing().item_spacing.x;
-    let (cursor, total) = (cursor.to_string(), total.to_string());
-    let moves = crate::i18n::format("sim.stock.progress", &[("cursor", &cursor), ("total", &total)]);
-    let (elapsed, length) = (clock(time), clock(total_time));
-    let speed = format!("{:.0}{}", app.sim_stock.speed, tr("sim.stock.speed_suffix"));
-    let elapsed_w = text_width(ui, &elapsed, egui::FontId::monospace(t.font_label));
-    let clear_w = text_width(ui, tr("sim.stock.clear"), egui::TextStyle::Small.resolve(ui.style())) + 2.0 * ui.spacing().button_padding.x;
-    let core = h + elapsed_w + text_width(ui, &length, egui::FontId::monospace(t.font_small)) + clear_w + 4.0 * gap;
-    let moves_w = text_width(ui, &moves, egui::FontId::proportional(t.font_small)) + 2.0 * gap;
-    let speed_w = text_width(ui, &speed, egui::FontId::proportional(t.font_small)) + SPEED_WIDTH + 2.0 * gap;
-    let Some((moves_on, speed_on)) = row_items(inner, core, moves_w, speed_w) else { return };
+    let b = (BUTTON_SCALE * h).round();
+    let gap = t.space_8;
+    let cluster = 7.0 * b + 6.0 * gap;
+    // Only as wide as the buttons, over the middle of the navigation bar (of the view without one), and
+    // left of the simulation window while it is open.
+    let width = (cluster + 2.0 * t.space_12).min(rect.width());
+    let mut x = nav.map_or(rect.center().x, |n| n.center().x);
+    if app.sim_stock.view.open {
+        x = x.min(view.right() - crate::sim_view::window_width() - 32.0 - width / 2.0);
+    }
+    let rect = egui::Rect::from_center_size(egui::pos2(x.max(view.left() + width / 2.0), rect.center().y), egui::vec2(width, rect.height()));
+    let inner = rect.shrink2(egui::vec2(t.space_12, t.space_4));
+    let top = egui::Rect::from_center_size(egui::pos2(inner.center().x, inner.top() + b / 2.0), egui::vec2(cluster, b));
+    let low = egui::Rect::from_min_size(egui::pos2(top.left(), top.bottom() + t.space_4), egui::vec2(cluster, h));
+    let speed = format!("{}: {:.0}{}", tr("sim.stock.speed"), app.sim_stock.speed, tr("sim.stock.speed_suffix"));
 
-    ui_kit::playback_surface(ui, rect, app.preferences.navigation_bar.size);
-    // Claimed before the row's widgets, so they stay on top of it and the viewport gets no press on the bar.
+    // No surface under the buttons: they sit on the view. Claimed before the row's widgets, so they stay on top of it and the viewport gets no press on the bar.
     ui.interact(rect, ui.id().with("sim_playback"), egui::Sense::click_and_drag());
     app.sim_stock.bar = Some(rect);
 
     let playing = app.sim_stock.playing;
     let mut level = speed_level(app.sim_stock.speed);
-    // While a scrub is on its way the timeline holds the target, not the playhead that lags it.
-    let mut shown = app.sim_stock.scrub.unwrap_or(time);
-    let (mut toggle, mut wipe) = (false, false);
-    let row = egui::Rect::from_center_size(rect.center(), egui::vec2(inner, h));
-    // The row is laid out from the right, so the timeline takes the width the controls on its left leave.
-    ui.scope_builder(egui::UiBuilder::new().max_rect(row).layout(egui::Layout::right_to_left(egui::Align::Center)), |ui| {
-        ui.set_clip_rect(rect);
-        wipe = ui_kit::button(ui, tr("sim.stock.clear"), ui_kit::Button::Small).clicked();
-        if speed_on {
-            ui.label(egui::RichText::new(speed).size(t.font_small).color(t.text_dim));
-            ui.allocate_ui_with_layout(egui::vec2(SPEED_WIDTH, h), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                let slider = ui_kit::slider(ui, &mut level, 0.0..=1.0, ui_kit::Slider { show_value: false, ..Default::default() });
-                if slider.on_hover_text(tr("sim.stock.speed")).changed() {
-                    app.sim_stock.speed = speed_at(level);
-                }
-            });
+    // While a scrub is on its way the buttons work from the target, not the playhead that lags it.
+    let shown = app.sim_stock.scrub.unwrap_or(time);
+    let mut pressed: Option<Control> = None;
+    ui.scope_builder(egui::UiBuilder::new().max_rect(top).layout(egui::Layout::left_to_right(egui::Align::Center)), |ui| {
+        ui.spacing_mut().item_spacing.x = gap;
+        let buttons = [
+            (Control::Start, "first", "sim.stock.start"),
+            (Control::PreviousOperation, "prev_op", "sim.stock.previous_operation"),
+            (Control::StepBack, "step_back", "sim.stock.step_back"),
+            (Control::Toggle, if playing { "pause" } else { "play" }, if playing { "sim.stock.pause" } else { "sim.stock.play" }),
+            (Control::StepForward, "step_forward", "sim.stock.step_forward"),
+            (Control::NextOperation, "next_op", "sim.stock.next_operation"),
+            (Control::End, "last", "sim.stock.end"),
+        ];
+        for (control, glyph, label) in buttons {
+            if transport_button(ui, b, glyph, tr(label)).clicked() {
+                pressed = Some(control);
+            }
         }
-        if moves_on {
-            ui.label(egui::RichText::new(moves).size(t.font_small).color(t.text_dim));
-        }
-        ui.label(egui::RichText::new(length).monospace().size(t.font_small).color(t.text_dim));
-        let width = (ui.available_width() - h - elapsed_w - 2.0 * gap).max(0.0);
-        if total_time > 0.0 {
-            ui.allocate_ui_with_layout(egui::vec2(width, h), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                let timeline = ui_kit::slider(ui, &mut shown, 0.0..=total_time, ui_kit::Slider { show_value: false, ..Default::default() });
-                if timeline.on_hover_text(tr("sim.stock.playhead")).changed() {
-                    seek(app, shown);
-                }
-            });
-        } else {
-            ui.allocate_exact_size(egui::vec2(width, h), egui::Sense::hover());
-        }
-        ui.label(egui::RichText::new(elapsed).monospace().size(t.font_label).color(t.text));
-        toggle = transport(ui, h, playing).clicked();
     });
-    if toggle {
-        if playing {
-            app.sim_stock.playing = false;
-        } else {
-            play(app);
+    ui.scope_builder(egui::UiBuilder::new().max_rect(low).layout(egui::Layout::left_to_right(egui::Align::Center)), |ui| {
+        ui.set_clip_rect(rect);
+        ui.spacing_mut().slider_width = low.width();
+        let slider = ui_kit::slider(ui, &mut level, 0.0..=1.0, ui_kit::Slider { show_value: false, on_view: true, ..Default::default() });
+        if slider.on_hover_text(speed).changed() {
+            app.sim_stock.speed = speed_at(level);
         }
+    });
+    let sections = app.session.sim_sections();
+    match pressed {
+        Some(Control::Start) => seek(app, 0.0),
+        Some(Control::End) => seek(app, total_time),
+        Some(Control::PreviousOperation) => seek(app, operation_jump(&sections, shown, total_time, false)),
+        Some(Control::NextOperation) => seek(app, operation_jump(&sections, shown, total_time, true)),
+        Some(Control::StepBack) => step_move(app, false),
+        Some(Control::StepForward) => step_move(app, true),
+        Some(Control::Toggle) if playing => app.sim_stock.playing = false,
+        Some(Control::Toggle) => play(app),
+        None => {}
     }
-    if wipe {
-        clear(app);
+}
+
+/// The bar along the bottom of the window, in the history bar's place while a simulation shows: one
+/// segment per operation, its name shown under the pointer only. In each segment green is what the playhead has
+/// played, dark is what is computed ahead of it and light is what is still to compute. A line marks the
+/// playhead, and a press or a drag sets it: the time it gives is returned.
+fn section_bar(ui: &mut egui::Ui, size: egui::Vec2, sections: &[(String, f64, f64, usize)], computed: f64, shown: f64, total: f64) -> Option<f64> {
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+    if !(total > 0.0) || !rect.is_positive() || !rect.is_finite() || sections.is_empty() {
+        return None;
+    }
+    let t = Tokens::get();
+    let pad = t.space_12;
+    let height = (rect.height() * 0.36).clamp(6.0, 16.0);
+    let bar_top = rect.center().y - height / 2.0;
+    let track = egui::Rect::from_min_max(egui::pos2(rect.left() + pad, bar_top), egui::pos2(rect.right() - pad, bar_top + height));
+    let x = |s: f64| track.left() + track.width() * (s / total).clamp(0.0, 1.0) as f32;
+    let gap = 3.0;
+    let round = (height / 4.0).max(2.0);
+    // Dark blue is computed, light blue is still to compute, whatever the theme's background.
+    let shade =
+        |c: egui::Color32, k: f32| egui::Color32::from_rgb((f32::from(c.r()) * k) as u8, (f32::from(c.g()) * k) as u8, (f32::from(c.b()) * k) as u8);
+    let (green, dark, light) = (t.form_success, shade(t.accent, 0.6), t.accent.lerp_to_gamma(egui::Color32::WHITE, 0.5));
+    let p = ui.painter();
+    let slice = |a: f64, b: f64| {
+        egui::Rect::from_min_max(egui::pos2(x(a) + gap / 2.0, track.top()), egui::pos2((x(b) - gap / 2.0).max(x(a) + gap / 2.0), track.bottom()))
+    };
+    for (name, a, b, _) in sections {
+        let whole = slice(*a, *b);
+        if whole.width() < 1.0 {
+            continue;
+        }
+        p.rect_filled(whole, round, light);
+        let ahead = computed.clamp(*a, *b);
+        if ahead > *a {
+            p.rect_filled(slice(*a, ahead), round, dark);
+        }
+        let played = shown.clamp(*a, *b);
+        if played > *a {
+            p.rect_filled(slice(*a, played), round, green);
+        }
+        let _ = name;
+    }
+    let at = x(shown);
+    p.line_segment([egui::pos2(at, track.top() - 3.0), egui::pos2(at, track.bottom() + 3.0)], egui::Stroke::new(2.0, t.text));
+    let seconds = |pos: egui::Pos2| (f64::from((pos.x - track.left()) / track.width().max(1.0)) * total).clamp(0.0, total);
+    let name = response.hover_pos().map(seconds).and_then(|s| sections.iter().find(|(_, a, b, _)| s >= *a && s < *b)).map(|(n, _, _, _)| n.as_str());
+    let tip = match name {
+        Some(n) => crate::i18n::format("sim.bar.operation", &[("name", n)]),
+        None => tr("sim.stock.playhead").to_string(),
+    };
+    let response = response.on_hover_text(tip);
+    if response.is_pointer_button_down_on() || response.clicked() {
+        return response.interact_pointer_pos().map(seconds);
+    }
+    None
+}
+
+/// The simulation's bar, drawn in the slot the history bar has (see `timeline::timeline`): the whole
+/// window's width, with a click or a drag setting the playhead.
+pub fn bottom_bar(app: &mut SolveApp, ui: &mut egui::Ui) {
+    let (Some((time, total)), Some(computed)) = (app.session.sim_time(), app.session.sim_computed_time()) else { return };
+    let sections = app.session.sim_sections();
+    let shown = app.sim_stock.scrub.unwrap_or(time);
+    let size = egui::vec2(ui.available_width(), ui.available_height());
+    if let Some(to) = section_bar(ui, size, &sections, computed, shown, total) {
+        seek(app, to);
     }
 }
 
@@ -698,12 +817,28 @@ fn cylinder(tip: Vec3, axis: Vec3, diameter: f64, length: f64) -> Vec<[(Vec3, Ve
 /// turned within the move). Its flute is a cylinder of the tool's diameter and flute length along the
 /// axis, tip to spindle; ball and bull tools are drawn flat-bottomed too. A tool the program does not
 /// list draws nothing.
-// shortcut: no shank drawn, since the engine sends an empty shank and a zero stickout; draw the shank
-// above the flute once it sends them.
+// shortcut: the shank and the holder are generic cylinders (the shank as wide as the cutter, the holder
+// about twice as wide), since a tool carries neither yet. Give them the tool's own dimensions once it does.
 fn tool_triangles(app: &SolveApp) -> Vec<[(Vec3, Vec3); 3]> {
+    use crate::sim_view::ToolPart;
+    let view = &app.sim_stock.view;
     let (Some(program), Some((id, tip, axis))) = (app.session.sim_program(), app.session.sim_tool_pose()) else { return Vec::new() };
     let Some(tool) = program.tools.iter().find(|t| t.id == id) else { return Vec::new() };
-    cylinder(Vec3::from(tip), Vec3::from(axis), tool.diameter, tool.flute_length)
+    if !view.tool {
+        return Vec::new();
+    }
+    let (tip, axis) = (Vec3::from(tip), Vec3::from(axis));
+    let along = |from: Vec3, d: f64| Vec3::new(from.x + axis.x * d, from.y + axis.y * d, from.z + axis.z * d);
+    let mut out = cylinder(tip, axis, tool.diameter, tool.flute_length);
+    if view.tool_part != ToolPart::Cutting {
+        let shank = (2.0 * tool.flute_length).max(25.0);
+        let base = along(tip, tool.flute_length);
+        out.extend(cylinder(base, axis, tool.diameter, shank));
+        if view.tool_part == ToolPart::Holder {
+            out.extend(cylinder(along(base, shank), axis, (2.2 * tool.diameter).max(22.0), 40.0));
+        }
+    }
+    out
 }
 
 /// What the model scene keys on for the simulation: the stock's meshes and box (`generation`) and the
@@ -714,27 +849,83 @@ pub fn model_key(app: &SolveApp) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     app.sim_stock.generation.hash(&mut h);
     app.session.sim_tool_pose().map(|(id, tip, axis)| (id, tip.map(f64::to_bits), axis.map(f64::to_bits))).hash(&mut h);
+    let v = &app.sim_stock.view;
+    (v.tool, v.tool_part as u8, v.tool_transparent, v.programmed_point, v.path, v.links, v.retracts, v.cuts, v.connections, v.points).hash(&mut h);
+    (v.path_mode as u8, v.stock, v.material as u8, v.colouring as u8, v.stock_transparent, v.spindle_direction).hash(&mut h);
+    app.session.sim_progress().hash(&mut h);
     h.finish()
 }
 
 /// The key of a surface's block: the surface, the frame it is placed in, and the palette slots and
 /// colours its faces and edges take. A block whose key comes back keeps its bytes, and so its buffers.
-fn block_key(idx: [usize; 3], surface: &Surface, frame: WorkFrame, colours: [(PaletteIndex, [u8; 4]); 2]) -> u64 {
+fn block_key(idx: [usize; 3], surface: &Surface, frame: WorkFrame, colours: [(PaletteIndex, [u8; 4]); 2], class: TriClass, paint: &Paint) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    ("sim-stock", idx, surface.serial, frame.bits(), colours.map(|(i, rgba)| (i.0, rgba))).hash(&mut h);
+    ("sim-stock", idx, surface.serial, frame.bits(), colours.map(|(i, rgba)| (i.0, rgba)), class as u8, paint.key).hash(&mut h);
     h.finish()
 }
 
+/// The colour of each piece of the cut surface, by the move that cut it (a triangle's `tri_face` is that
+/// move plus one, 0 for the stock's own faces): one colour per group of moves, the operation or the tool,
+/// from the components' identification colours.
+struct Paint {
+    /// Per move, its group; empty when the stock is one colour.
+    group: Vec<u32>,
+    /// Per group, its palette slot.
+    colours: Vec<PaletteIndex>,
+    /// Tells the paints apart in a block's key.
+    key: u64,
+}
+
+impl Paint {
+    fn plain() -> Paint {
+        Paint { group: Vec::new(), colours: Vec::new(), key: 0 }
+    }
+
+    /// The paint for the View tab's colouring of the program being simulated.
+    fn new(sc: &mut GpuScene, app: &SolveApp) -> Paint {
+        use crate::sim_view::Colouring;
+        let Some(program) = app.session.sim_program() else { return Paint::plain() };
+        let group: Vec<u32> = match app.sim_stock.view.colouring {
+            Colouring::Material => return Paint::plain(),
+            Colouring::Operation => {
+                let firsts: Vec<usize> = app.session.sim_sections().iter().map(|s| s.3).collect();
+                (0..program.moves.len()).map(|m| firsts.partition_point(|&f| f <= m).saturating_sub(1) as u32).collect()
+            }
+            Colouring::Tool => program.moves.iter().map(|m| m.tool).collect(),
+        };
+        let groups = group.iter().max().map_or(0, |g| *g as usize + 1).min(MAX_PAINT_GROUPS);
+        let colours = (0..groups)
+            .map(|g| {
+                let [r, g, b] = solidcraft_engine::doc::component_color::automatic_color(g as u64);
+                sc.color([r, g, b, 255])
+            })
+            .collect();
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (app.sim_stock.view.colouring as u8, &group).hash(&mut h);
+        Paint { group, colours, key: h.finish() }
+    }
+
+    /// The slot for a triangle with tag `tag`, `base` for the stock's own faces.
+    fn colour(&self, tag: u32, base: PaletteIndex) -> PaletteIndex {
+        let Some(m) = (tag as usize).checked_sub(1) else { return base };
+        self.group.get(m).and_then(|&g| self.colours.get(g as usize)).copied().unwrap_or(base)
+    }
+}
+
+/// The most groups a colouring tells apart; further operations or tools take the stock's colour.
+const MAX_PAINT_GROUPS: usize = 256;
+
 /// A chunk's surface as a block of the model scene: its shaded triangles and crease edges, placed in
 /// the model.
-fn surface_block(surface: &Surface, frame: WorkFrame, stock: PaletteIndex, edge: PaletteIndex) -> Arc<BlockBytes> {
+fn surface_block(surface: &Surface, frame: WorkFrame, stock: PaletteIndex, edge: PaletteIndex, class: TriClass, paint: &Paint) -> Arc<BlockBytes> {
     let mut block = BlockBuilder::default();
     block.reserve_triangles(surface.mesh.triangles.len());
-    for &t in &surface.mesh.triangles {
+    for (k, &t) in surface.mesh.triangles.iter().enumerate() {
         let Some(corners) = shaded_corners(&surface.mesh, t) else { continue };
         let p = corners.map(|(p, _)| frame.place(p.to_f32()));
         let n = corners.map(|(_, n)| frame.turn(n.to_f32()));
-        block.triangle(p, n, stock, TriClass::Opaque);
+        let tag = surface.mesh.tri_face.get(k).copied().unwrap_or(0);
+        block.triangle(p, n, paint.colour(tag, stock), class);
     }
     for e in &surface.edges {
         block.line(frame.place(e[0]), frame.place(e[1]), edge, EDGE_WIDTH);
@@ -742,29 +933,70 @@ fn surface_block(surface: &Surface, frame: WorkFrame, stock: PaletteIndex, edge:
     block.freeze()
 }
 
-/// Adds the simulation's stock to a model scene: the cut chunks, each one block that is built once and
-/// kept while its key comes back (a cursor step uploads nothing); then the uncut box and the cutting
-/// tool, loose and rebuilt each frame as they are small. Opaque so the cut reads, in the token's colour
-/// with the body edges' dark edges, and the tool in the body's colour.
+/// The stock colour for a material: the theme's stock colour, scaled per channel.
+fn tinted(rgba: [u8; 4], tint: [f32; 3]) -> [u8; 4] {
+    let scale = |c: u8, k: f32| (f32::from(c) * k).round().clamp(0.0, 255.0) as u8;
+    [scale(rgba[0], tint[0]), scale(rgba[1], tint[1]), scale(rgba[2], tint[2]), rgba[3]]
+}
+
+/// Adds the simulation to a model scene: the stock (the cut chunks, each one block that is built once and
+/// kept while its key comes back, then the uncut box), the toolpath's lines, the cutting tool and its
+/// markers. What shows is what the View tab sets. The stock is opaque so the cut reads, in the material's
+/// tint of the token's colour with the body edges' dark edges, unless the View tab makes it see-through.
 pub fn draw(sc: &mut GpuScene, app: &SolveApp) {
     let state = &app.sim_stock;
     if state.revision == 0 {
         return;
     }
+    let view = &state.view;
     let tk = Tokens::get();
     // The tokens' alpha is for translucent views; the stock is drawn at full alpha.
     let opaque = |c| {
         let [r, g, b, _] = c4(c);
         [r, g, b, 255]
     };
-    let stock_rgba = opaque(tk.cam_stock);
-    let edge_rgba = opaque(tk.body_edge);
+    let frame = work_frame(state);
+    if view.stock {
+        let class = if view.stock_transparent { TriClass::Glass } else { TriClass::Opaque };
+        let paint = Paint::new(sc, app);
+        draw_stock(sc, state, frame, tinted(opaque(tk.cam_stock), view.tint()), opaque(tk.body_edge), class, &paint);
+    }
+    if view.path {
+        draw_path(sc, app, frame);
+    }
+    let tool = sc.color(opaque(tk.body));
+    let triangles = tool_triangles(app);
+    if view.tool_transparent {
+        if !triangles.is_empty() {
+            let mut block = BlockBuilder::default();
+            block.reserve_triangles(triangles.len());
+            for corners in &triangles {
+                let p = corners.map(|(p, _)| frame.place(p.to_f32()));
+                let n = corners.map(|(_, n)| frame.turn(n.to_f32()));
+                block.triangle(p, n, tool, TriClass::Glass);
+            }
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            let pose = app.session.sim_tool_pose().map(|(i, t, a)| (i, t.map(f64::to_bits), a.map(f64::to_bits)));
+            ("sim-tool", triangles.len(), frame.bits(), pose).hash(&mut h);
+            sc.blocks.push(SceneBlock { key: h.finish(), bytes: block.freeze() });
+        }
+    } else {
+        for corners in triangles {
+            for (p, n) in corners {
+                sc.tri(frame.place(p.to_f32()), frame.turn(n.to_f32()), tool);
+            }
+        }
+    }
+    draw_markers(sc, app, frame, c4(tk.cam_selected));
+}
+
+/// The stock's blocks: the cut chunks, then the uncut box.
+fn draw_stock(sc: &mut GpuScene, state: &State, frame: WorkFrame, stock_rgba: [u8; 4], edge_rgba: [u8; 4], class: TriClass, paint: &Paint) {
     let stock = sc.color(stock_rgba);
     let edge = sc.color(edge_rgba);
-    let frame = work_frame(state);
     let mut cache = state.blocks.lock().unwrap_or_else(|e| e.into_inner());
     for (&idx, surface) in &state.meshes {
-        let key = block_key(idx, surface, frame, [(stock, stock_rgba), (edge, edge_rgba)]);
+        let key = block_key(idx, surface, frame, [(stock, stock_rgba), (edge, edge_rgba)], class, paint);
         let cached = match cache.get(&idx) {
             Some((k, bytes)) if *k == key => Some(bytes.clone()),
             _ => None,
@@ -772,7 +1004,7 @@ pub fn draw(sc: &mut GpuScene, app: &SolveApp) {
         let bytes = match cached {
             Some(bytes) => bytes,
             None => {
-                let bytes = surface_block(surface, frame, stock, edge);
+                let bytes = surface_block(surface, frame, stock, edge, class, paint);
                 cache.insert(idx, (key, bytes.clone()));
                 bytes
             }
@@ -785,23 +1017,112 @@ pub fn draw(sc: &mut GpuScene, app: &SolveApp) {
 
     // The uncut box is one block too, kept while its generation, the frame and the colours come back: a
     // tool move rebuilds the model scene, and must not tessellate the box again.
-    let box_key = block_key([usize::MAX; 3], &state.boxed, frame, [(stock, stock_rgba), (edge, edge_rgba)]);
+    // The uncut box is the stock's own faces only: one colour whatever the paint.
+    let plain = Paint::plain();
+    let box_key = block_key([usize::MAX; 3], &state.boxed, frame, [(stock, stock_rgba), (edge, edge_rgba)], class, &plain);
     let mut box_cache = state.box_block.lock().unwrap_or_else(|e| e.into_inner());
     let bytes = match &*box_cache {
         Some((k, bytes)) if *k == box_key => bytes.clone(),
         _ => {
-            let bytes = surface_block(&state.boxed, frame, stock, edge);
+            let bytes = surface_block(&state.boxed, frame, stock, edge, class, &plain);
             *box_cache = Some((box_key, bytes.clone()));
             bytes
         }
     };
     drop(box_cache);
     sc.blocks.push(SceneBlock { key: box_key, bytes });
-    let tool = sc.color(opaque(tk.body));
-    for corners in tool_triangles(app) {
-        for (p, n) in corners {
-            sc.tri(frame.place(p.to_f32()), frame.turn(n.to_f32()), tool);
+}
+
+/// The toolpath's lines for the display mode: a whole chunk of moves comes from the cache, the chunks
+/// the range ends in are built for this frame.
+fn draw_path(sc: &mut GpuScene, app: &SolveApp, frame: WorkFrame) {
+    use crate::sim_path::{CHUNK, Flags, build, move_range};
+    let (Some(program), Some((cursor, total))) = (app.session.sim_program(), app.session.sim_progress()) else { return };
+    let view = &app.sim_stock.view;
+    let tk = Tokens::get();
+    let flags = Flags { links: view.links, retracts: view.retracts, cuts: view.cuts, jumps: view.connections, points: view.points };
+    let rgba = [c4(tk.cam_feed), c4(tk.cam_rapid), c4(tk.cam_dimmed)];
+    let colours = rgba.map(|c| sc.color(c));
+    let time = app.session.sim_time().map_or(0.0, |(t, _)| t);
+    let sections = app.session.sim_sections();
+    let operation = sections.iter().enumerate().find(|(_, s)| time >= s.1 && time < s.2).map(|(k, s)| {
+        let end = sections.get(k + 1).map_or(total, |next| next.3);
+        (s.3, end)
+    });
+    let (from, to) = move_range(view.path_mode, cursor, total, operation);
+    if from >= to {
+        return;
+    }
+    let place = |p| frame.place(p);
+    let mut cache = app.sim_stock.path_blocks.lock().unwrap_or_else(|e| e.into_inner());
+    let mut live = BTreeSet::new();
+    for chunk in from / CHUNK..=(to - 1) / CHUNK {
+        let range = (chunk * CHUNK, ((chunk + 1) * CHUNK).min(total));
+        let part = (range.0.max(from), range.1.min(to));
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        ("sim-path", app.session.sim_revision(), chunk, part, flags.bits(), frame.bits(), rgba, colours.map(|c| c.0)).hash(&mut h);
+        let key = h.finish();
+        let bytes = match cache.get(&chunk) {
+            Some((k, bytes)) if *k == key => bytes.clone(),
+            _ => {
+                let bytes = build(program, part, flags, colours, place);
+                // Only a whole chunk is worth keeping: a partial one changes with the playhead.
+                if part == range {
+                    cache.insert(chunk, (key, bytes.clone()));
+                }
+                bytes
+            }
+        };
+        if part == range {
+            live.insert(chunk);
         }
+        sc.blocks.push(SceneBlock { key, bytes });
+    }
+    cache.retain(|chunk, _| live.contains(chunk));
+}
+
+/// The programmed point and the spindle's direction, as lines on the tool.
+fn draw_markers(sc: &mut GpuScene, app: &SolveApp, frame: WorkFrame, colour: [u8; 4]) {
+    let view = &app.sim_stock.view;
+    if !(view.programmed_point || view.spindle_direction) {
+        return;
+    }
+    let (Some(program), Some((id, tip, axis))) = (app.session.sim_program(), app.session.sim_tool_pose()) else { return };
+    let Some(tool) = program.tools.iter().find(|t| t.id == id) else { return };
+    let spindle = program.moves.iter().rev().find(|m| m.spindle != 0.0).map_or(0.0, |m| m.spindle);
+    let c = sc.color(colour);
+    let at = |p: [f64; 3]| frame.place([p[0] as f32, p[1] as f32, p[2] as f32]);
+    if view.programmed_point {
+        let r = (tool.diameter * 0.35).max(0.5);
+        for d in 0..3 {
+            let (mut a, mut b) = (tip, tip);
+            a[d] -= r;
+            b[d] += r;
+            sc.line(at(a), at(b), c, 2.5, true);
+        }
+    }
+    if view.spindle_direction && spindle != 0.0 {
+        // A ring round the tool above its flutes, open at one end where an arrowhead points the way the
+        // spindle turns: clockwise seen from above the tool for a positive speed.
+        let n = Vec3::from(axis);
+        let helper = if n.x.abs() < 0.9 { Vec3::new(1.0, 0.0, 0.0) } else { Vec3::new(0.0, 1.0, 0.0) };
+        let Some(u) = helper.cross(n).normalized() else { return };
+        let v = n.cross(u);
+        let (u, v) = ([u.x, u.y, u.z], [v.x, v.y, v.z]);
+        let r = tool.diameter * 0.9;
+        let top: [f64; 3] = std::array::from_fn(|k| tip[k] + axis[k] * tool.flute_length * 1.2);
+        let sign = if spindle > 0.0 { -1.0 } else { 1.0 };
+        let point = |a: f64| -> [f64; 3] { std::array::from_fn(|k| top[k] + r * (a.cos() * u[k] + sign * a.sin() * v[k])) };
+        let sweep = TAU * 0.8;
+        let steps = 24;
+        for s in 0..steps {
+            let (a0, a1) = (sweep * s as f64 / steps as f64, sweep * (s + 1) as f64 / steps as f64);
+            sc.line(at(point(a0)), at(point(a1)), c, 2.0, true);
+        }
+        let (head, back) = (point(sweep), point(sweep - 0.35));
+        let outward: [f64; 3] = std::array::from_fn(|k| back[k] + (head[k] - top[k]) * 0.25);
+        sc.line(at(head), at(back), c, 2.0, true);
+        sc.line(at(head), at(outward), c, 2.0, true);
     }
 }
 
@@ -954,13 +1275,15 @@ mod tests {
     }
 
     #[test]
-    fn the_timeline_keeps_half_the_row_and_the_optional_controls_go_first() {
-        // (inner, core, moves, speed) and the controls shown: all of them while the timeline keeps half.
-        assert_eq!(row_items(1000.0, 200.0, 100.0, 150.0), Some((true, true)), "room for all");
-        assert_eq!(row_items(1000.0, 300.0, 100.0, 150.0), Some((false, true)), "the move count goes first");
-        assert_eq!(row_items(1000.0, 400.0, 100.0, 150.0), Some((false, false)), "then the speed control");
-        assert_eq!(row_items(1000.0, 500.0, 100.0, 150.0), Some((false, false)), "exactly half still fits");
-        assert_eq!(row_items(1000.0, 600.0, 100.0, 150.0), None, "the core alone leaves less than half: hidden");
+    fn the_operation_buttons_jump_to_the_starts_of_the_operations() {
+        let sections = |v: &[(f64, f64)]| v.iter().enumerate().map(|(k, (a, b))| (format!("Op{k}"), *a, *b, k * 10)).collect::<Vec<_>>();
+        let s = sections(&[(0.0, 10.0), (10.0, 30.0), (30.0, 60.0)]);
+        assert_eq!(operation_jump(&s, 15.0, 60.0, true), 30.0, "next: the start of the next operation");
+        assert_eq!(operation_jump(&s, 45.0, 60.0, true), 60.0, "next after the last: the end of the program");
+        assert_eq!(operation_jump(&s, 15.0, 60.0, false), 10.0, "previous from inside an operation: its own start");
+        assert_eq!(operation_jump(&s, 10.5, 60.0, false), 0.0, "previous from the first second of one: the one before");
+        assert_eq!(operation_jump(&s, 0.5, 60.0, false), 0.0, "previous at the very start stays at the start");
+        assert_eq!(operation_jump(&[], 5.0, 60.0, true), 60.0, "no operations: next is the end");
     }
 
     #[test]

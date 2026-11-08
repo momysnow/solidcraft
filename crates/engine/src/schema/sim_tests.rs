@@ -7,7 +7,10 @@ use crate::schema::{ParamCheck, input_schema_for, output_schema_for};
 
 #[test]
 fn schemas_and_the_key_check_agree() {
-    assert_keys(input_schema_for::<SetupParams>(), &["gcode", "initial_tool", "memory_mb", "rapid_mm_min", "resolution", "stock", "tools"]);
+    assert_keys(
+        input_schema_for::<SetupParams>(),
+        &["gcode", "initial_tool", "memory_mb", "rapid_mm_min", "resolution", "sections", "stock", "tools"],
+    );
     assert_keys(input_schema_for::<RunParams>(), &["budget_s", "time", "to"]);
     assert_keys(input_schema_for::<StatusParams>(), &["limit", "offset"]);
     assert_keys(input_schema_for::<ClearParams>(), &[]);

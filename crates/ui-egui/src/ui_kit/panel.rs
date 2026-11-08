@@ -926,6 +926,7 @@ pub struct Window<'a> {
     page_padding: egui::Margin,
     page_chrome: bool,
     left_slot: bool,
+    max_body: Option<f32>,
 }
 
 impl<'a> Window<'a> {
@@ -950,6 +951,7 @@ impl<'a> Window<'a> {
             page_padding: egui::Margin::same(Tokens::get().space_16 as i8),
             page_chrome: false,
             left_slot: false,
+            max_body: None,
         }
     }
 
@@ -998,6 +1000,15 @@ impl<'a> Window<'a> {
     pub fn cards(mut self, cards: f32) -> Self {
         if cards.is_finite() && cards > 0.0 {
             self.width = Tokens::get().form_card_width * cards.min(16.0);
+        }
+        self
+    }
+
+    /// The most height, in points, the body may take: for a card that must stop above something that
+    /// stays on screen, such as a bar along the bottom of the window.
+    pub(crate) fn max_body(mut self, height: f32) -> Self {
+        if height.is_finite() {
+            self.max_body = Some(height.max(0.0));
         }
         self
     }
@@ -1060,6 +1071,7 @@ impl<'a> Window<'a> {
                 if self.body_padding {
                     let height =
                         (dimension(ui.ctx().content_rect().height()) - t.form_header_height - t.form_footer_height - t.space_24 * 2.0).max(0.0);
+                    let height = self.max_body.map_or(height, |most| height.min(most));
                     // Offer the body all the room the screen leaves, not just the height the card
                     // had last frame: a card first laid out on a tiny page (a browser canvas not
                     // sized yet) would otherwise keep a body of no height, its buttons hidden (#9472).

@@ -596,6 +596,7 @@ pub(crate) fn scene_key(app: &SolveApp) -> u64 {
     crate::manufacture_toolpaths::key(app).hash(&mut h);
     // Whether the simulation hides the bodies: the stock itself is only in the model scene's key.
     crate::sim_stock::hides_bodies(app).hash(&mut h);
+    crate::sim_stock::model_opacity(app).to_bits().hash(&mut h);
     app.session.active_component.hash(&mut h);
     app.session.active_occurrence_path.hash(&mut h);
     app.preview.effective_replaced().hash(&mut h);
@@ -1013,7 +1014,7 @@ fn resolve_appearance(app: &SolveApp, b: &solidcraft_engine::doc::ModelBody) -> 
     ResolvedAppearance {
         component: solidcraft_engine::view::component_color(s, b.component).map(|[r, g, b]| Color32::from_rgb(r, g, b)),
         body: body_color(&s.doc, b),
-        opacity: s.doc.model_body_opacity(b),
+        opacity: s.doc.model_body_opacity(b) * f64::from(crate::sim_stock::model_opacity(app)),
         face_looks: if s.colored_components.is_none() { s.doc.face_colors(b).into_iter().collect() } else { Default::default() },
     }
 }

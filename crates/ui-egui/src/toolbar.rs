@@ -1152,7 +1152,7 @@ fn ribbon_galley(ui: &egui::Ui, at: egui::Pos2, galley: std::sync::Arc<egui::Gal
 /// tab style; SHEET METAL is an ordinary tab otherwise. WELDMENTS selects itself on a frame member
 /// but keeps the ordinary tab look, as MODEL has when selected.
 pub(crate) fn contextual_tab(app: &SolveApp, tab: &str) -> bool {
-    tab == "SKETCH" || (tab == "SHEET METAL" && crate::workspace::sheet_body(app).is_some())
+    tab == "SKETCH" || tab == crate::manufacture_workspace::SIMULATION_TAB || (tab == "SHEET METAL" && crate::workspace::sheet_body(app).is_some())
 }
 
 /// How one ribbon tab is painted: its fill, its label colour and an outline

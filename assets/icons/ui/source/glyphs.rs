@@ -3,11 +3,17 @@ use crate::titlebar::Caption;
 use egui::{Color32, Pos2, Rect, Stroke, Ui, pos2, vec2};
 
 pub(crate) fn transport_glyph(p: &egui::Painter, c: egui::Pos2, what: &str, col: Color32) {
+    transport_glyph_scaled(p, c, what, col, 1.0);
+}
+
+/// `transport_glyph` drawn `k` times its size, for the simulation's larger buttons.
+pub(crate) fn transport_glyph_scaled(p: &egui::Painter, c: egui::Pos2, what: &str, col: Color32, k: f32) {
+    let at = |x: f32, y: f32| pos2(c.x + x * k, c.y + y * k);
     let tri = |dir: f32, dx: f32| {
-        let pts = vec![pos2(c.x + dx - 4.0 * dir, c.y - 5.0), pos2(c.x + dx + 4.0 * dir, c.y), pos2(c.x + dx - 4.0 * dir, c.y + 5.0)];
+        let pts = vec![at(dx - 4.0 * dir, -5.0), at(dx + 4.0 * dir, 0.0), at(dx - 4.0 * dir, 5.0)];
         p.add(egui::Shape::convex_polygon(pts, col, Stroke::NONE));
     };
-    let bar = |dx: f32| p.line_segment([pos2(c.x + dx, c.y - 5.0), pos2(c.x + dx, c.y + 5.0)], Stroke::new(1.6, col));
+    let bar = |dx: f32| p.line_segment([at(dx, -5.0), at(dx, 5.0)], Stroke::new(1.6 * k, col));
     match what {
         "first" => {
             bar(-5.0);
@@ -15,15 +21,33 @@ pub(crate) fn transport_glyph(p: &egui::Painter, c: egui::Pos2, what: &str, col:
         }
         "back" => tri(-1.0, 0.0),
         "forward" => tri(1.0, 0.0),
+        // The simulation's steps, one move: the arrow stops at a bar on its far side.
+        "step_back" => {
+            tri(-1.0, -2.0);
+            bar(5.0);
+        }
+        "step_forward" => {
+            bar(-5.0);
+            tri(1.0, 2.0);
+        }
+        // The simulation's previous and next operation: the arrow from a dot, the operation's start.
+        "prev_op" => {
+            p.circle_filled(at(-5.0, 0.0), 2.5 * k, col);
+            tri(-1.0, 3.0);
+        }
+        "next_op" => {
+            tri(1.0, -3.0);
+            p.circle_filled(at(5.0, 0.0), 2.5 * k, col);
+        }
         // Play History: larger than the step arrows so it doesn't read as Forward, and two bars
         // while it plays.
         "play" => {
-            let pts = vec![pos2(c.x - 4.5, c.y - 7.0), pos2(c.x + 6.5, c.y), pos2(c.x - 4.5, c.y + 7.0)];
+            let pts = vec![at(-4.5, -7.0), at(6.5, 0.0), at(-4.5, 7.0)];
             p.add(egui::Shape::convex_polygon(pts, col, Stroke::NONE));
         }
         "pause" => {
             for dx in [-3.0, 3.0] {
-                p.rect_filled(Rect::from_center_size(pos2(c.x + dx, c.y), vec2(3.0, 12.0)), 0.5, col);
+                p.rect_filled(Rect::from_center_size(at(dx, 0.0), vec2(3.0 * k, 12.0 * k)), 0.5 * k, col);
             }
         }
         _ => {

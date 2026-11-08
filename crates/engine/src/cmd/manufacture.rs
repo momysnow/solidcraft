@@ -18,6 +18,25 @@ const fn chrome(id: &'static str, label: &'static str, panel: &'static str, icon
     CommandSpec::new(id, label, opened).icon(icon).noundo().doc_only().at("MANUFACTURE", panel).params(params)
 }
 
+/// The operations of a posted program: the post writes one comment per operation, `name: T<n> D<d> kind`,
+/// in its comment style. Each such line starts a section at its 1-based line. A post with comments off
+/// gives none, and the simulation then shows one section.
+fn sections_of(gcode: &str) -> Vec<Value> {
+    gcode
+        .lines()
+        .enumerate()
+        .filter_map(|(i, line)| {
+            let text = line.trim().trim_start_matches(|c| c == '(' || c == ';').trim_end_matches(')').trim();
+            let (name, rest) = text.rsplit_once(": T")?;
+            let mut parts = rest.split_whitespace();
+            let tool = parts.next()?;
+            let diameter = parts.next()?;
+            (!name.is_empty() && !tool.is_empty() && tool.bytes().all(|b| b.is_ascii_digit()) && diameter.starts_with('D'))
+                .then(|| json!({"name": name, "line": i + 1}))
+        })
+        .collect()
+}
+
 /// Posts a setup in memory and sets its G-code up for the simulation: the setup's stock box and its
 /// flat end mills, the box in the setup's work frame like the G-code. A 0.25 mm ray spacing is tried
 /// first, then coarser up to 2 mm, so a large stock still fits the memory cap. Replies sim.setup's reply
@@ -49,9 +68,11 @@ fn simulate(s: &mut Session, p: &Value) -> Result<Value> {
         .filter(|t| t.kind == ToolKind::FlatEndmill)
         .map(|t| json!({"id": t.number, "diameter": t.diameter, "flute_length": t.flute_length}))
         .collect();
+    let sections = sections_of(&gcode);
     let mut last = None;
     for resolution in [0.25, 0.5, 1.0, 2.0] {
-        let params = json!({"stock": {"box": {"min": min, "max": max}}, "tools": tools, "gcode": gcode, "resolution": resolution});
+        let params =
+            json!({"stock": {"box": {"min": min, "max": max}}, "tools": tools, "gcode": gcode, "resolution": resolution, "sections": sections});
         let reply = s.execute("sim.setup", &params);
         let done = reply.is_ok();
         last = Some(reply);
@@ -148,6 +169,8 @@ pub static COMMANDS: &[CommandSpec] = &[
     chrome("manufacture.post.process", "Post", "POST", "export", "Opens Post Process on the active Manufacture setup."),
     chrome("manufacture.post.time", "Cycle Time", "POST", "params", "Opens Machining Time on the active Manufacture setup."),
     chrome("manufacture.post.sheet", "Setup Sheet", "POST", "list", "Opens a Setup Sheet for the active Manufacture setup."),
+    chrome("manufacture.sim.options", "View Options", "VIEW", "eye", "Opens the simulation's view options: tool, toolpath, stock and view settings."),
+    chrome("manufacture.sim.exit", "Exit Simulation", "EXIT", "check", "Ends the simulation and returns to the Manufacture tabs. The stock is dropped; nothing is written to the design."),
     CommandSpec::new("manufacture.post.simulate", "Simulate", simulate)
         .icon("camera")
         .noundo()
@@ -160,6 +183,29 @@ pub static COMMANDS: &[CommandSpec] = &[
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn sections_come_from_the_operation_comments_of_the_post() {
+        let g = "(Program)
+G21
+(Face1: T3 D63 Face mill)
+G0 X0
+; Pocket A: T1 D6 Flat end mill
+G1 X5
+(not an op: just text)
+";
+        let got: Vec<_> = sections_of(g).iter().map(|v| (v["name"].as_str().unwrap_or("").to_string(), v["line"].as_u64().unwrap_or(0))).collect();
+        assert_eq!(got, [("Face1".to_string(), 3), ("Pocket A".to_string(), 5)]);
+        assert!(
+            sections_of(
+                "G21
+G0 X0
+"
+            )
+            .is_empty(),
+            "no comments, no sections"
+        );
+    }
 
     #[test]
     fn setup_new_is_display_only() {
@@ -193,6 +239,9 @@ mod tests {
         assert_eq!(reply["setup"], "Top");
         assert!(s.sim_stock().is_some(), "the posted setup has a stock to cut");
         assert!(s.sim_program().is_some_and(|p| !p.moves.is_empty()), "the posted G-code is the program");
+        let status = s.execute("sim.status", &json!({})).unwrap_or_else(|e| panic!("{e}"));
+        let names: Vec<_> = status["sections"].as_array().map(|a| a.iter().filter_map(|x| x["name"].as_str()).collect()).unwrap_or_default();
+        assert_eq!(names, ["Outside"], "one section per operation of the setup: {status}");
         assert!(s.execute("manufacture.post.simulate", &json!({"setup": "Nope"})).is_err());
         assert!(s.execute("manufacture.post.simulate", &json!({})).is_err());
     }

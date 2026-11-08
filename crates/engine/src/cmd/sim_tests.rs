@@ -688,3 +688,54 @@ fn sim_full_run_timing() {
         setup["moves"], setup["h"], setup_time, run_time, run["removed_volume"]
     );
 }
+
+#[test]
+fn sections_split_the_program_into_operations_on_the_machine_clock() {
+    // Lines: 1 T0 M6, 2 units, 3 rapid, 4 plunge, 5 cut, 6 retract, 7 and 8 cuts.
+    let gcode = "T0 M6
+G21 G90
+G0 X0 Y0 Z5
+G1 Z-1 F600
+G1 X10 F600
+G0 Z5
+G1 X20 F600
+G1 X30 F600";
+    let mut params = setup_params(gcode);
+    params["sections"] = json!([{"name": "First", "line": 4}, {"name": "Second", "line": 7}]);
+    let mut s = Session::default();
+    call(&mut s, "sim.setup", &params);
+    let status = call(&mut s, "sim.status", &json!({}));
+    let sections = status["sections"].as_array().cloned().unwrap_or_default();
+    assert_eq!(sections.len(), 2, "{status}");
+    assert_eq!((sections[0]["name"].as_str(), sections[1]["name"].as_str()), (Some("First"), Some("Second")));
+    assert_eq!(sections[0]["first_move"], 1, "move 1 is the first one on line 4 or later: {status}");
+    assert_eq!(sections[1]["first_move"], 4, "move 4 is on line 7: {status}");
+    assert_eq!(sections[0]["end_time"], sections[1]["start_time"], "a section ends where the next starts");
+    assert_eq!(sections[1]["end_time"], status["total_time"], "the last section ends with the program");
+    let (a, b) = (sections[0]["start_time"].as_f64().unwrap_or(f64::NAN), sections[1]["start_time"].as_f64().unwrap_or(f64::NAN));
+    assert!(a < b && b < status["total_time"].as_f64().unwrap_or(f64::NAN), "{status}");
+}
+
+#[test]
+fn a_program_without_sections_is_one_section_and_computed_time_follows_the_playhead() {
+    let mut s = set_up(SLOT);
+    let status = call(&mut s, "sim.status", &json!({}));
+    let sections = status["sections"].as_array().cloned().unwrap_or_default();
+    assert_eq!(sections.len(), 1, "{status}");
+    assert_eq!((sections[0]["name"].as_str(), sections[0]["start_time"].as_f64()), (Some("Program"), Some(0.0)));
+    assert_eq!(sections[0]["end_time"], status["total_time"]);
+    let total = status["total_time"].as_f64().unwrap_or(f64::NAN);
+    call(&mut s, "sim.run", &json!({"time": total * 0.5}));
+    let status = call(&mut s, "sim.status", &json!({}));
+    let (time, computed) = (status["time"].as_f64().unwrap_or(f64::NAN), status["computed_time"].as_f64().unwrap_or(f64::NAN));
+    assert!(computed >= time && computed <= total, "computed {computed} must lie between the playhead {time} and the end {total}");
+}
+
+#[test]
+fn bad_sections_are_refused_not_panicked() {
+    let mut params = setup_params(SLOT);
+    params["sections"] = json!([{"name": "Zero", "line": 0}]);
+    assert!(Session::default().execute("sim.setup", &params).is_err(), "line counts from 1");
+    params["sections"] = json!([{"name": "Extra", "line": 1, "colour": "red"}]);
+    assert!(Session::default().execute("sim.setup", &params).is_err(), "unknown keys are refused");
+}

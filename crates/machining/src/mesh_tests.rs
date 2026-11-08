@@ -368,6 +368,30 @@ fn a_display_lod_mesh_has_far_fewer_triangles_than_the_full_surface() {
     }
 }
 
+#[test]
+fn each_triangle_keeps_the_tag_of_the_move_that_cut_it() {
+    // The slot is tag 1; a pocket at the other corner is tag 2. The top face is the stock's own, tag 0.
+    let mut s = slot_stock(0.5);
+    let tool = FlatTool::new(2.5, 20.0, Vec3::Z).expect("tool");
+    s.apply(&LinearFixedAxis { from: Vec3::new(5.0, 5.0, -3.0), to: Vec3::new(5.0, 5.0, -3.0), tool }, 2).expect("cut");
+    for step in [1, 2] {
+        let meshes: Vec<Mesh> = if step == 1 { chunk_meshes(&s) } else { (0..2).flat_map(|k| super::chunk_mesh_lod(&s, [k, 0, 0], step)).collect() };
+        let mut seen = std::collections::BTreeSet::new();
+        for m in &meshes {
+            assert_eq!(m.tri_face.len(), m.triangles.len(), "step {step}: one tag per triangle");
+            for (t, &tag) in m.triangles.iter().zip(&m.tri_face) {
+                let c = t.iter().fold(Vec3::ZERO, |a, &i| a + m.positions[i as usize]) * (1.0 / 3.0);
+                // Well inside the slot's floor, away from its walls and ends.
+                if (-4.5..-3.5).contains(&c.z) && (10.0..20.0).contains(&c.x) && (14.0..16.0).contains(&c.y) {
+                    assert_eq!(tag, 1, "step {step}: the slot's floor at {c:?}");
+                }
+                seen.insert(tag);
+            }
+        }
+        assert_eq!(seen.into_iter().collect::<Vec<_>>(), vec![0, 1, 2], "step {step}: the box, the slot and the pocket");
+    }
+}
+
 /// The uncut box's faces, cut per display chunk, cover the box's whole surface at every step; a chunk
 /// its own mesh covers leaves its faces out.
 #[test]

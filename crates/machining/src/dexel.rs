@@ -472,18 +472,8 @@ impl Stock {
     pub(crate) fn edge_crossing(&self, axis: usize, lower: [i64; 3]) -> Option<Vec3> {
         let (u, v) = ((axis + 1) % 3, (axis + 2) % 3);
         let (nu, nv, na) = (*lower.get(u)?, *lower.get(v)?, *lower.get(axis)?);
-        if !(real(nu, self.n_of(u)) && real(nv, self.n_of(v))) {
-            return None;
-        }
         let (t0, t1) = (self.rel(axis, self.pos(axis, na)), self.rel(axis, self.pos(axis, na + 1)));
-        let mut best: Option<f64> = None;
-        for s in self.ray_segs(axis, nu as usize, nv as usize) {
-            for b in [f64::from(s.lo), f64::from(s.hi)] {
-                if b >= t0 && b <= t1 && best.is_none_or(|x| b < x) {
-                    best = Some(b);
-                }
-            }
-        }
+        let best = self.nearest_end(axis, lower)?.map(|(b, _)| b);
         let t = self.min[axis] + best.unwrap_or(0.5 * (t0 + t1));
         let mut p = [0.0f64; 3];
         if let Some(x) = p.get_mut(axis) {
@@ -496,6 +486,32 @@ impl Stock {
             *x = self.pos(v, nv);
         }
         Some(Vec3::from(p))
+    }
+
+    /// The tag of the ray end at the crossing of the edge from `lower` along `axis`: the move that made
+    /// that piece of surface plus one, 0 for the stock's own faces and for an edge with no ray end.
+    pub(crate) fn edge_crossing_tag(&self, axis: usize, lower: [i64; 3]) -> u32 {
+        self.nearest_end(axis, lower).flatten().map_or(0, |(_, tag)| tag)
+    }
+
+    /// The first ray end, with its tag, on the edge from `lower` along `axis` (relative to the stock's
+    /// minimum): `None` for an edge off the lattice, `Some(None)` for one whose ray has no end on it.
+    fn nearest_end(&self, axis: usize, lower: [i64; 3]) -> Option<Option<(f64, u32)>> {
+        let (u, v) = ((axis + 1) % 3, (axis + 2) % 3);
+        let (nu, nv, na) = (*lower.get(u)?, *lower.get(v)?, *lower.get(axis)?);
+        if !(real(nu, self.n_of(u)) && real(nv, self.n_of(v))) {
+            return None;
+        }
+        let (t0, t1) = (self.rel(axis, self.pos(axis, na)), self.rel(axis, self.pos(axis, na + 1)));
+        let mut best: Option<(f64, u32)> = None;
+        for s in self.ray_segs(axis, nu as usize, nv as usize) {
+            for (b, tag) in [(f64::from(s.lo), s.lo_tag), (f64::from(s.hi), s.hi_tag)] {
+                if b >= t0 && b <= t1 && best.is_none_or(|(x, _)| b < x) {
+                    best = Some((b, tag));
+                }
+            }
+        }
+        Some(best)
     }
 
     fn n_of(&self, k: usize) -> i64 {

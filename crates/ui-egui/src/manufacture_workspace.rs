@@ -52,8 +52,16 @@ pub struct State {
     pub toolpaths: crate::manufacture_toolpaths::Toolpaths,
 }
 
+/// The ribbon tab of a running simulation: it replaces the process tabs while the simulation shows.
+pub const SIMULATION_TAB: &str = "SIMULATION";
+
 pub fn is_tab(tab: &str) -> bool {
-    CamMode::from_tab(tab).is_some() || tab == "MANUFACTURE"
+    CamMode::from_tab(tab).is_some() || tab == "MANUFACTURE" || tab == SIMULATION_TAB
+}
+
+/// Selects the Simulation tab (Simulate does, when it starts a simulation).
+pub fn show_simulation_tab(app: &mut SolveApp) {
+    app.ui.tab = SIMULATION_TAB.into();
 }
 
 pub fn active(app: &SolveApp) -> bool {
@@ -68,6 +76,9 @@ pub fn show_tab(app: &mut SolveApp, tab: &str) {
 }
 
 pub fn sync_tab(app: &mut SolveApp) {
+    if app.ui.tab == SIMULATION_TAB && crate::sim_stock::simulating(app) {
+        return;
+    }
     if let Some(mode) = CamMode::from_tab(&app.ui.tab) {
         app.manufacture_workspace.cam_mode = mode;
         return;
@@ -139,6 +150,14 @@ pub fn start_hook(app: &mut SolveApp, id: &str) -> bool {
             crate::sim_stock::simulate_active(app);
             false
         }
+        "manufacture.sim.options" => {
+            app.sim_stock.view.open = !app.sim_stock.view.open;
+            false
+        }
+        "manufacture.sim.exit" => {
+            crate::sim_stock::exit_simulation(app);
+            false
+        }
         id if id.starts_with("manufacture.") => {
             enter(app);
             if let Some(tab) = tab_for_command(id) {
@@ -173,6 +192,7 @@ pub fn tick(app: &mut SolveApp, ctx: &egui::Context) {
 
 pub fn panel(app: &mut SolveApp, ui: &mut egui::Ui) {
     crate::manufacture_setup::show_dialogs(app, ui);
+    crate::sim_view::window(app, ui);
 }
 
 pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
@@ -493,6 +513,8 @@ G0 Z5", "resolution": 0.5});
         let mut h = Harness::new();
         // The stock is drawn in Manufacture only.
         h.app.manufacture_workspace.active = true;
+        // The toolpath's lines change with the cursor by design; this test is about the stock's blocks.
+        h.app.sim_stock.view.path = false;
         let gcode = "T0 M6\nG21 G90\nG0 X10 Y10 Z5\nG1 Z-2 F100\nG1 X40 F300\nG0 Z5\nG0 X180 Y90\nG1 Z-2 F100\nG1 X190 F300\nG0 Z5";
         h.app
             .session
@@ -750,10 +772,43 @@ G0 Z5", "resolution": 0.5});
     /// Moving the tool within an air move redraws the model scene but keeps every stock block, bytes and
     /// all, and the uncut box's: only the tool's triangles are built again.
     #[test]
+    fn the_view_options_change_what_the_scene_draws() {
+        use crate::sim_stock::settle;
+        let mut h = Harness::new();
+        h.app.manufacture_workspace.active = true;
+        sim_setup(&mut h, CUTTING);
+        settle(&mut h.app);
+        h.app.session.execute("sim.run", &json!({"to": 4})).unwrap_or_else(|e| panic!("{e}"));
+        settle(&mut h.app);
+        let count = |h: &Harness| crate::viewport::build_scene(&h.app).blocks.len();
+        let all = count(&h);
+        let keys = |h: &Harness| crate::viewport::build_scene(&h.app).blocks.iter().map(|b| b.key).collect::<Vec<_>>();
+        let (model, plain) = (crate::sim_stock::model_key(&h.app), keys(&h));
+        h.app.sim_stock.view.colouring = crate::sim_view::Colouring::Operation;
+        assert_ne!(crate::sim_stock::model_key(&h.app), model, "a colouring redraws the scene");
+        assert_ne!(keys(&h), plain, "the cut is built again in the operations' colours");
+        h.app.sim_stock.view.colouring = crate::sim_view::Colouring::Material;
+        assert!(!crate::sim_stock::drawn_tool(&h.app).is_empty(), "the tool shows by default");
+        h.app.sim_stock.view.tool = false;
+        assert!(crate::sim_stock::drawn_tool(&h.app).is_empty(), "the tool can be hidden");
+        h.app.sim_stock.view.tool = true;
+        h.app.sim_stock.view.tool_part = crate::sim_view::ToolPart::Cutting;
+        let cutting = crate::sim_stock::drawn_tool(&h.app).len();
+        h.app.sim_stock.view.tool_part = crate::sim_view::ToolPart::Holder;
+        assert!(crate::sim_stock::drawn_tool(&h.app).len() > cutting, "the holder adds to the cutting part");
+        h.app.sim_stock.view.stock = false;
+        let path_only = count(&h);
+        assert!(path_only < all, "hiding the stock drops its blocks: {path_only} < {all}");
+        h.app.sim_stock.view.path = false;
+        assert!(count(&h) < path_only, "hiding the path drops its blocks too");
+    }
+
+    #[test]
     fn a_tool_move_keeps_the_stock_and_box_blocks() {
         use crate::sim_stock::settle;
         let mut h = Harness::new();
         h.app.manufacture_workspace.active = true;
+        h.app.sim_stock.view.path = false;
         sim_setup(&mut h, CUTTING);
         settle(&mut h.app);
         // Move 4 (G0 X180 Y90) runs at Z 5, above the stock: the playhead moves along it, nothing is cut.

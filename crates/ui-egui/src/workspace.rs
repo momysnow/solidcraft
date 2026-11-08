@@ -400,6 +400,9 @@ pub const SECTIONS: &[Section] = &[
     Section { tab: "MILLING", panel: "MODIFY", promoted: 4, ids: MFG_MODIFY },
     Section { tab: "MILLING", panel: "POST", promoted: 4, ids: MFG_POST },
     Section { tab: "MILLING", panel: "SELECT", promoted: 0, ids: &[] },
+    // While a simulation runs, the process tabs give way to this one (a contextual tab).
+    Section { tab: "SIMULATION", panel: "VIEW", promoted: 1, ids: &["manufacture.sim.options"] },
+    Section { tab: "SIMULATION", panel: "EXIT", promoted: 1, ids: &["manufacture.sim.exit"] },
     Section { tab: "TURNING", panel: "SETUP", promoted: 1, ids: MFG_SETUP },
     Section { tab: "TURNING", panel: "MANAGE", promoted: 4, ids: MFG_MANAGE },
     Section { tab: "TURNING", panel: "TURNING", promoted: 4, ids: MFG_TURNING },
@@ -579,6 +582,7 @@ pub const RIBBON_LABELS: &[(&str, &str)] = &[
     ("manufacture.post.simulate", "Simulate"),
     ("manufacture.post.time", "Cycle Time"),
     ("manufacture.setup.new", "New Setup"),
+    ("manufacture.sim.exit", "Exit"),
     ("manufacture.tools.library", "Tool Library"),
     ("manufacture.turning.chamfer", "Chamfer"),
     ("manufacture.turning.face", "Face"),
@@ -828,6 +832,9 @@ pub fn visible_tabs(app: &crate::SolveApp) -> Vec<&'static str> {
         return Vec::new();
     }
     if crate::manufacture_workspace::active(app) {
+        if crate::sim_stock::simulating(app) {
+            return vec![crate::manufacture_workspace::SIMULATION_TAB];
+        }
         return crate::manufacture_workspace::TABS.to_vec();
     }
     let mut tabs: Vec<_> = TABS.iter().copied().filter(|tab| tab_turned_on(app, tab)).collect();

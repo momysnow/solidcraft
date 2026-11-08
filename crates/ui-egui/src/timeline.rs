@@ -670,14 +670,22 @@ pub fn timeline(app: &mut SolveApp, ui: &mut egui::Ui) {
         let mut child = ui.new_child(UiBuilder::new().id_salt("sc_timeline").max_rect(rect));
         Container::paint_frame(ui.painter(), Container::new(ui.ctx(), Surface::Panel).frame(ui.ctx(), t.timeline, crate::frame::Side::Left), rect);
         child.set_clip_rect(rect);
-        timeline_contents(app, &mut child, true);
+        if crate::sim_stock::simulating(app) {
+            crate::sim_stock::bottom_bar(app, &mut child);
+        } else {
+            timeline_contents(app, &mut child, true);
+        }
     } else {
         let response = Container::new(ui.ctx(), Surface::Panel)
             .edge("sc_timeline", Edge::Bottom)
             .exact_size(40.0)
             .frame(Container::new(ui.ctx(), Surface::Panel).edge_frame(t.timeline))
             .show(ui, |ui| {
-                timeline_contents(app, ui, false);
+                if crate::sim_stock::simulating(app) {
+                    crate::sim_stock::bottom_bar(app, ui);
+                } else {
+                    timeline_contents(app, ui, false);
+                }
             });
         let frame = Container::new(ui.ctx(), Surface::Panel).edge_frame(t.timeline);
         Container::paint_inset(ui.painter(), response.response.rect - frame.outer_margin, frame);

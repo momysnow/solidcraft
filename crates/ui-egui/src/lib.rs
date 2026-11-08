@@ -242,7 +242,9 @@ pub mod shell;
 #[cfg(test)]
 mod shell_face_sketch_ui_tests;
 pub mod shortcut_box;
+pub mod sim_path;
 pub mod sim_stock;
+pub mod sim_view;
 pub mod sketch3d;
 #[cfg(test)]
 mod sketch3d_frame_ui_tests;
@@ -2943,8 +2945,10 @@ impl SolveApp {
         let floating = render_workspace::active(self) || ui_kit::Container::new(ui.ctx(), ui_kit::Surface::Panel).floating();
         timeline::follow_view_pick(self);
         render_ui::focus_shortcut(self, ui);
-        let show_timeline = self.ui.show_timeline && !render_workspace::active(self) && !self.preferences.history_in_browser;
-        let left_timeline = show_timeline && self.preferences.timeline_left;
+        // A simulation takes the history bar's slot along the bottom of the window for its own bar.
+        let simulating = sim_stock::simulating(self);
+        let show_timeline = (self.ui.show_timeline && !self.preferences.history_in_browser || simulating) && !render_workspace::active(self);
+        let left_timeline = show_timeline && self.preferences.timeline_left && !simulating;
         timeline_left::animate_folds(self, ui.ctx());
         if !floating && !self.embedded {
             toolbar::toolbar(self, ui);

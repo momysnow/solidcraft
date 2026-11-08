@@ -732,6 +732,8 @@ pub(crate) struct Slider {
     pub show_value: bool,
     pub integer: bool,
     pub workspace_accent: bool,
+    /// Drawn straight on the 3D view: no body-coloured backing behind the track.
+    pub on_view: bool,
 }
 
 /// Bounded read-only code box for diagnostic payloads. Native selection and copying
@@ -750,7 +752,7 @@ pub(crate) fn read_only_text(ui: &mut Ui, text: &str) -> Response {
 
 impl Default for Slider {
     fn default() -> Self {
-        Self { step: None, format: |v| format!("{v:.2}"), show_value: true, integer: false, workspace_accent: false }
+        Self { step: None, format: |v| format!("{v:.2}"), show_value: true, integer: false, workspace_accent: false, on_view: false }
     }
 }
 
@@ -781,6 +783,17 @@ pub(crate) fn slider<T: egui::emath::Numeric>(ui: &mut Ui, value: &mut T, range:
             t.space_4
         };
         ui.spacing_mut().slider_width = dimension(ui.available_width() - reserved);
+        if options.on_view {
+            // With no backing to cover egui's own rail and handle, they are drawn invisible instead.
+            let w = &mut ui.visuals_mut().widgets;
+            for state in [&mut w.inactive, &mut w.hovered, &mut w.active] {
+                state.bg_fill = egui::Color32::TRANSPARENT;
+                state.weak_bg_fill = egui::Color32::TRANSPARENT;
+                state.fg_stroke = egui::Stroke::NONE;
+                state.bg_stroke = egui::Stroke::NONE;
+            }
+            ui.visuals_mut().selection.bg_fill = egui::Color32::TRANSPARENT;
+        }
         let mut widget = egui::Slider::new(value, range).show_value(options.show_value).handle_shape(egui::style::HandleShape::Circle);
         if options.show_value {
             widget = widget.custom_formatter(move |v, _| (options.format)(v));
@@ -800,7 +813,7 @@ pub(crate) fn slider<T: egui::emath::Numeric>(ui: &mut Ui, value: &mut T, range:
         }
         let slider = egui::Rect::from_min_size(response.rect.min, vec2(ui.spacing().slider_width, response.rect.height()));
         let mut background = ui.painter().clone();
-        background.set_opacity(if ui.is_visible() { 1.0 } else { 0.0 });
+        background.set_opacity(if ui.is_visible() && !options.on_view { 1.0 } else { 0.0 });
         // At the top of the range egui's own handle reaches `slider.right()` exactly, and a fill
         // that stops there leaves its last column showing beside the editor (#5708). The gap
         // before the editor is `item_spacing.x`, so a pixel past the edge covers nothing else.

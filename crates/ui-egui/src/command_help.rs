@@ -146,6 +146,8 @@ pub const DOCUMENTED: &[&str] = &[
     "manufacture.post.simulate",
     "manufacture.post.time",
     "manufacture.setup.new",
+    "manufacture.sim.exit",
+    "manufacture.sim.options",
     "manufacture.tools.library",
     "manufacture.turning.chamfer",
     "manufacture.turning.face",

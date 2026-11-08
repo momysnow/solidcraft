@@ -18,8 +18,8 @@ use web_time::Instant;
 use super::CommandSpec;
 use crate::params::bad;
 use crate::schema::sim::{
-    BoundsReply, ClearParams, ClearReply, DiagReply, MemoryReply, MoveTarget, PartialReply, RunParams, RunReply, SetupParams, SetupReply, ShapeName,
-    StatusParams, StatusReply, ToolParams, ToolPoseReply,
+    BoundsReply, ClearParams, ClearReply, DiagReply, MemoryReply, MoveTarget, PartialReply, RunParams, RunReply, SectionParams, SectionReply,
+    SetupParams, SetupReply, ShapeName, StatusParams, StatusReply, ToolParams, ToolPoseReply,
 };
 use crate::schema::{TypedContract, output_schema_for};
 use crate::sim_jobs::{Job, Setup};
@@ -53,7 +53,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .output(output_schema_for::<SetupReply>)
         .noundo()
         .doc_only()
-        .params("stock: {box: {min: [x,y,z], max: [x,y,z]}}, mm in the workpiece frame; tools: [{id, diameter, flute_length, shape?: flat|ball|bull|cone|taper|profile, plus the fields that shape needs}], mm; gcode: text for a generic 3-axis machine; initial_tool?: the tool the moves before the first M6 cut with; resolution?: ray spacing h in mm (default: the finest of 0.05 to 20 mm whose stock fits half of memory_mb); memory_mb?: cap from 1 to 1024 (default 512); rapid_mm_min?: rapid feed in mm/min, above 0 (default 5000), used for rapids and for moves with no feed. Parses the G-code, builds the stock uncut and resets the cursor and the playhead to 0, replacing any earlier simulation. Each move takes its path length over its feed; an arc takes its own arc length. A move with no tool, or a tool not listed, is a diagnostic. Replies moves, bounds, h, memory_estimate {bytes, budget}, diag_count and diagnostics [{line, col, severity, msg}] (the first 200). Bad or too large input is refused and nothing changes. Nothing is cut yet: see sim.run."),
+        .params("stock: {box: {min: [x,y,z], max: [x,y,z]}}, mm in the workpiece frame; tools: [{id, diameter, flute_length, shape?: flat|ball|bull|cone|taper|profile, plus the fields that shape needs}], mm; gcode: text for a generic 3-axis machine; initial_tool?: the tool the moves before the first M6 cut with; resolution?: ray spacing h in mm (default: the finest of 0.05 to 20 mm whose stock fits half of memory_mb); memory_mb?: cap from 1 to 1024 (default 512); rapid_mm_min?: rapid feed in mm/min, above 0 (default 5000), used for rapids and for moves with no feed; sections?: [{name, line}], the operations in order with the 1-based G-code line each starts at (at most 10000; sim.status reports where each runs). Parses the G-code, builds the stock uncut and resets the cursor and the playhead to 0, replacing any earlier simulation. Each move takes its path length over its feed; an arc takes its own arc length. A move with no tool, or a tool not listed, is a diagnostic. Replies moves, bounds, h, memory_estimate {bytes, budget}, diag_count and diagnostics [{line, col, severity, msg}] (the first 200). Bad or too large input is refused and nothing changes. Nothing is cut yet: see sim.run."),
     CommandSpec::new("sim.run", "Run Simulation", crate::checked!("sim.run", run))
         .contract(&RUN)
         .output(output_schema_for::<RunReply>)
@@ -65,7 +65,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .output(output_schema_for::<StatusReply>)
         .noundo()
         .doc_only()
-        .params("offset?: first diagnostic to list (default 0); limit?: most to list (default 100, at most 1000). Read only. Replies cursor, total, stock_volume, remaining_volume, removed_volume (mm^3), memory {bytes, budget}, diag_count, error (why the run stopped, or null), revision, partial, time and total_time (the playhead and the program's machine time, s), tool ({id, tip: [x,y,z], axis: [x,y,z]}: the tool at the playhead, its tip along the move it is on, or null without moves or when that move has no tool) and the page of diagnostics. Errors without sim.setup."),
+        .params("offset?: first diagnostic to list (default 0); limit?: most to list (default 100, at most 1000). Read only. Replies cursor, total, stock_volume, remaining_volume, removed_volume (mm^3), memory {bytes, budget}, diag_count, error (why the run stopped, or null), revision, partial, time and total_time (the playhead and the program's machine time, s), computed_time (s: the playhead, or later when a checkpoint exists ahead of it), sections ([{name, first_move, start_time, end_time}], one per operation, or one \"Program\" section when sim.setup gave none), tool ({id, tip: [x,y,z], axis: [x,y,z]}: the tool at the playhead, its tip along the move it is on, or null without moves or when that move has no tool) and the page of diagnostics. Errors without sim.setup."),
     CommandSpec::new("sim.clear", "Clear Simulation", crate::checked!("sim.clear", clear))
         .contract(&CLEAR)
         .output(output_schema_for::<ClearReply>)
@@ -239,7 +239,8 @@ fn setup(s: &mut Session, p: &Value) -> Result<Value> {
         Some(_) => return Err(bad(C, "rapid_mm_min must be a positive feed in mm/min")),
         None => DEFAULT_RAPID_MM_MIN,
     };
-    let setup = Setup { min, max, h, budget_bytes, rapid_mm_min, program };
+    let sections = sections_of(C, input.sections.as_deref().unwrap_or_default())?;
+    let setup = Setup { min, max, h, budget_bytes, rapid_mm_min, program, sections };
     let revision = crate::sim_jobs::next_revision();
     let job = Job::new(setup, revision).map_err(|e| sim_error(C, e))?;
     let (min, max) = job.bounds();
@@ -253,6 +254,26 @@ fn setup(s: &mut Session, p: &Value) -> Result<Value> {
     };
     s.sim.set(job);
     serde_json::to_value(reply).map_err(|e| bad(C, e.to_string()))
+}
+
+/// Most operations a program is split into, and the longest name kept.
+const MAX_SECTIONS: usize = 10_000;
+const MAX_SECTION_NAME: usize = 80;
+
+/// The sections as the job keeps them: names cut to length, in the order given.
+fn sections_of(cmd: &str, given: &[SectionParams]) -> Result<Vec<(String, u32)>> {
+    if given.len() > MAX_SECTIONS {
+        return Err(bad(cmd, format!("sections: at most {MAX_SECTIONS}")));
+    }
+    given
+        .iter()
+        .map(|s| {
+            if s.line == 0 {
+                return Err(bad(cmd, "sections: `line` counts from 1"));
+            }
+            Ok((s.name.chars().take(MAX_SECTION_NAME).collect(), s.line))
+        })
+        .collect()
 }
 
 fn run(s: &mut Session, p: &Value) -> Result<Value> {
@@ -322,6 +343,12 @@ fn status(s: &mut Session, p: &Value) -> Result<Value> {
         partial: partial_reply(job),
         time: job.playhead(),
         total_time: job.total_time(),
+        computed_time: job.computed_time(),
+        sections: job
+            .sections()
+            .into_iter()
+            .map(|x| SectionReply { name: x.name, first_move: count(x.first_move), start_time: x.start_time, end_time: x.end_time })
+            .collect(),
         tool: job.tool_pose().map(|(id, tip, axis)| ToolPoseReply { id, tip, axis }),
         diagnostics: job.diagnostics().skip(offset).take(limit).map(diag_reply).collect(),
     };

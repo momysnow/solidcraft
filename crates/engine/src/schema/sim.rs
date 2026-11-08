@@ -98,6 +98,32 @@ pub struct SetupParams {
     /// Rapid feed in mm/min, above 0 (default 5000). It times rapids and moves with no feed.
     #[serde(default)]
     pub rapid_mm_min: Option<f64>,
+    /// The operations of the program in order, each with the 1-based G-code line it starts at.
+    /// `sim.status` reports where each one runs on the machine clock. Without them the whole program
+    /// is one section.
+    #[serde(default)]
+    pub sections: Option<Vec<SectionParams>>,
+}
+
+/// One operation of the program: its name and the G-code line it starts at.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct SectionParams {
+    pub name: String,
+    pub line: u32,
+}
+
+/// Where one operation runs on the machine clock.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct SectionReply {
+    pub name: String,
+    /// The first move of the operation (0-based).
+    pub first_move: u64,
+    /// Machine time at which the operation starts, s.
+    pub start_time: f64,
+    /// Machine time at which it ends (where the next one starts), s.
+    pub end_time: f64,
 }
 
 /// A problem in the G-code or the simulation: `severity` is `error` or `warning`.
@@ -239,6 +265,11 @@ pub struct StatusReply {
     pub time: f64,
     /// The program's machine time, s.
     pub total_time: f64,
+    /// The machine time, s, up to which the stock can be shown without cutting from the start again: the
+    /// playhead, or later when a checkpoint exists ahead of it. Never below the playhead.
+    pub computed_time: f64,
+    /// The operations and where they run on the machine clock, in order (see `sim.setup`).
+    pub sections: Vec<SectionReply>,
     /// The tool at the playhead, or null without moves or when that move has no tool.
     pub tool: Option<ToolPoseReply>,
     /// The page of problems asked for.

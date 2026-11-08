@@ -44,6 +44,12 @@ pub trait Lattice {
     fn node_position(&self, _axis: usize, i: i64) -> f64 {
         i as f64
     }
+
+    /// The tag of the move that made the crossing of the edge from `lower` along `axis` (see `dexel`):
+    /// each surface quad keeps it as its triangles' `tri_face`. A lattice without tags keeps 0.
+    fn crossing_tag(&self, _axis: usize, _lower: [i64; 3]) -> u32 {
+        0
+    }
 }
 
 impl Lattice for Stock {
@@ -57,6 +63,10 @@ impl Lattice for Stock {
 
     fn crossing(&self, axis: usize, lower: [i64; 3]) -> Option<Vec3> {
         self.edge_crossing(axis, lower)
+    }
+
+    fn crossing_tag(&self, axis: usize, lower: [i64; 3]) -> u32 {
+        self.edge_crossing_tag(axis, lower)
     }
 
     fn node_position(&self, axis: usize, i: i64) -> f64 {
@@ -176,6 +186,23 @@ impl Lattice for Strided<'_> {
             0.5 * (a + b)
         };
         Some(Vec3::new(mid(0), mid(1), mid(2)))
+    }
+
+    fn crossing_tag(&self, axis: usize, lower: [i64; 3]) -> u32 {
+        let base = lower.map(|k| k * self.step);
+        // The fine edge `crossing` takes the point from.
+        (0..self.step)
+            .map(|i| {
+                let mut p = base;
+                p[axis] += i;
+                p
+            })
+            .find(|&p| {
+                let mut q = p;
+                q[axis] += 1;
+                Lattice::inside(self.stock, p) != Lattice::inside(self.stock, q)
+            })
+            .map_or(0, |p| Lattice::crossing_tag(self.stock, axis, p))
     }
 
     fn node_position(&self, axis: usize, i: i64) -> f64 {
@@ -487,6 +514,8 @@ struct Builder<'a, L: Lattice> {
     edges: HashMap<(usize, [i64; 3]), Option<(Vec3, Vec3)>>,
     positions: Vec<Vec3>,
     triangles: Vec<[u32; 3]>,
+    /// Per triangle, the tag of the crossing its quad stands on (see `Lattice::crossing_tag`).
+    tags: Vec<u32>,
 }
 
 impl<'a, L: Lattice> Builder<'a, L> {
@@ -496,7 +525,7 @@ impl<'a, L: Lattice> Builder<'a, L> {
     fn new(lat: &'a L, n: [i64; 3], first: [i64; 3]) -> Self {
         let origin = first.map(|f| f - 2);
         let nodes = NodeCache::build(lat, origin, [CHUNK + 4; 3]);
-        Builder { lat, n, nodes, cells: HashMap::new(), edges: HashMap::new(), positions: Vec::new(), triangles: Vec::new() }
+        Builder { lat, n, nodes, cells: HashMap::new(), edges: HashMap::new(), positions: Vec::new(), triangles: Vec::new(), tags: Vec::new() }
     }
 
     fn inside(&self, node: [i64; 3]) -> bool {
@@ -619,6 +648,8 @@ impl<'a, L: Lattice> Builder<'a, L> {
         let [v0, v1, v2, v3] = quad;
         let tris = if inside { [[v0, v1, v2], [v0, v2, v3]] } else { [[v0, v2, v1], [v0, v3, v2]] };
         self.triangles.extend(tris);
+        let tag = self.lat.crossing_tag(a, lower);
+        self.tags.extend([tag, tag]);
     }
 
     /// The vertex of edge `edge` of `cell`, computing the cell's vertices once.
@@ -725,8 +756,7 @@ impl<'a, L: Lattice> Builder<'a, L> {
         for nrm in &mut normals {
             *nrm = nrm.normalized().unwrap_or(Vec3::ZERO);
         }
-        let tri_face = vec![0u32; self.triangles.len()];
-        Mesh { positions: self.positions, normals, triangles: self.triangles, tri_face, ..Mesh::default() }
+        Mesh { positions: self.positions, normals, triangles: self.triangles, tri_face: self.tags, ..Mesh::default() }
     }
 }
 
