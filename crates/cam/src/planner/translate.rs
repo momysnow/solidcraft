@@ -107,6 +107,10 @@ pub(crate) fn append(ops: &Ops, cut: &Cut, moves: &mut Vec<Move>, pos: &mut Opti
                         // straight down at the plunge feed: the verifier allows no rapid below
                         // the retract plane.
                         if to.z >= cut.heights.top && to.z < at.z {
+                            if cut.heights.retract < at.z && cut.heights.retract > to.z {
+                                let down = Vec3::new(to.x, to.y, cut.heights.retract);
+                                moves.push(Move::Rapid { to: down });
+                            }
                             let low = Vec3::new(to.x, to.y, to.z);
                             moves.push(Move::Feed { to: low, feed: cut.feeds.plunge });
                             *pos = Some(low);

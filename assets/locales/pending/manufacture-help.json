@@ -122,7 +122,7 @@
     "help.manufacture.turning.thread": "ねじ切り旋削は、旋削工具で旋削部品にねじを加工します。旋盤で指定ピッチの外ねじや内ねじを作るときに使います。"
   },
   "zh": {
-    "help.manufacture.2d.adaptive": "自适应清根以稳定的刀具负载分层轻切削二维型腔。需要避免刀具全宽切削时用于粗加工。",
+    "help.manufacture.2d.adaptive": "自适应清除以稳定的刀具负载分层轻切削二维型腔。需要避免刀具全宽切削时用于粗加工。",
     "help.manufacture.2d.bore": "镗孔用镗刀把圆孔加工到设定直径。需要比钻孔更精确的孔径或更好的表面时使用。",
     "help.manufacture.2d.chamfer": "倒角沿二维轮廓切出斜面。用于去掉锐边或在加工件上加倒角。",
     "help.manufacture.2d.circular": "圆周加工围绕中心阵列加工同一特征，如一圈孔或槽。特征沿圆周均匀重复时使用。",

@@ -16,6 +16,7 @@
     "CAM Setup": "إعداد CAM",
     "Define Tool": "تعريف أداة",
     "List CAM": "سرد CAM",
+    "Post Process": "معالجة لاحقة",
     "Remove CAM Operation": "إزالة عملية CAM",
     "Remove Tool": "إزالة الأداة"
   },
@@ -26,6 +27,7 @@
     "CAM Setup": "הגדרת CAM",
     "Define Tool": "הגדרת כלי",
     "List CAM": "רשימת CAM",
+    "Post Process": "עיבוד לאחר",
     "Remove CAM Operation": "הסרת פעולת CAM",
     "Remove Tool": "הסרת כלי"
   },
@@ -46,6 +48,7 @@
     "CAM Setup": "Thiết lập CAM",
     "Define Tool": "Định nghĩa công cụ",
     "List CAM": "Liệt kê CAM",
+    "Post Process": "Hậu xử lý",
     "Remove CAM Operation": "Loại bỏ thao tác CAM",
     "Remove Tool": "Loại bỏ công cụ"
   },
