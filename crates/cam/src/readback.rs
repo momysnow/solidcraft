@@ -5,14 +5,15 @@
 
 use std::collections::HashMap;
 
-use crate::gcode::{Program, parse};
-use crate::path::Toolpath;
-use crate::post::Post;
-use crate::{CamError, Result};
 use serde::{Deserialize, Serialize};
 use solidcore_record::Vec3;
-#[allow(unused_imports)]
 use solidcraft_geom::prelude::*;
+
+use crate::gcode::parse;
+use crate::path::Toolpath;
+use crate::post::Post;
+use crate::program::Program;
+use crate::{CamError, Result};
 
 /// Most grid entries the comparison builds.
 const MAX_ENTRIES: usize = 20_000_000;

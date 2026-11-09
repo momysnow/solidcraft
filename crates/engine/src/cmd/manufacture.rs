@@ -60,7 +60,7 @@ fn simulate(s: &mut Session, p: &Value) -> Result<Value> {
         }
     }
     let posted = s.execute("cam.post", &json!({"setup": name}))?;
-    let gcode = posted["gcode"].as_str().unwrap_or_default().to_string();
+    let gcode = posted["code"].as_str().unwrap_or_default().to_string();
     let tools: Vec<Value> = s
         .doc
         .cam

@@ -5,12 +5,12 @@
 //! copied polygon, so toolpaths follow the design. Depths, feeds and stepdowns are [`Expr`]
 //! values, mapped onto `solidcraft-cam` only at post time.
 
-use crate::{DocError, Expr, ProfileSel, Result};
 use serde::{Deserialize, Serialize};
 use solidcore_record::{Loop2, Region2, Vec2, Vec3};
 use solidcraft_cam::{Post, Tool};
-#[allow(unused_imports)]
 use solidcraft_geom::prelude::*;
+
+use crate::{DocError, Expr, ProfileSel, Result};
 
 /// Most tools in one design.
 pub const MAX_TOOLS: usize = 256;

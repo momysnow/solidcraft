@@ -1,12 +1,11 @@
 //! Safety rules every toolpath must keep, checked before a path leaves an operation.
 
 use solidcore_record::{Vec2, Vec3};
+use solidcraft_geom::prelude::*;
 
-use crate::ops::Heights;
+use crate::params::Heights;
 use crate::path::{MAX_MOVES, Move, Toolpath};
 use crate::{CamError, Result};
-#[allow(unused_imports)]
-use solidcraft_geom::prelude::*;
 
 const TOL: f64 = 1e-6;
 
