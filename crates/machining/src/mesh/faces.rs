@@ -2,32 +2,37 @@
 //! draws for a solid.
 //!
 //! The surface is welded into one indexed mesh (chunk meshes share their boundary vertices bit for
-//! bit), then grown into faces in three passes. Planar faces go first, from flat seeds: a triangle
-//! whose neighbours all turn by at most `plane_angle` from its normal. A planar face takes every
-//! neighbour whose corners lie within `plane_gap` of the seed's plane; the normal is not tested there,
-//! because the corners of a plane carry noise of a few hundredths of a cell that tilts their triangles.
-//! A planar face narrower than `min_plane_extent` is a facet of a curved surface and is given back.
-//! Planar faces claim their triangles before any curved face grows, so a plane never grows into a
-//! fillet: where a plane meets a fillet tangentially, the boundary falls at the fillet's first row. The
-//! triangles left over grow curved faces across neighbours that turn by less than `crease_angle`.
-//! Finally the triangles with no normal (degenerate) join a neighbour. A planar face is shaded with its
-//! plane's normal.
+//! bit). Each triangle's normal is first smoothed over about `SMOOTH_STEPS` rings of triangles, leaving
+//! out neighbours that turn by more than 60 degrees. A faceted cylinder then reads as one smooth
+//! curve, while a 90 degree crease stays sharp.
 //!
-//! The boundary between two faces is an edge, drawn as a polyline. It is marked tangent when its two
-//! sides turn by at most `tangent_angle`, so a fillet meeting a floor or a wall is a tangent edge and
-//! a corner is not.
+//! Planar faces grow first, from flat seeds (every neighbour's smoothed normal within `plane_angle`).
+//! A neighbour joins when its corners lie within `plane_gap` of the least-squares plane through the
+//! members so far, refitted as the face grows, so a tilted wall is one face. A planar face must be at
+//! least `min_plane_extent` wide across two in-plane directions, and a flood that fails the fit or the
+//! width gives its triangles back to the curved pass. Curved faces then grow over what is left, across
+//! neighbours whose smoothed normals turn by less than `crease_angle`. Curved faces under
+//! `MIN_FACE_TRIS` triangles, or narrower than `min_plane_extent`, merge into the neighbour across the
+//! smallest normal angle. Degenerate triangles (no normal) join a neighbour's face.
 //!
-//! Limits: a curved surface turns by about cell / radius per row. Where that is below `plane_angle`
-//! (radius above about cell / plane_angle, 29 mm at a 0.25 mm cell) its rows pass as seeds, and the
-//! surface splits into planar strips a few millimetres across. A tangent edge sits within about one row
-//! of the true tangent line. Two curved faces that meet at a small angle without a change of type stay
-//! one face, as do two curved faces of different radius that join smoothly.
+//! The boundary between two faces is an edge polyline. It is tangent when the median angle between the
+//! smoothed normals on its two sides is at most `tangent_angle`.
+//!
+//! The output is one [`Mesh`]: vertices split per face, `tri_face` set, and `edges`, `edge_faces` and
+//! `smooth_edges` filled, with `display_only_edges` set. A planar face shades with its plane's normal,
+//! a curved face with its smoothed normals, so a crease keeps its sharpness.
+//!
+//! Limits: a curved surface turns by about cell / radius per cell. Where that is below `plane_angle`
+//! (radius above about cell / plane_angle, 29 mm at a 0.25 mm cell) its rows pass as seeds, and it can
+//! split into planar patches a few millimetres across. A tangent edge sits within about one row of the
+//! true tangent line, since the planar gap admits the first row. Features narrower than about
+//! `SMOOTH_STEPS` triangle rings are smoothed over, so they can merge into a neighbour.
 //!
 //! shortcut: the whole surface is segmented on each call (every mesh welded, every triangle grown), so
 //! a viewer that remeshes one chunk segments the whole set again. Segment only the dirty region once
 //! the viewport needs it at interactive rates.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::f64::consts::PI;
 
 use solidcore_record::Vec3;
@@ -37,37 +42,47 @@ use solidcraft_geom::prelude::*;
 use crate::SimError;
 use crate::det_math;
 
-/// The face of a triangle that no face has claimed yet. Faces are numbered from 0, so this is never one.
+/// The face of a triangle that no face has claimed yet. Faces are numbered from 0.
 const NONE: u32 = u32::MAX;
+/// Normals are averaged over about this many rings of triangles (see [`smooth_normals`]).
+const SMOOTH_STEPS: usize = 24;
+/// Smoothing leaves out neighbours that turn by more than 60 degrees (cosine 0.5): a crease is not averaged.
+const FEATURE_COS: f64 = 0.5;
+/// A curved face with fewer triangles than this is a sliver and joins a neighbour.
+const MIN_FACE_TRIS: usize = 32;
+/// Refit the planar face's plane after this many accepted triangles, as well as when a candidate fails.
+const REFIT_EVERY: u32 = 64;
+/// Estimated bytes per triangle and per vertex while segmenting, checked against the budget.
+const BYTES_PER_TRI: u64 = 320;
+const BYTES_PER_VERTEX: u64 = 64;
 
-/// What decides where faces end. Angles are in radians and the gap in millimetres.
+/// What decides where faces end. Angles are in radians and lengths in millimetres.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FaceTolerances {
-    /// Largest angle between a seed's normal and each of its neighbours' normals: a seed is flat only
-    /// when it is. Curved rows turn by about cell / radius, so this keeps them out of a plane's seed.
+    /// Largest angle between a seed's smoothed normal and each neighbour's: a seed is flat only when
+    /// its surroundings are.
     pub plane_angle: f64,
-    /// Largest distance from a planar face's plane to any of its vertices.
+    /// Largest distance from a planar face's plane to any of its corners.
     pub plane_gap: f64,
-    /// A planar face must be at least this wide across (its middle bounding-box extent), in mm. A
-    /// narrower flat region is one facet of a curved surface, not a face.
+    /// A planar face must be at least this wide across two in-plane directions, and a curved face at
+    /// least this large. A narrower flat region is a facet of a curved surface, not a face.
     pub min_plane_extent: f64,
-    /// Normals that turn by more than this across an edge split the faces there.
+    /// Smoothed normals that turn by more than this across an edge split the faces there.
     pub crease_angle: f64,
-    /// A boundary whose two sides turn by at most this is tangent.
+    /// A boundary whose two sides turn by at most this (median along the edge) is tangent.
     pub tangent_angle: f64,
 }
 
 impl FaceTolerances {
-    /// The tolerances for a stock whose rays are `cell` mm apart. The planar gap is a quarter of a cell:
-    /// the corners of a true plane sit within a few hundredths of a cell of it, and a fillet's first row
-    /// is taken into the plane only when it is that close. The seed angle is half a degree, below the
-    /// turn of a fillet's first row, so a fillet is not a seed. A planar face is at least four cells
-    /// across. A crease is 30 degrees. A boundary turning by 15 or less is tangent, which still holds
-    /// across one row of a fillet.
+    /// The tolerances for a stock whose rays are `cell` mm apart. The planar gap is 0.35 of a cell:
+    /// the corners of a true plane, and of the rim where a plane meets a curve, sit within about a third
+    /// of a cell of it. The seed angle is half a
+    /// degree. A planar face and a curved face are at least four cells across. A crease is 30 degrees,
+    /// and a boundary turning by 15 or less is tangent, which still holds across one row of a fillet.
     pub fn for_cell(cell: f64) -> Result<FaceTolerances, SimError> {
         FaceTolerances {
             plane_angle: 0.5f64.to_radians(),
-            plane_gap: 0.25 * cell,
+            plane_gap: 0.35 * cell,
             min_plane_extent: 4.0 * cell,
             crease_angle: 30f64.to_radians(),
             tangent_angle: 15f64.to_radians(),
@@ -84,7 +99,7 @@ impl FaceTolerances {
             return Err(SimError::BadInput("the planar gap must be a positive length".into()));
         }
         if !(self.min_plane_extent > 0.0 && self.min_plane_extent.is_finite()) {
-            return Err(SimError::BadInput("the minimum planar extent must be a positive length".into()));
+            return Err(SimError::BadInput("the minimum face extent must be a positive length".into()));
         }
         Ok(self)
     }
@@ -100,43 +115,35 @@ pub enum FaceKind {
 /// The faces of a surface and the lines between them.
 #[derive(Clone, Debug)]
 pub struct FaceSegmentation {
-    /// The input meshes, in order, with their vertices split per face. `tri_face` holds each triangle's
-    /// face. Normals are per face: a plane shades flat, a curved face shades smooth, and a crease keeps
-    /// its sharpness, because a vertex on a crease has one copy per face with that face's normal.
-    pub meshes: Vec<Mesh>,
+    /// One mesh of the whole surface: `tri_face` is each triangle's face, `edges` the boundary
+    /// polylines in world coordinates (closed loops repeat their first point), `edge_faces` the faces
+    /// each one separates, and `smooth_edges` the tangent ones. Vertices are split per face.
+    pub mesh: Mesh,
     /// The kind of each face, by face id.
     pub kinds: Vec<FaceKind>,
-    /// The boundaries between faces, each edge once, as polylines in world coordinates. A polyline runs
-    /// from one junction to the next, where three or more faces meet or the input's outline ends. A
-    /// closed loop has its first point again as its last.
-    pub edges: Vec<Vec<Vec3>>,
-    /// Per polyline: the faces it separates, ascending.
-    pub edge_faces: Vec<Vec<u32>>,
-    /// Per polyline: true where the two faces meet tangentially, every segment turning by at most
-    /// `tangent_angle`.
-    pub tangent: Vec<bool>,
 }
 
-/// Segments the surface of `meshes`, taken together as one surface, into faces and boundary lines. The
-/// meshes of one stock weld along their shared vertices, so a face that crosses a chunk boundary stays
-/// one face. Errors, never panics: bad tolerances, non-finite vertices and out-of-range indices are
-/// refused.
-pub fn segment_faces(meshes: &[Mesh], tol: &FaceTolerances) -> Result<FaceSegmentation, SimError> {
+/// Segments the surface of `meshes`, taken together as one surface, into faces and boundary lines.
+/// Chunk meshes of one stock weld along their shared vertices, so a face that crosses a chunk boundary
+/// stays one face. Errors, never panics: bad tolerances, non-finite vertices, out-of-range indices and a
+/// surface over `budget_bytes` (by estimate) are refused.
+pub fn segment_faces(meshes: &[Mesh], tol: &FaceTolerances, budget_bytes: u64) -> Result<FaceSegmentation, SimError> {
     let tol = tol.checked()?;
     let surface = Surface::weld(meshes)?;
-    let normal: Vec<Option<Vec3>> = surface.tris.iter().map(|t| surface.normal(*t)).collect();
-    let edges = surface.edges();
-    let nbrs = neighbours(&edges, surface.tris.len());
-    let (face, kinds, planes) = grow(&surface, &normal, &nbrs, tol);
-    let segments = boundary_segments(&edges, &normal, &face);
+    let need = surface.tris.len() as u64 * BYTES_PER_TRI + surface.pos.len() as u64 * BYTES_PER_VERTEX;
+    if need > budget_bytes {
+        return Err(SimError::Budget { need, budget: budget_bytes });
+    }
+    let raw: Vec<Option<Vec3>> = surface.tris.iter().map(|t| surface.normal(*t)).collect();
+    let adj = Adjacency::build(&surface);
+    let smooth = smooth_normals(&raw, &adj);
+    let mut grown = grow(&surface, &smooth, &adj, tol);
+    merge_slivers(&surface, &smooth, &adj, &mut grown, tol);
+    compact(&mut grown);
+    let segments = boundary_segments(&adj, &smooth, &grown.face);
     let lines = chain(&segments);
-    Ok(FaceSegmentation {
-        meshes: split(&surface, meshes, &face, &kinds, &planes),
-        kinds,
-        edges: lines.iter().map(|l| l.points.iter().map(|&v| surface.point(v)).collect()).collect(),
-        edge_faces: lines.iter().map(|l| l.faces.clone()).collect(),
-        tangent: lines.iter().map(|l| l.angle <= tol.tangent_angle).collect(),
-    })
+    let mesh = build_mesh(&surface, &smooth, &grown, &lines, tol);
+    Ok(FaceSegmentation { mesh, kinds: grown.kinds })
 }
 
 /// The meshes welded into one indexed surface: each position once, each triangle by global indices.
@@ -149,7 +156,7 @@ impl Surface {
     fn weld(meshes: &[Mesh]) -> Result<Surface, SimError> {
         let too_big = || SimError::BadInput("too many vertices or triangles to segment".to_string());
         let mut pos: Vec<Vec3> = Vec::new();
-        let mut index: HashMap<[u64; 3], u32> = HashMap::new();
+        let mut index: std::collections::HashMap<[u64; 3], u32> = std::collections::HashMap::new();
         let mut tris: Vec<[u32; 3]> = Vec::new();
         for m in meshes {
             if m.positions.iter().any(|p| !p.is_finite()) {
@@ -177,7 +184,7 @@ impl Surface {
                 tris.push(g);
             }
         }
-        // Each output vertex is one (position, face) pair of a triangle corner, so 3 per triangle must fit.
+        // Each output vertex is one (position, face) pair of a triangle corner: 3 per triangle must fit.
         if tris.len().checked_mul(3).is_none_or(|n| n >= NONE as usize) {
             return Err(too_big());
         }
@@ -192,32 +199,10 @@ impl Surface {
         t.map(|v| self.point(v))
     }
 
-    /// The cross product of two edges of a triangle: twice its area, along its normal.
-    fn area_normal(&self, t: [u32; 3]) -> Vec3 {
-        let [a, b, c] = self.corners(t);
-        (b - a).cross(c - a)
-    }
-
     /// The unit normal of a triangle, or `None` when it is degenerate.
     fn normal(&self, t: [u32; 3]) -> Option<Vec3> {
-        self.area_normal(t).normalized()
-    }
-
-    /// Every edge of the surface with the triangles on it, sorted by its two vertices. An edge with one
-    /// triangle lies on the input's outline.
-    fn edges(&self) -> Vec<((u32, u32), Vec<u32>)> {
-        let mut map: HashMap<(u32, u32), Vec<u32>> = HashMap::new();
-        for (t, tri) in self.tris.iter().enumerate() {
-            let [a, b, c] = *tri;
-            for (p, q) in [(a, b), (b, c), (c, a)] {
-                if p != q {
-                    map.entry((p.min(q), p.max(q))).or_default().push(t as u32);
-                }
-            }
-        }
-        let mut edges: Vec<_> = map.into_iter().collect();
-        edges.sort_unstable_by_key(|(k, _)| *k);
-        edges
+        let [a, b, c] = self.corners(t);
+        (b - a).cross(c - a).normalized()
     }
 }
 
@@ -226,141 +211,356 @@ fn bits(v: f64) -> u64 {
     if v == 0.0 { 0 } else { v.to_bits() }
 }
 
-/// The triangles that share an edge with each triangle.
-fn neighbours(edges: &[((u32, u32), Vec<u32>)], n: usize) -> Vec<Vec<u32>> {
-    let mut out = vec![Vec::new(); n];
-    for (_, ts) in edges {
-        for &t in ts {
-            for &u in ts {
-                if u != t
-                    && let Some(list) = out.get_mut(t as usize)
-                {
-                    list.push(u);
+/// The edges of the surface, sorted by their two vertices, with the triangles on each, and the
+/// triangles that share an edge with each triangle. Both are flat arrays.
+struct Adjacency {
+    edge_key: Vec<(u32, u32)>,
+    /// Edge `e` has the triangles `edge_tris[edge_start[e]..edge_start[e + 1]]`.
+    edge_start: Vec<u32>,
+    edge_tris: Vec<u32>,
+    /// Triangle `t` has the neighbours `nbr[nbr_start[t]..nbr_start[t + 1]]`.
+    nbr_start: Vec<u32>,
+    nbr: Vec<u32>,
+}
+
+impl Adjacency {
+    fn build(surface: &Surface) -> Adjacency {
+        let n = surface.tris.len();
+        let mut pairs: Vec<((u32, u32), u32)> = Vec::with_capacity(3 * n);
+        for (t, tri) in surface.tris.iter().enumerate() {
+            let [a, b, c] = *tri;
+            for (p, q) in [(a, b), (b, c), (c, a)] {
+                if p != q {
+                    pairs.push(((p.min(q), p.max(q)), t as u32));
                 }
             }
         }
+        pairs.sort_unstable();
+        let mut edge_key: Vec<(u32, u32)> = Vec::new();
+        let mut edge_start: Vec<u32> = Vec::new();
+        let mut edge_tris: Vec<u32> = Vec::with_capacity(pairs.len());
+        for (key, t) in pairs {
+            if edge_key.last() != Some(&key) {
+                edge_key.push(key);
+                edge_start.push(edge_tris.len() as u32);
+            }
+            edge_tris.push(t);
+        }
+        edge_start.push(edge_tris.len() as u32);
+
+        let mut nbr_start = vec![0u32; n + 1];
+        for e in 0..edge_key.len() {
+            let ts = edge_slice(&edge_start, &edge_tris, e);
+            for &t in ts {
+                if let Some(slot) = nbr_start.get_mut(t as usize + 1) {
+                    *slot += ts.len().saturating_sub(1) as u32;
+                }
+            }
+        }
+        let mut acc = 0u32;
+        for x in nbr_start.iter_mut() {
+            acc += *x;
+            *x = acc;
+        }
+        let mut cursor = nbr_start.clone();
+        let mut nbr = vec![0u32; nbr_start[n] as usize];
+        for e in 0..edge_key.len() {
+            let ts = edge_slice(&edge_start, &edge_tris, e);
+            for &t in ts {
+                for &u in ts {
+                    if u != t
+                        && let Some(c) = cursor.get_mut(t as usize)
+                    {
+                        if let Some(dst) = nbr.get_mut(*c as usize) {
+                            *dst = u;
+                        }
+                        *c += 1;
+                    }
+                }
+            }
+        }
+        Adjacency { edge_key, edge_start, edge_tris, nbr_start, nbr }
     }
-    out
+
+    fn nbrs(&self, t: usize) -> &[u32] {
+        let (a, b) = (self.nbr_start.get(t).copied().unwrap_or(0), self.nbr_start.get(t + 1).copied().unwrap_or(0));
+        self.nbr.get(a as usize..b as usize).unwrap_or(&[])
+    }
+
+    fn edge_tris(&self, e: usize) -> &[u32] {
+        edge_slice(&self.edge_start, &self.edge_tris, e)
+    }
 }
 
-/// Whether a triangle with normal `n` (`None` when degenerate, which never joins) lies within the angle
-/// whose cosine is `cos_limit` of `reference`.
+fn edge_slice<'a>(start: &[u32], tris: &'a [u32], e: usize) -> &'a [u32] {
+    let (a, b) = (start.get(e).copied().unwrap_or(0), start.get(e + 1).copied().unwrap_or(0));
+    tris.get(a as usize..b as usize).unwrap_or(&[])
+}
+
+/// Whether a normal lies within the angle whose cosine is `cos_limit` of `reference`. A degenerate
+/// triangle (no normal) never does.
 fn aligned(n: Option<Vec3>, reference: Vec3, cos_limit: f64) -> bool {
     n.is_some_and(|n| n.dot(reference) >= cos_limit)
 }
 
-/// Whether all three corners lie within `gap` of the plane through `p0` with normal `n0`.
-fn within_gap(corners: [Vec3; 3], p0: Vec3, n0: Vec3, gap: f64) -> bool {
-    corners.iter().all(|c| (*c - p0).dot(n0).abs() <= gap)
+/// Each triangle's normal, averaged over about `SMOOTH_STEPS` rings of triangles. A neighbour counts
+/// only when its raw normal is within 60 degrees of the triangle's own, so a crease is never averaged
+/// across. Each step averages the current smoothed normals, so the reach grows with the steps.
+fn smooth_normals(raw: &[Option<Vec3>], adj: &Adjacency) -> Vec<Option<Vec3>> {
+    let mut cur = raw.to_vec();
+    let mut next = raw.to_vec();
+    for _ in 0..SMOOTH_STEPS {
+        for (t, r) in raw.iter().enumerate() {
+            let Some(r) = *r else {
+                next[t] = None;
+                continue;
+            };
+            let mut sum = Vec3::ZERO;
+            let mut add = |u: usize| {
+                if let (Some(ru), Some(su)) = (raw[u], cur[u])
+                    && ru.dot(r) >= FEATURE_COS
+                {
+                    sum += su;
+                }
+            };
+            add(t);
+            for &u in adj.nbrs(t) {
+                add(u as usize);
+            }
+            next[t] = Some(sum.normalized().unwrap_or(r));
+        }
+        std::mem::swap(&mut cur, &mut next);
+    }
+    cur
 }
 
-/// Grows the faces: planar ones from flat seeds, curved ones over what is left, and degenerate triangles
-/// last. Returns each triangle's face and each face's kind.
-fn grow(surface: &Surface, normal: &[Option<Vec3>], nbrs: &[Vec<u32>], tol: FaceTolerances) -> (Vec<u32>, Vec<FaceKind>, Vec<Option<Vec3>>) {
+/// Running moments of a set of points, for their least-squares plane: the count, the sum and the sum of
+/// outer products, all relative to an origin near the points so the covariance keeps its precision.
+#[derive(Clone, Copy)]
+struct Moments {
+    origin: Vec3,
+    n: f64,
+    sum: Vec3,
+    sq: [[f64; 3]; 3],
+}
+
+impl Moments {
+    fn new(origin: Vec3) -> Moments {
+        Moments { origin, n: 0.0, sum: Vec3::ZERO, sq: [[0.0; 3]; 3] }
+    }
+
+    /// Adds (`sign` 1) or removes (`sign` -1) one point.
+    fn update(&mut self, p: Vec3, sign: f64) {
+        let d = p - self.origin;
+        let a: [f64; 3] = d.into();
+        self.n += sign;
+        self.sum += d * sign;
+        for (r, row) in self.sq.iter_mut().enumerate() {
+            for (c, cell) in row.iter_mut().enumerate() {
+                *cell += sign * a[r] * a[c];
+            }
+        }
+    }
+
+    fn update_all(&mut self, ps: [Vec3; 3], sign: f64) {
+        for p in ps {
+            self.update(p, sign);
+        }
+    }
+
+    /// The least-squares plane: its point (the centroid) and unit normal (the direction of least
+    /// variance). `None` with fewer than three points or a singular solve.
+    fn plane(&self) -> Option<(Vec3, Vec3)> {
+        if self.n < 3.0 {
+            return None;
+        }
+        let mean = self.sum / self.n;
+        let mu: [f64; 3] = mean.into();
+        let mut cov = [[0.0f64; 3]; 3];
+        for (r, row) in cov.iter_mut().enumerate() {
+            for (c, cell) in row.iter_mut().enumerate() {
+                *cell = self.sq[r][c] / self.n - mu[r] * mu[c];
+            }
+        }
+        Some((self.origin + mean, smallest_eigenvector(cov)?))
+    }
+}
+
+/// The unit eigenvector of the smallest eigenvalue of a symmetric 3 by 3 matrix, by cyclic Jacobi
+/// rotations. `None` when the result is not finite.
+fn smallest_eigenvector(mut m: [[f64; 3]; 3]) -> Option<Vec3> {
+    let mut v = [[1.0f64, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    const PAIRS: [(usize, usize); 3] = [(0, 1), (0, 2), (1, 2)];
+    for _ in 0..16 {
+        let off: f64 = PAIRS.iter().map(|&(p, q)| m[p][q].abs()).sum();
+        let scale: f64 = m[0][0].abs() + m[1][1].abs() + m[2][2].abs();
+        if off <= 1e-14 * scale || !off.is_finite() {
+            break;
+        }
+        for (p, q) in PAIRS {
+            if m[p][q] == 0.0 {
+                continue;
+            }
+            let theta = (m[q][q] - m[p][p]) / (2.0 * m[p][q]);
+            let t = theta.signum() / (theta.abs() + (theta * theta + 1.0).sqrt());
+            let c = 1.0 / (t * t + 1.0).sqrt();
+            let s = t * c;
+            for row in m.iter_mut() {
+                let (mkp, mkq) = (row[p], row[q]);
+                row[p] = c * mkp - s * mkq;
+                row[q] = s * mkp + c * mkq;
+            }
+            let (rp, rq) = (m[p], m[q]);
+            m[p] = std::array::from_fn(|k| c * rp[k] - s * rq[k]);
+            m[q] = std::array::from_fn(|k| s * rp[k] + c * rq[k]);
+            for row in v.iter_mut() {
+                let (vkp, vkq) = (row[p], row[q]);
+                row[p] = c * vkp - s * vkq;
+                row[q] = s * vkp + c * vkq;
+            }
+        }
+    }
+    let i = (0..3).min_by(|&a, &b| m[a][a].total_cmp(&m[b][b]))?;
+    Vec3::new(v[0][i], v[1][i], v[2][i]).normalized()
+}
+
+/// The face of every triangle, and each face's kind and plane (planar faces only).
+struct Grown {
+    face: Vec<u32>,
+    kinds: Vec<FaceKind>,
+    planes: Vec<Option<Vec3>>,
+}
+
+/// Grows the faces: planar ones first, then curved ones over what is left, then degenerate triangles.
+fn grow(surface: &Surface, smooth: &[Option<Vec3>], adj: &Adjacency, tol: FaceTolerances) -> Grown {
     let n = surface.tris.len();
-    let mut face = vec![NONE; n];
-    let mut kinds: Vec<FaceKind> = Vec::new();
-    // The plane of each planar face, by face id; `None` for a curved face.
-    let mut planes: Vec<Option<Vec3>> = Vec::new();
     let cos_plane = tol.plane_angle.cos();
     let cos_crease = tol.crease_angle.cos();
-    let mut queue = VecDeque::new();
-    // Seeds whose flood came out too narrow to be a face: they seed no flood of their own.
+    let mut g = Grown { face: vec![NONE; n], kinds: Vec::new(), planes: Vec::new() };
+    // Triangles of a planar flood that came out too narrow: never a seed or a member again.
     let mut rejected = vec![false; n];
+    let mut queue: VecDeque<usize> = VecDeque::new();
 
-    // Planar faces. A seed is flat when every neighbour is within the planar angle of it.
     for seed in 0..n {
-        let Some(n0) = normal[seed] else { continue };
-        if face[seed] != NONE || rejected[seed] || !nbrs[seed].iter().all(|&u| aligned(normal[u as usize], n0, cos_plane)) {
+        let Some(sn) = smooth[seed] else { continue };
+        if g.face[seed] != NONE || rejected[seed] || !adj.nbrs(seed).iter().all(|&u| aligned(smooth[u as usize], sn, cos_plane)) {
             continue;
         }
-        let id = kinds.len() as u32;
-        let p0 = surface.corners(surface.tris[seed])[0];
+        let id = g.kinds.len() as u32;
+        let seed_corners = surface.corners(surface.tris[seed]);
+        let mut m = Moments::new(seed_corners[0]);
+        m.update_all(seed_corners, 1.0);
         let mut members = vec![seed];
-        face[seed] = id;
+        let mut plane: Option<(Vec3, Vec3)> = m.plane();
+        let mut since_refit = 0u32;
+        g.face[seed] = id;
         queue.push_back(seed);
         while let Some(x) = queue.pop_front() {
-            for &u in &nbrs[x] {
+            for &u in adj.nbrs(x) {
                 let u = u as usize;
-                // The gap alone decides a neighbour: a corner's noise can tilt its triangle by degrees.
-                if face[u] == NONE && within_gap(surface.corners(surface.tris[u]), p0, n0, tol.plane_gap) {
-                    face[u] = id;
+                if g.face[u] != NONE || rejected[u] {
+                    continue;
+                }
+                let cs = surface.corners(surface.tris[u]);
+                m.update_all(cs, 1.0);
+                let within = |p: Option<(Vec3, Vec3)>| p.is_some_and(|(c, nrm)| cs.iter().all(|q| (*q - c).dot(nrm).abs() <= tol.plane_gap));
+                let fits = if within(plane) && since_refit < REFIT_EVERY {
+                    true
+                } else {
+                    plane = m.plane();
+                    since_refit = 0;
+                    within(plane)
+                };
+                if fits {
+                    since_refit += 1;
+                    g.face[u] = id;
                     members.push(u);
                     queue.push_back(u);
+                } else {
+                    m.update_all(cs, -1.0);
                 }
             }
         }
-        if extent(surface, &members) < tol.min_plane_extent {
-            for &t in &members {
-                face[t] = NONE;
+        // Trim: a member whose corners stray beyond the gap from the refitted plane goes back to the
+        // curved pass, and the plane is refitted, for a few rounds.
+        let mut oriented = plane.map(|(c, nrm)| (c, if nrm.dot(sn) < 0.0 { -nrm } else { nrm }));
+        for _ in 0..3 {
+            let Some((c, nrm)) = oriented else { break };
+            let mut bad: Vec<usize> = members
+                .iter()
+                .copied()
+                .filter(|&t| surface.corners(surface.tris[t]).iter().any(|q| (*q - c).dot(nrm).abs() > tol.plane_gap))
+                .collect();
+            if bad.is_empty() {
+                break;
             }
-            rejected[seed] = true;
-        } else {
-            kinds.push(FaceKind::Planar);
-            planes.push(Some(n0));
+            bad.sort_unstable();
+            for &t in &bad {
+                g.face[t] = NONE;
+                m.update_all(surface.corners(surface.tris[t]), -1.0);
+            }
+            members.retain(|t| bad.binary_search(t).is_err());
+            oriented = m.plane().map(|(c, nrm)| (c, if nrm.dot(sn) < 0.0 { -nrm } else { nrm }));
+        }
+        let verified = oriented.is_some_and(|(c, nrm)| {
+            members.iter().all(|&t| surface.corners(surface.tris[t]).iter().all(|q| (*q - c).dot(nrm).abs() <= tol.plane_gap))
+        });
+        match oriented {
+            Some((c, nrm)) if verified && width(surface, &members, c, nrm) >= tol.min_plane_extent => {
+                g.kinds.push(FaceKind::Planar);
+                g.planes.push(Some(nrm));
+            }
+            _ => {
+                for &t in &members {
+                    g.face[t] = NONE;
+                    rejected[t] = true;
+                }
+            }
         }
     }
 
-    // Curved faces: whatever no plane claimed, grown across neighbours that turn by less than the crease.
     for seed in 0..n {
-        if face[seed] != NONE || normal[seed].is_none() {
+        if g.face[seed] != NONE || smooth[seed].is_none() {
             continue;
         }
-        let id = kinds.len() as u32;
-        kinds.push(FaceKind::Curved);
-        planes.push(None);
-        face[seed] = id;
+        let id = g.kinds.len() as u32;
+        g.kinds.push(FaceKind::Curved);
+        g.planes.push(None);
+        g.face[seed] = id;
         queue.push_back(seed);
         while let Some(x) = queue.pop_front() {
-            let Some(nx) = normal[x] else { continue };
-            for &u in &nbrs[x] {
+            let Some(nx) = smooth[x] else { continue };
+            for &u in adj.nbrs(x) {
                 let u = u as usize;
-                if face[u] == NONE && aligned(normal[u], nx, cos_crease) {
-                    face[u] = id;
+                if g.face[u] == NONE && aligned(smooth[u], nx, cos_crease) {
+                    g.face[u] = id;
                     queue.push_back(u);
                 }
             }
         }
     }
 
-    // Degenerate triangles take a neighbour's face. A group with no face next to it is a face of its own.
-    let mut queue: VecDeque<usize> = (0..n).filter(|&t| face[t] != NONE).collect();
-    spread(&mut face, nbrs, &mut queue);
+    // Degenerate triangles take a neighbour's face; a group with none next to it is a face of its own.
+    let mut queue: VecDeque<usize> = (0..n).filter(|&t| g.face[t] != NONE).collect();
+    spread(&mut g.face, adj, &mut queue);
     for t in 0..n {
-        if face[t] == NONE {
-            let id = kinds.len() as u32;
-            kinds.push(FaceKind::Curved);
-            planes.push(None);
-            face[t] = id;
+        if g.face[t] == NONE {
+            let id = g.kinds.len() as u32;
+            g.kinds.push(FaceKind::Curved);
+            g.planes.push(None);
+            g.face[t] = id;
             queue.push_back(t);
-            spread(&mut face, nbrs, &mut queue);
+            spread(&mut g.face, adj, &mut queue);
         }
     }
-    (face, kinds, planes)
-}
-
-/// The middle of the three bounding-box extents of the triangles' corners. For a flat patch the
-/// smallest extent is its thickness, so this is its width across.
-fn extent(surface: &Surface, members: &[usize]) -> f64 {
-    let mut lo = Vec3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
-    let mut hi = Vec3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
-    for &t in members {
-        for c in surface.corners(surface.tris[t]) {
-            lo = lo.min(c);
-            hi = hi.max(c);
-        }
-    }
-    let d = hi - lo;
-    let mut e = [d.x, d.y, d.z];
-    e.sort_by(f64::total_cmp);
-    e[1]
+    g
 }
 
 /// Gives every unclaimed neighbour of the queued triangles the face of the triangle that reaches it.
-fn spread(face: &mut [u32], nbrs: &[Vec<u32>], queue: &mut VecDeque<usize>) {
+fn spread(face: &mut [u32], adj: &Adjacency, queue: &mut VecDeque<usize>) {
     while let Some(x) = queue.pop_front() {
         let f = face[x];
-        for &u in &nbrs[x] {
+        for &u in adj.nbrs(x) {
             let u = u as usize;
             if face[u] == NONE {
                 face[u] = f;
@@ -370,51 +570,156 @@ fn spread(face: &mut [u32], nbrs: &[Vec<u32>], queue: &mut VecDeque<usize>) {
     }
 }
 
+/// The width of a planar face across two in-plane directions: the smaller of its two extents.
+fn width(surface: &Surface, members: &[usize], c: Vec3, nrm: Vec3) -> f64 {
+    let e1 = nrm.any_perp();
+    let e2 = nrm.cross(e1);
+    [e1, e2]
+        .iter()
+        .map(|e| {
+            let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+            for &t in members {
+                for q in surface.corners(surface.tris[t]) {
+                    let d = (q - c).dot(*e);
+                    lo = lo.min(d);
+                    hi = hi.max(d);
+                }
+            }
+            hi - lo
+        })
+        .fold(f64::INFINITY, f64::min)
+}
+
+/// Merges each curved face that is a sliver (under `MIN_FACE_TRIS` triangles, or narrower than
+/// `min_plane_extent`) into the neighbour across its smallest normal angle. A few passes let a chain of
+/// slivers settle.
+fn merge_slivers(surface: &Surface, smooth: &[Option<Vec3>], adj: &Adjacency, g: &mut Grown, tol: FaceTolerances) {
+    let n = surface.tris.len();
+    for _ in 0..4 {
+        let k = g.kinds.len();
+        let mut count = vec![0usize; k];
+        let mut lo = vec![Vec3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY); k];
+        let mut hi = vec![Vec3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY); k];
+        for t in 0..n {
+            let f = g.face[t] as usize;
+            count[f] += 1;
+            for q in surface.corners(surface.tris[t]) {
+                lo[f] = lo[f].min(q);
+                hi[f] = hi[f].max(q);
+            }
+        }
+        let small: Vec<bool> = (0..k)
+            .map(|f| {
+                let d = hi[f] - lo[f];
+                let widest = d.x.max(d.y).max(d.z);
+                g.kinds[f] == FaceKind::Curved && count[f] > 0 && (count[f] < MIN_FACE_TRIS || widest < tol.min_plane_extent)
+            })
+            .collect();
+        if !small.iter().any(|&s| s) {
+            break;
+        }
+        // Best neighbour of each sliver: the face across the edge with the largest cosine.
+        let mut best: Vec<(f64, u32)> = vec![(-2.0, NONE); k];
+        for t in 0..n {
+            let f = g.face[t] as usize;
+            if !small[f] {
+                continue;
+            }
+            let Some(st) = smooth[t] else { continue };
+            for &u in adj.nbrs(t) {
+                let other = g.face[u as usize];
+                if other as usize == f {
+                    continue;
+                }
+                if let Some(su) = smooth[u as usize] {
+                    let c = st.dot(su);
+                    if c > best[f].0 {
+                        best[f] = (c, other);
+                    }
+                }
+            }
+        }
+        let mut changed = false;
+        for t in 0..n {
+            let f = g.face[t] as usize;
+            if small[f] && best[f].1 != NONE {
+                g.face[t] = best[f].1;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
+/// Renumbers the faces that still have triangles, in order of first use, and drops the rest.
+fn compact(g: &mut Grown) {
+    let mut map = vec![NONE; g.kinds.len()];
+    let mut kinds = Vec::new();
+    let mut planes = Vec::new();
+    for f in g.face.iter_mut() {
+        let old = *f as usize;
+        if map.get(old).copied() == Some(NONE) {
+            if let Some(slot) = map.get_mut(old) {
+                *slot = kinds.len() as u32;
+            }
+            kinds.push(g.kinds.get(old).copied().unwrap_or(FaceKind::Curved));
+            planes.push(g.planes.get(old).copied().flatten());
+        }
+        *f = map.get(old).copied().unwrap_or(NONE);
+    }
+    g.kinds = kinds;
+    g.planes = planes;
+}
+
 /// One edge between two different faces: its end vertices, the faces on it, and the angle between the
-/// two sides' normals.
+/// two sides' smoothed normals (`None` when neither side has a normal, as for degenerate triangles).
 struct Segment {
     a: u32,
     b: u32,
     faces: Vec<u32>,
-    angle: f64,
+    angle: Option<f64>,
 }
 
 /// The edges whose triangles belong to more than one face.
-fn boundary_segments(edges: &[((u32, u32), Vec<u32>)], normal: &[Option<Vec3>], face: &[u32]) -> Vec<Segment> {
+fn boundary_segments(adj: &Adjacency, smooth: &[Option<Vec3>], face: &[u32]) -> Vec<Segment> {
     let mut out = Vec::new();
-    for ((a, b), ts) in edges {
+    for (e, &(a, b)) in adj.edge_key.iter().enumerate() {
+        let ts = adj.edge_tris(e);
         let mut faces: Vec<u32> = ts.iter().map(|&t| face[t as usize]).collect();
         faces.sort_unstable();
         faces.dedup();
         if faces.len() < 2 {
             continue;
         }
-        let mut angle = 0.0f64;
-        for (i, &t) in ts.iter().enumerate() {
-            for &u in &ts[i + 1..] {
+        let mut angle = None;
+        'pairs: for &t in ts {
+            for &u in ts {
                 if face[t as usize] != face[u as usize]
-                    && let (Some(nt), Some(nu)) = (normal[t as usize], normal[u as usize])
+                    && let (Some(nt), Some(nu)) = (smooth[t as usize], smooth[u as usize])
                 {
-                    angle = angle.max(det_math::acos(nt.dot(nu).clamp(-1.0, 1.0)));
+                    angle = Some(det_math::acos(nt.dot(nu).clamp(-1.0, 1.0)));
+                    break 'pairs;
                 }
             }
         }
-        out.push(Segment { a: *a, b: *b, faces, angle });
+        out.push(Segment { a, b, faces, angle });
     }
     out
 }
 
-/// A polyline of boundary: its vertices, the faces on it, and the largest angle of its segments.
+/// A polyline of boundary: its vertices, the faces on it, and the angle of each segment that has one.
 struct Line {
     points: Vec<u32>,
     faces: Vec<u32>,
-    angle: f64,
+    angles: Vec<f64>,
 }
 
 /// Chains the segments into polylines, each segment once. Lines run between junctions and free ends
 /// first; closed loops (all junctions of two) come after.
 fn chain(segs: &[Segment]) -> Vec<Line> {
-    let mut adj: HashMap<u32, Vec<usize>> = HashMap::new();
+    let mut adj: std::collections::HashMap<u32, Vec<usize>> = std::collections::HashMap::new();
     for (i, s) in segs.iter().enumerate() {
         adj.entry(s.a).or_default().push(i);
         adj.entry(s.b).or_default().push(i);
@@ -440,15 +745,15 @@ fn chain(segs: &[Segment]) -> Vec<Line> {
 }
 
 /// Follows the segments from `start` along `first` until a junction or a free end, or back to `start`.
-fn walk(start: u32, first: usize, segs: &[Segment], adj: &HashMap<u32, Vec<usize>>, used: &mut [bool]) -> Line {
-    let mut line = Line { points: vec![start], faces: Vec::new(), angle: 0.0 };
+fn walk(start: u32, first: usize, segs: &[Segment], adj: &std::collections::HashMap<u32, Vec<usize>>, used: &mut [bool]) -> Line {
+    let mut line = Line { points: vec![start], faces: Vec::new(), angles: Vec::new() };
     let (mut cur, mut s) = (start, first);
     loop {
         used[s] = true;
         let seg = &segs[s];
         let next = if seg.a == cur { seg.b } else { seg.a };
         line.faces.extend_from_slice(&seg.faces);
-        line.angle = line.angle.max(seg.angle);
+        line.angles.extend(seg.angle);
         line.points.push(next);
         cur = next;
         let Some(list) = adj.get(&cur) else { break };
@@ -465,45 +770,59 @@ fn walk(start: u32, first: usize, segs: &[Segment], adj: &HashMap<u32, Vec<usize
     line
 }
 
-/// The input meshes, each with its vertices split per face. A curved face's vertex normal is the
-/// area-weighted average of that face's triangles at the vertex, over the whole surface, so chunks that
-/// share a vertex agree on it. A planar face's normal is its plane's.
-fn split(surface: &Surface, meshes: &[Mesh], face: &[u32], kinds: &[FaceKind], planes: &[Option<Vec3>]) -> Vec<Mesh> {
-    let mut sum: HashMap<(u32, u32), Vec3> = HashMap::new();
+/// The median of a list of angles, or `None` when it is empty.
+fn median(mut v: Vec<f64>) -> Option<f64> {
+    v.sort_by(f64::total_cmp);
+    v.get(v.len() / 2).copied()
+}
+
+/// The one output mesh: vertices split per face, normals per face, and the boundary lines.
+fn build_mesh(surface: &Surface, smooth: &[Option<Vec3>], g: &Grown, lines: &[Line], tol: FaceTolerances) -> Mesh {
+    let n = surface.tris.len();
+    // One entry per triangle corner, grouped by (vertex, face) once sorted.
+    let mut corners: Vec<(u32, u32, u32, u8)> = Vec::with_capacity(3 * n);
     for (t, tri) in surface.tris.iter().enumerate() {
-        let raw = surface.area_normal(*tri);
-        for &v in tri {
-            *sum.entry((v, face[t])).or_insert(Vec3::ZERO) += raw;
+        let f = g.face[t];
+        for (slot, &v) in tri.iter().enumerate() {
+            corners.push((v, f, t as u32, slot as u8));
         }
     }
-    let mut out = Vec::with_capacity(meshes.len());
-    let mut offset = 0usize;
-    for m in meshes {
-        let mut mesh = Mesh::default();
-        let mut vertex: HashMap<(u32, u32), u32> = HashMap::new();
-        for (t, corners) in surface.tris.iter().enumerate().skip(offset).take(m.triangles.len()) {
-            let f = face[t];
-            let tri = corners.map(|v| {
-                *vertex.entry((v, f)).or_insert_with(|| {
-                    // The vertex count is below NONE, checked in `weld`.
-                    let id = mesh.positions.len() as u32;
-                    mesh.positions.push(surface.point(v));
-                    // A planar face shades with its plane, even where a tilted triangle sits in it.
-                    let normal = match (kinds.get(f as usize), planes.get(f as usize).copied().flatten()) {
-                        (Some(FaceKind::Planar), Some(n)) => n,
-                        _ => sum.get(&(v, f)).and_then(|s| s.normalized()).unwrap_or(Vec3::ZERO),
-                    };
-                    mesh.normals.push(normal);
-                    id
-                })
-            });
-            mesh.triangles.push(tri);
-            mesh.tri_face.push(f);
+    corners.sort_unstable();
+    let mut triangles = vec![[0u32; 3]; n];
+    let mut positions: Vec<Vec3> = Vec::new();
+    let mut normals: Vec<Vec3> = Vec::new();
+    let mut i = 0;
+    while i < corners.len() {
+        let (v, f, _, _) = corners[i];
+        let mut j = i;
+        let mut sum = Vec3::ZERO;
+        while let Some(&(cv, cf, t, _)) = corners.get(j) {
+            if cv != v || cf != f {
+                break;
+            }
+            if let Some(s) = smooth.get(t as usize).copied().flatten() {
+                sum += s;
+            }
+            j += 1;
         }
-        offset += m.triangles.len();
-        out.push(mesh);
+        let index = positions.len() as u32;
+        positions.push(surface.point(v));
+        let normal = match g.kinds.get(f as usize) {
+            Some(FaceKind::Planar) => g.planes.get(f as usize).copied().flatten().unwrap_or(Vec3::ZERO),
+            _ => sum.normalized().unwrap_or(Vec3::ZERO),
+        };
+        normals.push(normal);
+        for &(_, _, t, slot) in corners.get(i..j).unwrap_or(&[]) {
+            if let Some(tri) = triangles.get_mut(t as usize) {
+                tri[slot as usize] = index;
+            }
+        }
+        i = j;
     }
-    out
+    let edges: Vec<Vec<Vec3>> = lines.iter().map(|l| l.points.iter().map(|&v| surface.point(v)).collect()).collect();
+    let edge_faces: Vec<Vec<u32>> = lines.iter().map(|l| l.faces.clone()).collect();
+    let smooth_edges: Vec<bool> = lines.iter().map(|l| median(l.angles.clone()).is_some_and(|m| m <= tol.tangent_angle)).collect();
+    Mesh { positions, normals, triangles, tri_face: g.face.clone(), edges, edge_faces, smooth_edges, display_only_edges: true, ..Mesh::default() }
 }
 
 #[cfg(test)]
