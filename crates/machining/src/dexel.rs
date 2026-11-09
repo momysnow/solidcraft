@@ -7,10 +7,12 @@
 
 use std::sync::Arc;
 
-use solidcraft_geom::Vec3;
+use solidcore_record::Vec3;
 
 use crate::SimError;
 use crate::sweep::Sweep;
+#[allow(unused_imports)]
+use solidcraft_geom::prelude::*;
 
 /// Rays per tile along each of the two perpendicular axes.
 pub const TILE: usize = 32;

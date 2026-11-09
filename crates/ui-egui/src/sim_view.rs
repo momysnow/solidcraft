@@ -3,9 +3,9 @@
 //! part of the design.
 
 use crate::SolveApp;
-use crate::i18n::tr;
-use crate::theme::Tokens;
 use crate::ui_kit;
+use solidcraft_theme::Tokens;
+use solidcraft_ui_text::tr;
 
 /// Which parts of the tool are drawn.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -268,7 +268,7 @@ pub fn window(app: &mut SolveApp, ui: &mut egui::Ui) {
     let top = app.viewport.rect.map_or(120.0, |vp| crate::viewport::axis_rect(app, vp).bottom() + 8.0);
     let bottom = app.shell.history.map_or(ui.ctx().content_rect().bottom(), |bar| bar.top());
     let body = (bottom - top - 40.0 - 24.0 - 12.0).max(120.0);
-    let closed = ui_kit::Window::new(egui::Id::new("sim_view_window"), "eye", tr("sim.view.title"))
+    let closed = ui_kit::Window::new(egui::Id::unique("sim_view_window"), "eye", tr("sim.view.title"))
         .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-16.0, top))
         .max_body(body)
         .cards(WINDOW_CARDS)

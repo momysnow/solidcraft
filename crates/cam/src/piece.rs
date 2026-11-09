@@ -3,8 +3,10 @@
 
 use std::f64::consts::TAU;
 
-use solidcraft_geom::{Seg2, Vec2};
+use solidcore_record::{Seg2, Vec2};
 
+#[allow(unused_imports)]
+use solidcraft_geom::prelude::*;
 /// A parameter within this of 0 or 1 counts as on the piece.
 const PARAM_SLACK: f64 = 1e-9;
 

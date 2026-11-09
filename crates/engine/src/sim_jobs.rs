@@ -17,7 +17,10 @@
 //! shortcut: a checkpoint is not kept for a forward seek past it, so the moves after a backward seek are
 //! cut again. Upgrade: keep the later checkpoints, sorted, and skip them on the way forward.
 
-use solidcraft_geom::Vec3;
+use solidcore_record::Vec3;
+
+#[allow(unused_imports)]
+use solidcraft_geom::prelude::*;
 use solidcraft_machining::SimError;
 use solidcraft_machining::dexel::Stock;
 use solidcraft_machining::sim::{Cut, Cutter, Progress, step_count};

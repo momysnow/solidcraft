@@ -16,12 +16,16 @@ use std::sync::{Arc, Mutex, PoisonError, mpsc::Receiver, mpsc::TryRecvError};
 use std::time::Duration;
 
 use serde_json::json;
-use solidcraft_engine::geom::{Mesh, Vec3};
+use solidcore_record::Vec3;
+use solidcraft_engine::geom::{Mesh, prelude::*};
 use solidcraft_machining::dexel::Stock;
 use solidcraft_machining::mesh;
 
 use crate::gpu::{BlockBuilder, BlockBytes, GpuScene, PaletteIndex, SceneBlock, TriClass};
-use crate::{SolveApp, i18n::tr, theme::Tokens, ui_kit, viewport::c4};
+use solidcraft_theme::Tokens;
+use solidcraft_ui_text::tr;
+
+use crate::{SolveApp, ui_kit, viewport::c4};
 
 /// How often the window asks again while a batch is being meshed.
 const POLL: Duration = Duration::from_millis(100);
@@ -372,7 +376,7 @@ fn transport_button(ui: &mut egui::Ui, size: f32, glyph: &str, label: &str) -> e
     let ink = if response.hovered() { t.accent } else { t.icon };
     crate::icons::glyphs::transport_glyph_scaled(ui.painter(), rect.center() + egui::vec2(1.0, 1.0), glyph, t.overlay, GLYPH_SCALE);
     crate::icons::glyphs::transport_glyph_scaled(ui.painter(), rect.center(), glyph, ink, GLYPH_SCALE);
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label));
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, ui.is_enabled(), label));
     response.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(label)
 }
 
@@ -415,7 +419,7 @@ pub fn playback(app: &mut SolveApp, ui: &mut egui::Ui, viewport: egui::Rect) {
     let Some((time, total_time)) = app.session.sim_time() else { return };
     let view = crate::shell::bottom_overlay_rect(app, crate::shell::content_rect(app, viewport));
     let nav = app.viewport.layout.as_ref().map(|l| l.navigation).filter(|n| {
-        n.is_positive() && n.is_finite() && app.ui.show_navigation_bar && app.preferences.navigation_bar.edge == crate::navigation_bar::Edge::Bottom
+        n.is_positive() && n.is_finite() && app.ui.show_navigation_bar && app.preferences.navigation_bar.edge == crate::ui_kit::NavigationEdge::Bottom
     });
     let Some(rect) = bar_rect(view, nav).filter(|r| r.is_finite() && r.is_positive()) else { return };
     let t = Tokens::get();
@@ -437,7 +441,7 @@ pub fn playback(app: &mut SolveApp, ui: &mut egui::Ui, viewport: egui::Rect) {
     let speed = format!("{}: {:.0}{}", tr("sim.stock.speed"), app.sim_stock.speed, tr("sim.stock.speed_suffix"));
 
     // No surface under the buttons: they sit on the view. Claimed before the row's widgets, so they stay on top of it and the viewport gets no press on the bar.
-    ui.interact(rect, ui.id().with("sim_playback"), egui::Sense::click_and_drag());
+    ui.interact(rect, ui.scope_id().with("sim_playback"), egui::Sense::click_and_drag());
     app.sim_stock.bar = Some(rect);
 
     let playing = app.sim_stock.playing;
@@ -465,7 +469,7 @@ pub fn playback(app: &mut SolveApp, ui: &mut egui::Ui, viewport: egui::Rect) {
     ui.scope_builder(egui::UiBuilder::new().max_rect(low).layout(egui::Layout::left_to_right(egui::Align::Center)), |ui| {
         ui.set_clip_rect(rect);
         ui.spacing_mut().slider_width = low.width();
-        let slider = ui_kit::slider(ui, &mut level, 0.0..=1.0, ui_kit::Slider { show_value: false, on_view: true, ..Default::default() });
+        let slider = ui_kit::slider(ui, &mut level, 0.0..=1.0, ui_kit::Slider { show_value: false, ..Default::default() });
         if slider.on_hover_text(speed).changed() {
             app.sim_stock.speed = speed_at(level);
         }
@@ -530,7 +534,7 @@ fn section_bar(ui: &mut egui::Ui, size: egui::Vec2, sections: &[(String, f64, f6
     let seconds = |pos: egui::Pos2| (f64::from((pos.x - track.left()) / track.width().max(1.0)) * total).clamp(0.0, total);
     let name = response.hover_pos().map(seconds).and_then(|s| sections.iter().find(|(_, a, b, _)| s >= *a && s < *b)).map(|(n, _, _, _)| n.as_str());
     let tip = match name {
-        Some(n) => crate::i18n::format("sim.bar.operation", &[("name", n)]),
+        Some(n) => solidcraft_ui_text::format("sim.bar.operation", &[("name", n)]),
         None => tr("sim.stock.playhead").to_string(),
     };
     let response = response.on_hover_text(tip);

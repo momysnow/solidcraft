@@ -1,9 +1,11 @@
 use std::f64::consts::PI;
 
-use solidcraft_geom::{Loop2, Region2, Vec2, Vec3};
+use solidcore_record::{Loop2, Region2, Vec2, Vec3};
 
 use super::*;
 use crate::offset::Shape;
+#[allow(unused_imports)]
+use solidcraft_geom::prelude::*;
 
 fn v(x: f64, y: f64) -> Vec2 {
     Vec2::new(x, y)
@@ -684,6 +686,34 @@ fn adaptive_stays_inside_the_walls_and_clears_everything_the_tool_can_reach() {
             assert!(d <= 3.0 + 0.01, "{q:?} is {d} from the nearest pass");
         }
     }
+}
+
+#[test]
+fn adaptive_enters_and_links_just_above_the_last_floor() {
+    let regions = [rect(0.0, 0.0, 40.0, 30.0)];
+    let params = AdaptiveParams { stepover: 2.5, climb: true, stock_to_leave: 0.0, tolerance: 0.01 };
+    let path = adaptive(&regions, &tool(6.0), &params, &cut(0.0, -6.0, 2.0)).unwrap();
+    // A sideways feed move never runs more than the link lift above the floor the last level
+    // left: entry ramps and links do not start from the clearance or retract planes.
+    let floors = [0.0, -2.0, -4.0, -6.0];
+    let mut pos: Option<Vec3> = None;
+    let mut deepest = 0.0_f64;
+    for m in &path.moves {
+        let Some(to) = m.target() else { continue };
+        if let (Some(from), Move::Feed { .. } | Move::Arc { .. }) = (pos, m)
+            && (from.x - to.x).hypot(from.y - to.y) > 1e-9
+        {
+            deepest = deepest.min(to.z);
+            // The level being cut is the shallowest one at or below the deepest point so far.
+            let level = floors.iter().position(|f| *f <= deepest + 1e-6).unwrap_or(floors.len() - 1).max(1);
+            let floor = floors[level - 1];
+            assert!(from.z.max(to.z) <= floor + 0.5 + 1e-6, "a sideways feed from {from:?} to {to:?} runs above {floor} + 0.5");
+        }
+        pos = Some(to);
+    }
+    assert_eq!(path.stats().lowest_z, Some(-6.0));
+    // The path ends back at the clearance plane.
+    assert_eq!(pos.map(|p| p.z), Some(10.0));
 }
 
 #[test]

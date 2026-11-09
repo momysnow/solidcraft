@@ -2,10 +2,11 @@
 
 use std::f64::consts::TAU;
 
-use serde::{Deserialize, Serialize};
-use solidcraft_geom::{Vec2, Vec3};
-
 use crate::piece::wrap;
+use serde::{Deserialize, Serialize};
+use solidcore_record::{Vec2, Vec3};
+#[allow(unused_imports)]
+use solidcraft_geom::prelude::*;
 
 /// Most moves in one toolpath.
 pub const MAX_MOVES: usize = 2_000_000;

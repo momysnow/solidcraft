@@ -2,13 +2,14 @@
 //!
 //! Recut of the #1782 ribbon onto the cam document. Op dialogs land in the stacked UI PRs.
 
-use serde_json::{Value, json};
-use solidcraft_cam::ToolKind;
-use solidcraft_geom::Vec3;
-
 use super::CommandSpec;
 use crate::params::{bad, str_};
 use crate::{Result, Session};
+use serde_json::{Value, json};
+use solidcore_record::Vec3;
+use solidcraft_cam::ToolKind;
+#[allow(unused_imports)]
+use solidcraft_geom::prelude::*;
 
 fn opened(_s: &mut Session, _params: &Value) -> Result<Value> {
     Ok(json!({"opened": true}))

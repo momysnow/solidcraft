@@ -14,9 +14,13 @@
 
 use std::f64::consts::{FRAC_PI_2, PI, TAU};
 
-use solidcraft_geom::{Aabb3, Vec3};
+use solidcore_record::Vec3;
+
+use solidcraft_geom::Aabb3;
 
 use crate::det_math;
+#[allow(unused_imports)]
+use solidcraft_geom::prelude::*;
 
 /// Arcs with more extra turns than this are refused (a `Move` can come from any source).
 pub const MAX_ARC_TURNS: u32 = 1000;

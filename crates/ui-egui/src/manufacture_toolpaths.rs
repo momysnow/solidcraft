@@ -12,14 +12,14 @@ use std::sync::{Arc, Mutex, Weak, mpsc::Receiver, mpsc::TryRecvError};
 use std::time::Duration;
 
 use serde_json::{Value, json};
+use solidcore_record::Vec3;
 use solidcraft_engine::Session;
 use solidcraft_engine::doc::Document;
-use solidcraft_engine::geom::Vec3;
+use solidcraft_theme::Tokens;
 
 use crate::{
     SolveApp,
     gpu::GpuScene,
-    theme::Tokens,
     viewport::{c4, dashes},
 };
 

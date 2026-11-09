@@ -22,9 +22,13 @@
 
 use std::collections::HashMap;
 
-use solidcraft_geom::{Mesh, Vec3};
+use solidcore_record::Vec3;
+
+use solidcraft_geom::Mesh;
 
 use crate::dexel::Stock;
+#[allow(unused_imports)]
+use solidcraft_geom::prelude::*;
 
 pub const CHUNK: i64 = 32;
 /// The lowest lower node the mesher walks. Nodes below it are taken as air: the stock never has

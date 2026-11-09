@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use solidcraft_geom::Vec3;
+use solidcore_record::Vec3;
 
 use super::Stock;
 use crate::SimError;
@@ -8,6 +8,8 @@ use crate::gcode::{CodeTable, parse};
 use crate::sim::{Cutter, simulate, step_count};
 use crate::sweep::{ArcFixedAxis, FlatTool, LinearFixedAxis};
 use crate::toolpath::{Program, Shape, Tool};
+#[allow(unused_imports)]
+use solidcraft_geom::prelude::*;
 
 const R: f64 = 2.5;
 /// The slot's centreline. Off the ray rows of h = 0.2, 0.1 and 0.05, so the walls (SLOT_Y -+ R) are never

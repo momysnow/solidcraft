@@ -45,6 +45,8 @@ pub struct State {
     pub active_setup: String,
     pub cam_mode: CamMode,
     pub setup_dialog: Option<crate::manufacture_setup::SetupDialogState>,
+    /// The open operation window (Contour, Pocket, Adaptive).
+    pub op_dialog: Option<crate::manufacture_operation::OpDialogState>,
     /// The operation picked in the Browser (its name in the active setup): its toolpath is drawn
     /// in the highlight colour and the others are dimmed.
     pub selected_op: Option<String>,
@@ -114,6 +116,7 @@ pub fn reset_document(app: &mut SolveApp) {
 
 pub fn close_floating_dialogs(app: &mut SolveApp) {
     app.manufacture_workspace.setup_dialog = None;
+    app.manufacture_workspace.op_dialog = None;
     app.ui.pick_bodies = false;
 }
 
@@ -158,12 +161,19 @@ pub fn start_hook(app: &mut SolveApp, id: &str) -> bool {
             crate::sim_stock::exit_simulation(app);
             false
         }
+        id if let Some(kind) = crate::manufacture_operation::OpKind::from_command(id) => {
+            crate::manufacture_operation::open(app, kind);
+            false
+        }
         id if id.starts_with("manufacture.") => {
             enter(app);
             if let Some(tab) = tab_for_command(id) {
                 show_tab(app, tab);
             }
-            true
+            // The rest of the ribbon has no window yet: say so instead of doing nothing.
+            let label = app.tr(&format!("cmd.{id}")).to_string();
+            app.set_status(solidcraft_ui_text::format("manufacture.op.not_available", &[("name", &label)]), true);
+            false
         }
         _ => true,
     }
@@ -192,6 +202,7 @@ pub fn tick(app: &mut SolveApp, ctx: &egui::Context) {
 
 pub fn panel(app: &mut SolveApp, ui: &mut egui::Ui) {
     crate::manufacture_setup::show_dialogs(app, ui);
+    crate::manufacture_operation::show_dialog(app, ui);
     crate::sim_view::window(app, ui);
 }
 
@@ -241,6 +252,7 @@ mod tests {
     use super::*;
     use crate::scenario::Harness;
     use serde_json::json;
+    use solidcraft_engine::geom::prelude::*;
 
     #[test]
     fn new_setup_opens_the_setup_window_without_creating() {
@@ -324,6 +336,27 @@ mod tests {
         .unwrap_or_else(|e| panic!("{e}"));
         crate::manufacture_workspace::enter(&mut h.app);
         h.app.manufacture_workspace.active_setup = "Top".into();
+    }
+
+    /// The Pocket button opens the operation window on the active setup; OK adds the pocket of the
+    /// picked sketch with a new tool. A button without a toolpath says so instead of doing nothing.
+    #[test]
+    fn operation_buttons_open_a_window_that_adds_the_operation() {
+        let mut h = Harness::new();
+        milled_setup(&mut h);
+        h.app.run("sketch.create", json!({"plane": "XY", "name": "Slot"})).unwrap_or_else(|e| panic!("{e}"));
+        h.app.run("sketch.circle.center", json!({"center": [20, 15], "diameter": 10})).unwrap_or_else(|e| panic!("{e}"));
+        h.app.run("sketch.finish", json!({})).unwrap_or_else(|e| panic!("{e}"));
+        h.app.start("manufacture.2d.pocket");
+        let state = h.app.manufacture_workspace.op_dialog.clone().unwrap_or_else(|| panic!("Pocket opens its window"));
+        assert_eq!((state.kind, state.setup.as_str(), state.geometry), (crate::manufacture_operation::OpKind::Pocket, "Top", 1));
+        h.frames(2);
+        let state = crate::manufacture_operation::OpDialogState { tool: 1, new_diameter: 4.0, bottom: -2.0, ..state };
+        assert!(crate::manufacture_operation::save(&mut h.app, &state), "{:?}", h.app.status);
+        let ops = &h.app.session.doc.cam.setup("Top").map(|s| s.operations.clone()).unwrap_or_default();
+        assert!(ops.iter().any(|o| o.name() == state.name && o.tool() == 2), "a pocket on the new tool T2");
+        h.app.start("manufacture.2d.face");
+        assert!(h.app.status.as_ref().is_some_and(|(text, _, error)| *error && text.contains("Face")), "{:?}", h.app.status);
     }
 
     /// The active setup's toolpaths are computed once a design has been still for a moment, then
@@ -740,7 +773,7 @@ G0 Z5", "resolution": 0.5});
 
     /// Whether the drawn cutting tool has its base fan at `tip`, facing against `axis`.
     fn tool_base_at(app: &SolveApp, tip: [f64; 3], axis: [f64; 3]) -> bool {
-        let (tip, axis) = (solidcraft_engine::geom::Vec3::from(tip), solidcraft_engine::geom::Vec3::from(axis));
+        let (tip, axis) = (solidcore_record::Vec3::from(tip), solidcore_record::Vec3::from(axis));
         crate::sim_stock::drawn_tool(app)
             .iter()
             .flatten()

@@ -19,6 +19,12 @@
 
 use std::sync::{Arc, Mutex};
 
+use crate::check::verify;
+use crate::offset::{Shape, offset_regions};
+use crate::ops::Cut;
+use crate::path::{MAX_MOVES, Move, Toolpath, arc_sweep};
+use crate::tool::{Tool, ToolKind};
+use crate::{CamError, Result, invalid};
 use raygeo::cnc::execution::intent::create_intent;
 use raygeo::cnc::execution::specs::AggregateOutput;
 use raygeo::cnc::plan::clearing::{ClearingWorkplanOptions, plan_clearing};
@@ -29,17 +35,14 @@ use raygeo::ops::{MoveCmd, OpCategory};
 use raygeo::pipeline::completed::CompletedNode;
 use raygeo::pipeline::pipeline::Pipeline;
 use serde::{Deserialize, Serialize};
-use solidcraft_geom::{Loop2, Region2, Vec2, Vec3};
-
-use crate::check::verify;
-use crate::offset::{Shape, offset_regions};
-use crate::ops::Cut;
-use crate::path::{MAX_MOVES, Move, Toolpath, arc_sweep};
-use crate::tool::{Tool, ToolKind};
-use crate::{CamError, Result, invalid};
+use solidcore_record::{Loop2, Region2, Vec2, Vec3};
+#[allow(unused_imports)]
+use solidcraft_geom::prelude::*;
 
 /// Largest coordinate the engine is asked to cut (mm).
 const MAX_COORD: f64 = 1.0e6;
+/// How far above the floor the last level left a level enters and links (mm).
+const LINK_LIFT: f64 = 0.5;
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AdaptiveParams {
@@ -114,13 +117,23 @@ pub fn adaptive(regions: &[Region2], tool: &Tool, params: &AdaptiveParams, cut: 
         // what every move target is snapped into.
         let shape = Shape::from_regions(std::slice::from_ref(region), params.tolerance)?;
         let keep_out = tool.radius() + params.stock_to_leave - 1e-6;
+        let mut level_top = cut.heights.top;
         for z in &levels {
-            let ops = clear_level(&boundary, &islands, size, tool, params, cut, *z)?;
-            append(&ops, cut, &mut moves, &mut pos, &shape, keep_out)?;
+            // Inside the region everything above the last level's floor is cut already, so a
+            // level ramps in and links from just above it, not from the clearance plane.
+            let link = (level_top + LINK_LIFT).min(cut.heights.retract);
+            let ops = clear_level(&boundary, &islands, size, tool, params, *z, link)?;
+            append(&ops, cut, &mut moves, &mut pos, &shape, keep_out, link)?;
+            level_top = *z;
             if moves.len() > MAX_MOVES {
                 return Err(CamError::TooLarge(format!("the toolpath has more than {MAX_MOVES} moves")));
             }
         }
+    }
+    if let Some(p) = pos
+        && p.z < cut.heights.clearance
+    {
+        moves.push(Move::Rapid { to: Vec3::new(p.x, p.y, cut.heights.clearance) });
     }
     let cuts_any = moves.iter().any(|m| matches!(m, Move::Feed { .. } | Move::Arc { .. }));
     if !cuts_any {
@@ -175,8 +188,8 @@ fn clear_level(
     size: (f64, f64),
     tool: &Tool,
     params: &AdaptiveParams,
-    cut: &Cut,
     target_z: f64,
+    safe_z: f64,
 ) -> Result<Ops> {
     let part = Part::from_polygons(boundary, islands, size);
     // The scales follow the engine's own defaults (a 3 mm-radius tool steps
@@ -188,7 +201,7 @@ fn clear_level(
         step_over: params.stepover,
         step_length: tool.radius() * 0.2,
         target_z,
-        safe_z: cut.heights.clearance,
+        safe_z,
         wall_margin: 0.0,
         safe_margin: tool.radius() * 0.2,
         stock_to_leave: 0.0,
@@ -197,6 +210,13 @@ fn clear_level(
         area_tolerance: 1.0,
         max_deflection_deg: 30.0,
         finishing: false,
+        // The planner's historical behaviour: counter-clockwise passes, its own entry, travels over
+        // the cleared floor, and the feeds left to the post.
+        cut_direction: Default::default(),
+        max_entry_angle_deg: 0.0,
+        travel_mode: Default::default(),
+        feed_rate: None,
+        plunge_feed: None,
     };
     let mut plan = plan_clearing(&part, "", &options).map_err(|e| CamError::Invalid(format!("the clearing planner failed: {e}")))?;
     for step in &mut plan.steps {
@@ -257,18 +277,32 @@ fn clamp_to(shape: &Shape, keep_out: f64, from: Vec2, to: Vec2) -> Vec2 {
     from.lerp(to, lo)
 }
 
+/// Whether the tool stays `keep_out` inside the region all the way from `from` to `to`.
+fn clear_along(shape: &Shape, keep_out: f64, from: Vec2, to: Vec2) -> bool {
+    let steps = ((from.dist(to) / (keep_out.max(0.1) * 0.25)).ceil() as usize).clamp(1, 4096);
+    (0..=steps).all(|k| shape.clear(from.lerp(to, k as f64 / steps as f64), keep_out))
+}
+
 /// Appends the engine's motion commands as moves.
 ///
 /// The engine links its passes with high-speed skims that rise just above the
 /// cut and knows from its own cleared-area state that they cross cleared
-/// material. This crate judges a toolpath from the path alone, so a travel
-/// below the retract height is rewritten the way the pocket operation builds
-/// its own: up to the retract plane, across, and down at the plunge feed.
-/// Feed moves straight down also take the plunge feed.
-fn append(ops: &Ops, cut: &Cut, moves: &mut Vec<Move>, pos: &mut Option<Vec3>, shape: &Shape, keep_out: f64) -> Result<()> {
+/// material. This crate judges a toolpath from the path alone: a travel below
+/// the retract height that stays inside the region feeds across at `link`,
+/// above all the material this level cuts; any other is rewritten the way the
+/// pocket operation builds its own: up to the retract plane, across, and down
+/// at the plunge feed. Feed moves straight down also take the plunge feed.
+/// Travels after the level's last cut are dropped: the next level or the
+/// final retract moves the tool on.
+fn append(ops: &Ops, cut: &Cut, moves: &mut Vec<Move>, pos: &mut Option<Vec3>, shape: &Shape, keep_out: f64, link: f64) -> Result<()> {
     let h = &cut.heights;
     let feeds = &cut.feeds;
-    for node in ops.commands.iter() {
+    let last_cut = ops
+        .commands
+        .iter()
+        .rposition(|node| matches!(&node.category, OpCategory::Moving { cmd: MoveCmd::LineTo | MoveCmd::ArcTo(_), .. }))
+        .map_or(0, |i| i + 1);
+    for node in ops.commands.iter().take(last_cut) {
         let OpCategory::Moving { end, cmd } = &node.category else { continue };
         let mut to = Vec3::new(end.x, end.y, end.z);
         if !to.is_finite() {
@@ -279,11 +313,15 @@ fn append(ops: &Ops, cut: &Cut, moves: &mut Vec<Move>, pos: &mut Option<Vec3>, s
             Some(from) => from,
             None if moves.is_empty() => {
                 // The engine's first command positions at its own working
-                // height; the path still begins at the clearance plane.
+                // height; the path still begins at the clearance plane, and
+                // goes on down from there.
                 let at = Vec3::new(to.x, to.y, h.clearance.max(to.z));
                 moves.push(Move::Rapid { to: at });
                 *pos = Some(at);
-                continue;
+                if at.dist(to) <= 1e-9 {
+                    continue;
+                }
+                at
             }
             None => continue,
         };
@@ -306,6 +344,15 @@ fn append(ops: &Ops, cut: &Cut, moves: &mut Vec<Move>, pos: &mut Option<Vec3>, s
                         moves.push(Move::Rapid { to: Vec3::new(from.x, from.y, h.retract) });
                     }
                     moves.push(Move::Feed { to, feed: feeds.plunge });
+                } else if from.z <= h.retract + 1e-9 && clear_along(shape, keep_out, from_xy, to_xy) {
+                    let across = link.max(to.z);
+                    if from.z < across - 1e-9 {
+                        moves.push(Move::Feed { to: from_xy.extend(across), feed: feeds.cut });
+                    }
+                    moves.push(Move::Feed { to: to_xy.extend(across), feed: feeds.cut });
+                    if to.z < across - 1e-9 {
+                        moves.push(Move::Feed { to, feed: feeds.plunge });
+                    }
                 } else {
                     moves.push(Move::Rapid { to: Vec3::new(from.x, from.y, h.retract) });
                     moves.push(Move::Rapid { to: Vec3::new(to.x, to.y, h.retract) });

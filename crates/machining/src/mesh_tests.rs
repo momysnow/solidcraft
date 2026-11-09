@@ -1,10 +1,14 @@
 use std::collections::HashMap;
 
-use solidcraft_geom::{Mesh, Vec3};
+use solidcore_record::Vec3;
+
+use solidcraft_geom::Mesh;
 
 use super::{Lattice, chunk_counts, chunk_mesh, chunk_meshes, dirty_chunks, extract, mesh_volume};
 use crate::dexel::Stock;
 use crate::sweep::{FlatTool, LinearFixedAxis};
+#[allow(unused_imports)]
+use solidcraft_geom::prelude::*;
 
 /// Chunk meshes welded by exact position (chunks share their boundary vertices bit for bit), so the
 /// result is one mesh whose edges can be counted.

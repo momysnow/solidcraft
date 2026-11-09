@@ -36,7 +36,10 @@ pub(crate) fn start(app: &mut SolveApp, component: u64) {
         return;
     }
     let document = app.session.doc.clone();
-    app.pick_open_for(&solidcraft_engine::io::DESIGN_EXTS, move |app, path| {
+    // A design of any release, or a plain JSON design: what Insert Design takes.
+    let mut extensions = solidcraft_engine::io::DESIGN_EXTS.to_vec();
+    extensions.push("json");
+    app.pick_open_for(&extensions, move |app, path| {
         let Some(path) = path else { return };
         // A host or programmatic caller can replace/edit a design while a native picker is
         // pending. Never apply that old component id to a different design or newer revision.
@@ -248,15 +251,16 @@ pub fn link_copies(app: &mut SolveApp, accept: bool) -> bool {
 pub fn show_copies(app: &mut SolveApp, ctx: &egui::Context) {
     let Some(c) = app.menu.link_copies.clone() else { return };
     let name = app.session.doc.components.iter().find(|x| x.id == c.linked).map(|x| x.name.clone()).unwrap_or_default();
-    let (closed, action) = crate::ui_kit::Confirm::new(egui::Id::new("sc_link_copies"), "help", crate::i18n::tr_label("Link Identical Copies"))
-        .actions("Link", "Keep", None)
-        .show(ctx, true, |ui| {
-            let text = crate::i18n::format("ui.link_copies_text", &[("name", &name)]);
-            crate::ui_kit::text(ui, &text, crate::ui_kit::Text::Report("copies", false));
-            for (id, copy) in &c.copies {
-                crate::ui_kit::text(ui, &format!("  • {copy}"), crate::ui_kit::Text::Report(&format!("copy:{id}"), false));
-            }
-        });
+    let (closed, action) =
+        crate::ui_kit::Confirm::new(egui::Id::unique("sc_link_copies"), "help", solidcraft_ui_text::tr_label("Link Identical Copies"))
+            .actions("Link", "Keep", None)
+            .show(ctx, true, |ui| {
+                let text = solidcraft_ui_text::format("ui.link_copies_text", &[("name", &name)]);
+                crate::ui_kit::text(ui, &text, crate::ui_kit::Text::Report("copies", false));
+                for (id, copy) in &c.copies {
+                    crate::ui_kit::text(ui, &format!("  • {copy}"), crate::ui_kit::Text::Report(&format!("copy:{id}"), false));
+                }
+            });
     match action {
         crate::ui_kit::Action::Ok => drop(link_copies(app, true)),
         crate::ui_kit::Action::Cancel => drop(link_copies(app, false)),
@@ -289,13 +293,13 @@ mod tests {
         (app, component, occurrence, folder, moved)
     }
 
-    fn menu(app: &SolveApp, target: Target) -> Option<context_menu::Item> {
-        context_menu::items(app, &target).into_iter().find(|i| i.id == "ui.relinkSource")
+    fn menu(app: &SolveApp, target: Target) -> Option<crate::ui_kit::Item> {
+        context_menu::entries(app, &target).into_iter().find(|i| i.id == "ui.relinkSource")
     }
 
     fn answer(app: &mut SolveApp, path: Option<String>) {
         app.services.pick_open = Some(Box::new(move |extensions| {
-            assert_eq!(extensions, &["sc", "solidcraft", "solvecraft"], "a design of any release");
+            assert_eq!(extensions, &["sc", "solidcraft", "solvecraft", "json"], "a design of any release, or a plain JSON design");
             let result = path.clone();
             Box::pin(async move { result })
         }));
@@ -369,6 +373,20 @@ mod tests {
     }
 
     #[test]
+    fn relink_picks_a_plain_json_design_as_insert_design_does() {
+        let (mut app, component, _, folder, _) = fixture("json");
+        let plain = folder.join("plain.json");
+        let mut part = Session::default();
+        part.execute("solid.box", &json!({"length": 10, "width": 20, "height": 45})).unwrap();
+        part.execute("file.save", &json!({"path": plain})).unwrap();
+        answer(&mut app, Some(plain.to_string_lossy().into_owned()));
+        start(&mut app, component);
+        crate::file_picker::tick(&mut app, &egui::Context::default());
+        assert!(app.session.doc.links[&component].path.ends_with("plain.json"));
+        let _ = std::fs::remove_dir_all(folder);
+    }
+
+    #[test]
     fn extract_menu_asks_where_to_save_and_links_the_component_there() {
         let folder = std::env::temp_dir().join(format!("solidcraft-extract-ui-{}", std::process::id()));
         std::fs::create_dir_all(&folder).unwrap();
@@ -376,16 +394,18 @@ mod tests {
         let made = app.run("component.create", json!({"name": "Bracket", "grounded": false})).unwrap();
         let (component, occurrence) = (made["component"].as_u64().unwrap(), made["occurrence"].as_u64().unwrap());
         app.run("solid.box", json!({"length": 10, "width": 20, "height": 30})).unwrap();
-        let find = |app: &SolveApp, id: u64| context_menu::items(app, &Target::Component { id }).into_iter().find(|i| i.id == "ui.extractComponent");
+        let find =
+            |app: &SolveApp, id: u64| context_menu::entries(app, &Target::Component { id }).into_iter().find(|i| i.id == "ui.extractComponent");
         assert!(find(&app, 0).is_none());
         // Not offered while the component can't go: here, moved without Capture Position
         app.run("occurrence.move", json!({"occurrence": occurrence, "translate": [5, 0, 0], "capture": false})).unwrap();
         assert!(find(&app, component).is_none());
         app.run("component.revert_position", json!({})).unwrap();
-        // In Relink Source's place, right after Properties
-        let ids: Vec<String> = context_menu::items(&app, &Target::Component { id: component }).into_iter().map(|i| i.id).collect();
-        let properties = ids.iter().position(|i| i == "ui.properties").unwrap();
-        assert_eq!(ids.get(properties + 1).map(String::as_str), Some("ui.extractComponent"));
+        // In Relink Source's place in the Component flyout, right below New Component
+        let rows = context_menu::items(&app, &Target::Component { id: component });
+        let ids: Vec<&str> = rows.iter().find(|i| i.label == "Component").unwrap().children.iter().map(|i| i.id.as_str()).collect();
+        let create = ids.iter().position(|i| *i == "component.create").unwrap();
+        assert_eq!(ids.get(create + 1), Some(&"ui.extractComponent"));
         let item = find(&app, component).unwrap();
         let chosen = folder.join("bracket").to_string_lossy().into_owned();
         app.services.pick_save = Some(Box::new(move |name, extensions| {
@@ -446,7 +466,11 @@ mod tests {
         let mut app = SolveApp::new(Session::default(), Default::default());
         app.run("component.insert_design", json!({"path": file})).unwrap();
         let volume = |app: &SolveApp| {
-            app.session.world_state().bodies.iter().map(|b| solidcraft_engine::kernel::measure(&b.body).unwrap().volume).sum::<f64>()
+            crate::open_meshing::session_world(&app.session)
+                .bodies
+                .iter()
+                .map(|b| solidcraft_engine::kernel::measure(&b.body).unwrap().volume)
+                .sum::<f64>()
         };
         let ctx = egui::Context::default();
         let settle = |app: &mut SolveApp| {
@@ -539,7 +563,7 @@ mod tests {
     }
 
     fn volume(app: &SolveApp) -> f64 {
-        app.session.world_state().bodies.iter().map(|b| solidcraft_engine::kernel::measure(&b.body).unwrap().volume).sum()
+        crate::open_meshing::session_world(&app.session).bodies.iter().map(|b| solidcraft_engine::kernel::measure(&b.body).unwrap().volume).sum()
     }
 
     /// Away to the blank tab and back to the assembly.

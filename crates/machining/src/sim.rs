@@ -5,12 +5,14 @@
 
 use std::ops::Range;
 
-use solidcraft_geom::Vec3;
+use solidcore_record::Vec3;
 
 use crate::SimError;
 use crate::dexel::Stock;
 use crate::sweep::{ArcFixedAxis, FlatTool, LinearFixedAxis, MAX_ARC_TURNS};
 use crate::toolpath::{Diag, MoveKind, NO_TOOL, Program, Shape};
+#[allow(unused_imports)]
+use solidcraft_geom::prelude::*;
 
 const MAX_DIAGS: usize = 1000;
 /// An arc is cut a quarter turn per step: a step is then a fraction of a second even at fine spacing,

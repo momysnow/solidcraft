@@ -3,15 +3,16 @@
 
 use std::f64::consts::PI;
 
-use serde::{Deserialize, Serialize};
-use solidcraft_geom::{Region2, Vec2, Vec3};
-
 use crate::check::verify;
 use crate::offset::{Shape, reversed};
 use crate::path::{MAX_MOVES, Move, Toolpath};
 use crate::piece::Piece;
 use crate::tool::{Tool, ToolKind};
 use crate::{CamError, Result, invalid};
+use serde::{Deserialize, Serialize};
+use solidcore_record::{Region2, Vec2, Vec3};
+#[allow(unused_imports)]
+use solidcraft_geom::prelude::*;
 
 /// Most depth passes of one operation.
 const MAX_LEVELS: usize = 10_000;

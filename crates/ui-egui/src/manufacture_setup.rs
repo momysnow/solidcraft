@@ -91,9 +91,9 @@ pub fn show_dialogs(app: &mut SolveApp, ui: &mut egui::Ui) {
         return;
     };
     let title_owned = if state.existing_name.is_some() {
-        format!("{} : {}", crate::i18n::tr("ui.heading_setup"), state.name.to_uppercase())
+        format!("{} : {}", solidcraft_ui_text::tr("ui.heading_setup"), state.name.to_uppercase())
     } else {
-        crate::i18n::tr("ui.heading_setup").to_string()
+        solidcraft_ui_text::tr("ui.heading_setup").to_string()
     };
 
     let mut draft = state.draft.clone();
@@ -103,7 +103,7 @@ pub fn show_dialogs(app: &mut SolveApp, ui: &mut egui::Ui) {
     let name_editable = state.existing_name.is_none();
 
     let (closed, action) =
-        crate::ui_kit::Window::new(egui::Id::new("mfg_setup_dialog"), "settings", &title_owned).fields().cards(1.2).show(ui.ctx(), true, |ui| {
+        crate::ui_kit::Window::new(egui::Id::unique("mfg_setup_dialog"), "settings", &title_owned).fields().cards(1.2).show(ui.ctx(), true, |ui| {
             crate::ui_kit::scope(ui, |ui| {
                 let mut tab_idx = match tab {
                     SetupDialogTab::Setup => 0,
@@ -418,7 +418,7 @@ fn selected_body_names(app: &SolveApp) -> Vec<String> {
 }
 
 fn model_bounds(app: &SolveApp, names: &[String]) -> Option<([f64; 3], [f64; 3])> {
-    let st = app.session.world_state();
+    let st = app.session.world_state().ok()?;
     let mut box3 = solidcraft_engine::geom::Aabb3::EMPTY;
     for name in names {
         if let Some(body) = st.body(name) {
@@ -580,10 +580,10 @@ fn paint_setup(app: &SolveApp, painter: &egui::Painter, proj: &viewport::Proj, s
     let wcs = painted_wcs(setup);
     let model = model_bounds(app, &setup.model_bodies);
     let (min, max) = stock_box(setup, model);
-    let t = crate::theme::Tokens::get();
-    let o = solidcraft_engine::geom::Vec3::new(wcs.origin[0], wcs.origin[1], wcs.origin[2]);
+    let t = solidcraft_theme::Tokens::get();
+    let o = solidcore_record::Vec3::new(wcs.origin[0], wcs.origin[1], wcs.origin[2]);
     let len = triad_len(model.unwrap_or((min, max)));
-    let axis = |v: [f64; 3]| solidcraft_engine::geom::Vec3::new(v[0] * len, v[1] * len, v[2] * len);
+    let axis = |v: [f64; 3]| solidcore_record::Vec3::new(v[0] * len, v[1] * len, v[2] * len);
     if let Some(origin) = proj.to_screen(o) {
         for (dir, color) in [(wcs.x_axis, t.axis_x), (wcs.y_axis, t.axis_y), (wcs.z_axis(), t.axis_z)] {
             if let Some(tip) = proj.to_screen(o + axis(dir)) {
@@ -602,13 +602,13 @@ fn paint_setup(app: &SolveApp, painter: &egui::Painter, proj: &viewport::Proj, s
         [min[0], max[1], max[2]],
     ];
     let edges = [[0, 1], [1, 2], [2, 3], [3, 0], [4, 5], [5, 6], [6, 7], [7, 4], [0, 4], [1, 5], [2, 6], [3, 7]];
-    let tk = crate::theme::Tokens::get();
+    let tk = solidcraft_theme::Tokens::get();
     let stock_color = tk.warning.gamma_multiply(0.7);
     for e in edges {
         let a = corners[e[0]];
         let b = corners[e[1]];
-        let wa = solidcraft_engine::geom::Vec3::new(a[0], a[1], a[2]);
-        let wb = solidcraft_engine::geom::Vec3::new(b[0], b[1], b[2]);
+        let wa = solidcore_record::Vec3::new(a[0], a[1], a[2]);
+        let wb = solidcore_record::Vec3::new(b[0], b[1], b[2]);
         if let (Some(sa), Some(sb)) = (proj.to_screen(wa), proj.to_screen(wb)) {
             painter.line_segment([sa, sb], egui::Stroke::new(1.5, stock_color));
         }
@@ -619,7 +619,7 @@ fn paint_setup(app: &SolveApp, painter: &egui::Painter, proj: &viewport::Proj, s
     let hover = painter.ctx().input(|i| i.pointer.hover_pos());
     let origin = wcs.origin;
     for (_bp, world) in box_points(min, max) {
-        let p = solidcraft_engine::geom::Vec3::new(world[0], world[1], world[2]);
+        let p = solidcore_record::Vec3::new(world[0], world[1], world[2]);
         let Some(sp) = proj.to_screen(p) else { continue };
         let active = (origin[0] - world[0]).abs() < 1e-3 && (origin[1] - world[1]).abs() < 1e-3 && (origin[2] - world[2]).abs() < 1e-3;
         let hot = hover.is_some_and(|h| h.distance(sp) <= 14.0);
@@ -662,7 +662,7 @@ pub fn try_pick_origin(app: &mut SolveApp, proj: &viewport::Proj, screen: egui::
     state.draft.box_point = bp;
     state.draft.wcs.origin = world;
     state.draft.wcs_origin_mode = WcsOriginMode::StockBoxPoint;
-    app.set_status(crate::i18n::tr("manufacture.setup.origin_set").to_string(), false);
+    app.set_status(solidcraft_ui_text::tr("manufacture.setup.origin_set").to_string(), false);
     true
 }
 
@@ -685,7 +685,7 @@ fn box_points(min: [f64; 3], max: [f64; 3]) -> Vec<(BoxPoint, [f64; 3])> {
 fn nearest_box_point(proj: &viewport::Proj, screen: egui::Pos2, min: [f64; 3], max: [f64; 3], radius: f32) -> Option<(BoxPoint, [f64; 3])> {
     let mut best: Option<(f32, BoxPoint, [f64; 3])> = None;
     for (bp, world) in box_points(min, max) {
-        let p = solidcraft_engine::geom::Vec3::new(world[0], world[1], world[2]);
+        let p = solidcore_record::Vec3::new(world[0], world[1], world[2]);
         let Some(sp) = proj.to_screen(p) else { continue };
         let d = sp.distance(screen);
         if d <= radius && best.is_none_or(|(bd, _, _)| d < bd) {

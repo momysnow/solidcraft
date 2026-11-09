@@ -5,10 +5,12 @@
 
 use std::f64::consts::{FRAC_PI_2, TAU};
 
-use solidcraft_geom::{Loop2, Region2, Seg2, Vec2};
+use solidcore_record::{Loop2, Region2, Seg2, Vec2};
 
 use crate::piece::{Piece, turn};
 use crate::{CamError, Result, invalid};
+#[allow(unused_imports)]
+use solidcraft_geom::prelude::*;
 
 /// Most boundary pieces of one operation's regions (curves count by their line approximation).
 pub(crate) const MAX_PIECES: usize = 4000;

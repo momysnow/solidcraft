@@ -1,13 +1,14 @@
 //! Programs as G-code: [`emit`] writes one through a [`Post`], [`parse`] reads the motion
 //! back (the subset `emit` writes), which is how the output is checked.
 
-use serde::{Deserialize, Serialize};
-use solidcraft_geom::{Vec2, Vec3};
-
 use crate::path::{Move, Toolpath, arc_sweep};
 use crate::post::{CommentStyle, Post, Values, fill};
 use crate::tool::Tool;
 use crate::{CamError, Result, invalid};
+use serde::{Deserialize, Serialize};
+use solidcore_record::{Vec2, Vec3};
+#[allow(unused_imports)]
+use solidcraft_geom::prelude::*;
 
 /// Most operations in one program.
 const MAX_OPERATIONS: usize = 10_000;

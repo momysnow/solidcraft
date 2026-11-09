@@ -7,7 +7,9 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::Value;
-use solidcraft_geom::Vec3;
+use solidcore_record::Vec3;
+#[allow(unused_imports)]
+use solidcraft_geom::prelude::*;
 use solidcraft_machining::SimError;
 use solidcraft_machining::dexel::Stock;
 use solidcraft_machining::gcode::{self, CodeTable};

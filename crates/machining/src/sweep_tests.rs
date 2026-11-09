@@ -1,6 +1,7 @@
-use solidcraft_geom::Vec3;
-
 use super::{ArcFixedAxis, FlatTool, LinearFixedAxis, MAX_ARC_TURNS, Sweep, brent_min, fiber};
+use solidcore_record::Vec3;
+#[allow(unused_imports)]
+use solidcraft_geom::prelude::*;
 
 const R: f64 = 2.5;
 const L: f64 = 10.0;

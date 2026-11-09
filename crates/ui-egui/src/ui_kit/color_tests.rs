@@ -1,4 +1,5 @@
 use super::*;
+use crate::scenario;
 use crate::ui_kit::test_support::pointer;
 
 fn frame<R>(ctx: &egui::Context, events: Vec<egui::Event>, mut add: impl FnMut(&mut Ui) -> R) {
@@ -306,9 +307,9 @@ fn pixel(primitives: &[egui::ClippedPrimitive], at: egui::Pos2) -> [f32; 4] {
 
 #[test]
 fn rendered_square_hue_and_current_strip_leave_rounded_corner_pixels_clear() {
-    let previous = crate::theme::is_dark();
+    let previous = solidcraft_theme::is_dark();
     for dark in [false, true] {
-        crate::theme::set_dark(dark);
+        solidcraft_theme::set_dark(dark);
         for ppp in [1.0, 2.0] {
             let ctx = crate::fonts::test_context();
             ctx.set_pixels_per_point(ppp);
@@ -335,7 +336,7 @@ fn rendered_square_hue_and_current_strip_leave_rounded_corner_pixels_clear() {
             }
         }
     }
-    crate::theme::set_dark(previous);
+    solidcraft_theme::set_dark(previous);
 }
 
 /// A taller frame than the shared one: the popover's recent row sits below 400 points.
@@ -473,11 +474,11 @@ fn recent_list_is_capped_unique_and_synced_with_the_saved_one() {
     assert_eq!(recent.iter().filter(|c| **c == [35, 0, 0]).count(), 1);
     // Picks flow to the saved list once…
     let mut saved = Vec::new();
-    crate::recent_colors::share(&ctx, &mut saved);
+    crate::ui_kit::recent_colors::share(&ctx, &mut saved);
     assert_eq!(saved, recent);
     // …and a list loaded from preferences (even an oversized one) is what the pickers show.
     let mut loaded: Vec<[u8; 3]> = (0..100u8).map(|i| [0, i, 0]).collect();
-    crate::recent_colors::share(&ctx, &mut loaded);
+    crate::ui_kit::recent_colors::share(&ctx, &mut loaded);
     assert_eq!(loaded.len(), MAX_RECENT_COLORS);
     assert_eq!(recent_colors(&ctx), loaded);
 }
@@ -492,12 +493,52 @@ fn recent_colours_are_saved_with_the_preferences_and_hostile_entries_dropped() {
     assert_eq!(app.ui.recent_colors.len(), MAX_RECENT_COLORS);
     assert_eq!(app.ui.recent_colors.first(), Some(&[1, 2, 3]));
     let ctx = crate::fonts::test_context();
-    crate::recent_colors::share(&ctx, &mut app.ui.recent_colors);
+    crate::ui_kit::recent_colors::share(&ctx, &mut app.ui.recent_colors);
     remember_color(&ctx, [9, 8, 7], None);
-    crate::recent_colors::share(&ctx, &mut app.ui.recent_colors);
+    crate::ui_kit::recent_colors::share(&ctx, &mut app.ui.recent_colors);
     let mut restored = crate::SolveApp::new(solidcraft_engine::Session::default(), Default::default());
     restored.load_prefs(&app.prefs());
     assert_eq!(restored.ui.recent_colors.first(), Some(&[9, 8, 7]));
     assert_eq!(restored.ui.recent_colors.get(1), Some(&[1, 2, 3]));
     assert_eq!(restored.ui.recent_colors.len(), MAX_RECENT_COLORS);
+}
+
+/// #10201: a step button held down keeps stepping until it is let go, past egui's longest click
+/// (0.8 s): two seconds of holding H's up button step it about 32 degrees, not the 8 a press
+/// counted as a click managed before it stopped.
+#[test]
+fn a_held_step_button_keeps_stepping_until_it_is_let_go() {
+    let ctx = crate::fonts::test_context();
+    let mut rgb = [255, 0, 0];
+    let at_time = |time: f64, events: Vec<egui::Event>, rgb: &mut [u8; 3]| {
+        scenario::clear_handles();
+        let _ = crate::test_support::frame(
+            &ctx,
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(320.0, 600.0))),
+                events,
+                time: Some(time),
+                focused: true,
+                ..Default::default()
+            },
+            |ui| {
+                ui.set_width(280.0);
+                ui.push_id("picker", |ui| crate::ui_kit::scope(ui, |ui| color_popover(ui, rgb)));
+            },
+        );
+    };
+    at_time(0.0, vec![], &mut rgb);
+    let up = scenario::handle_at("color:spin:H:up").expect("H's up button");
+    at_time(0.01, pointer(up, true), &mut rgb);
+    for frame in 1..=120 {
+        at_time(0.01 + f64::from(frame) / 60.0, vec![egui::Event::PointerMoved(up)], &mut rgb);
+    }
+    let hue = |rgb: [u8; 3]| HsvaGamma::from(Color32::from_rgb(rgb[0], rgb[1], rgb[2])).h * 360.0;
+    let held = hue(rgb);
+    assert!(held > 20.0, "two seconds held stepped the hue to {held:.1} degrees");
+    at_time(2.1, pointer(up, false), &mut rgb);
+    for frame in 1..=30 {
+        at_time(2.1 + f64::from(frame) / 60.0, vec![], &mut rgb);
+    }
+    assert!((hue(rgb) - held).abs() < 1.5, "let go, it stops: {} after {held}", hue(rgb));
 }
