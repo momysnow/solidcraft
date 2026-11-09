@@ -28,6 +28,9 @@ use solidcraft_geom::prelude::*;
 
 use crate::dexel::Stock;
 
+pub mod faces;
+pub use faces::{FaceKind, FaceSegmentation, FaceTolerances, segment_faces};
+
 pub const CHUNK: i64 = 32;
 /// The lowest lower node the mesher walks. Nodes below it are taken as air: the stock never has
 /// material there, and a general lattice must keep its material above it.
