@@ -58,8 +58,7 @@
     "help.manufacture.turning.groove": "Groove cuts a narrow groove into a turned part, such as a relief or an O-ring seat. Use it where the tool must cut in radially.",
     "help.manufacture.turning.part": "Part cuts the finished part off the bar. Use it as the last operation on a turned part, once it is finished.",
     "help.manufacture.turning.profile": "Profile follows the outline of a turned part with a lathe tool. Use it for the outside shape of a turned part.",
-    "help.manufacture.turning.thread": "Thread cuts a thread on a turned part with a threading tool. Use it for an external or internal thread of a set pitch on a lathe.",
-    "Adaptive Clear": "Adaptive Clear"
+    "help.manufacture.turning.thread": "Thread cuts a thread on a turned part with a threading tool. Use it for an external or internal thread of a set pitch on a lathe."
   },
   "ja": {
     "help.manufacture.2d.adaptive": "アダプティブ加工は、一定の工具負荷で軽い切り込みを重ねて2Dポケットを荒加工します。工具に全幅の切削をさせたくない荒加工に使います。",
@@ -120,8 +119,7 @@
     "help.manufacture.turning.groove": "溝入れは、旋削部品に幅の狭い溝を削ります。逃げ溝やOリング溝などに使います。",
     "help.manufacture.turning.part": "突切りは、完成した部品を棒材から切り離します。加工が終わった旋削部品の最後の工程に使います。",
     "help.manufacture.turning.profile": "外形旋削は旋削工具で旋削部品の外形をなぞって加工します。旋削部品の外側の形状に使います。",
-    "help.manufacture.turning.thread": "ねじ切り旋削は、旋削工具で旋削部品にねじを加工します。旋盤で指定ピッチの外ねじや内ねじを作るときに使います。",
-    "Adaptive Clear": "アダプティブクリア"
+    "help.manufacture.turning.thread": "ねじ切り旋削は、旋削工具で旋削部品にねじを加工します。旋盤で指定ピッチの外ねじや内ねじを作るときに使います。"
   },
   "zh": {
     "help.manufacture.2d.adaptive": "自适应清根以稳定的刀具负载分层轻切削二维型腔。需要避免刀具全宽切削时用于粗加工。",
@@ -182,7 +180,6 @@
     "help.manufacture.turning.groove": "切槽在车削零件上切出窄槽，如退刀槽或O形圈槽。刀具需要径向切入时使用。",
     "help.manufacture.turning.part": "切断将完成的零件从棒料上切下。车削零件完工后作为最后一道工序使用。",
     "help.manufacture.turning.profile": "轮廓车削用车刀沿车削零件的外形加工。用于车削零件的外部形状。",
-    "help.manufacture.turning.thread": "螺纹车削用螺纹车刀在车削零件上加工螺纹。用于车床上加工指定螺距的外螺纹或内螺纹。",
-    "Adaptive Clear": "自适应清根"
+    "help.manufacture.turning.thread": "螺纹车削用螺纹车刀在车削零件上加工螺纹。用于车床上加工指定螺距的外螺纹或内螺纹。"
   }
 }

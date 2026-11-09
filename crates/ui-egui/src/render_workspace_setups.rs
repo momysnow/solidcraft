@@ -466,7 +466,6 @@ pub(super) fn same_model_source(app: &SolveApp, document: &std::sync::Weak<solid
         assembly,
         sheet,
         plastic,
-        cam,
         parts,
         links,
         configs,

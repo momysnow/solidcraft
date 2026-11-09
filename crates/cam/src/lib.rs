@@ -37,7 +37,7 @@ pub use path::{Move, PathStats, Toolpath, arc_sweep};
 pub use post::{CommentStyle, LineNumbers, Post, Units};
 pub use program::{MachineCode, MachineOutput, Operation, Program};
 pub use readback::{Readback, allowed_deviation, readback};
-pub use tool::{Tool, ToolKind};
+pub use tool::{Tool, ToolKind, cantilever_stiffness_n_per_um, tooth_passing_hz, wall_stiffness_n_per_um, youngs_modulus_gpa};
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum CamError {

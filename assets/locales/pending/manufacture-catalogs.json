@@ -269,8 +269,7 @@
     "help.manufacture.turning.groove": "Groove cuts a narrow groove into a turned part, such as a relief or an O-ring seat. Use it where the tool must cut in radially.",
     "help.manufacture.turning.part": "Part cuts the finished part off the bar. Use it as the last operation on a turned part, once it is finished.",
     "help.manufacture.turning.profile": "Profile follows the outline of a turned part with a lathe tool. Use it for the outside shape of a turned part.",
-    "help.manufacture.turning.thread": "Thread cuts a thread on a turned part with a threading tool. Use it for an external or internal thread of a set pitch on a lathe.",
-    "Adaptive Clear": "Adaptive Clear"
+    "help.manufacture.turning.thread": "Thread cuts a thread on a turned part with a threading tool. Use it for an external or internal thread of a set pitch on a lathe."
   },
   "he": {
     "2D Profile": "2D Profile",
@@ -542,8 +541,7 @@
     "help.manufacture.turning.groove": "Groove cuts a narrow groove into a turned part, such as a relief or an O-ring seat. Use it where the tool must cut in radially.",
     "help.manufacture.turning.part": "Part cuts the finished part off the bar. Use it as the last operation on a turned part, once it is finished.",
     "help.manufacture.turning.profile": "Profile follows the outline of a turned part with a lathe tool. Use it for the outside shape of a turned part.",
-    "help.manufacture.turning.thread": "Thread cuts a thread on a turned part with a threading tool. Use it for an external or internal thread of a set pitch on a lathe.",
-    "Adaptive Clear": "Adaptive Clear"
+    "help.manufacture.turning.thread": "Thread cuts a thread on a turned part with a threading tool. Use it for an external or internal thread of a set pitch on a lathe."
   },
   "vi": {
     "2D Profile": "2D Profile",
@@ -815,7 +813,6 @@
     "help.manufacture.turning.groove": "Groove cuts a narrow groove into a turned part, such as a relief or an O-ring seat. Use it where the tool must cut in radially.",
     "help.manufacture.turning.part": "Part cuts the finished part off the bar. Use it as the last operation on a turned part, once it is finished.",
     "help.manufacture.turning.profile": "Profile follows the outline of a turned part with a lathe tool. Use it for the outside shape of a turned part.",
-    "help.manufacture.turning.thread": "Thread cuts a thread on a turned part with a threading tool. Use it for an external or internal thread of a set pitch on a lathe.",
-    "Adaptive Clear": "Adaptive Clear"
+    "help.manufacture.turning.thread": "Thread cuts a thread on a turned part with a threading tool. Use it for an external or internal thread of a set pitch on a lathe."
   }
 }
