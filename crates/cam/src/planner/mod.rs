@@ -5,8 +5,9 @@
 //! plan per region and depth level, and translates the planner's motion
 //! commands back into this crate's checked [`Move`]s. The rest of the crate
 //! never sees a raygeo type: operations are validate → prepare → run →
-//! verify frontends, and the crate's own offsetting survives as the oracle
-//! the translator clamps against and the stock-to-leave preparer.
+//! verify frontends. Offsetting (the stock to leave, and the offset API) goes
+//! through raygeo's exact offsetting here; the translator clamps against the
+//! regions' walls.
 
 pub(crate) mod geometry;
 pub(crate) mod plan;

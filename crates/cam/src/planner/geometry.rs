@@ -4,9 +4,15 @@
 //! followed as line chains within the operation's tolerance, as everywhere
 //! else in the crate.
 
-use raygeo::geo::types::{Point, Polygon};
-use solidcore_record::{Loop2, Region2, Vec2};
+use raygeo::geo::algo::offset_exact::offset_exact;
+use raygeo::geo::geometry::Geometry;
+use raygeo::geo::shape::arc::get_arc_sweep;
+use raygeo::geo::types::{Command, Point, Polygon};
+use solidcore_record::{Loop2, Region2, Seg2, Vec2};
 use solidcraft_geom::prelude::*;
+
+use crate::piece::region_pieces;
+use crate::{Result, invalid};
 
 /// Appends one closed loop to `g` at Z 0 (the engine lifts every move to
 /// the pass height itself). Lines and arcs stay exact; other curves become
@@ -96,4 +102,59 @@ pub(crate) fn region_polygons(region: &Region2, tolerance: f64) -> (Polygon, Vec
     let boundary = loop_polygon(&region.outer, tolerance);
     let islands = region.holes.iter().map(|h| loop_polygon(h, tolerance)).collect();
     (boundary, islands)
+}
+
+/// The boundaries of `regions` moved by `distance` (positive: into the regions, so they shrink;
+/// negative: outwards), as closed loops with what is left on their left. Lines and arcs stay
+/// exact: raygeo's exact offsetting does the work, and it grows for a positive distance, so the
+/// sign is flipped here. Other curves are followed within `tolerance`.
+///
+/// Limit: raygeo returns nothing both for a region that collapses and for a failed offset, so
+/// an empty result cannot tell them apart. Inputs are checked first (see [`region_pieces`]),
+/// so bad input is still an error.
+pub fn offset_regions(regions: &[Region2], distance: f64, tolerance: f64) -> Result<Vec<Loop2>> {
+    if !distance.is_finite() {
+        return invalid("the offset distance must be finite");
+    }
+    let loops = region_pieces(regions, tolerance)?;
+    // Nothing moves: the loops come back as given (raygeo returns nothing for a zero offset).
+    if distance.abs() <= 1e-9 {
+        return Ok(loops.iter().map(|pieces| Loop2 { segs: pieces.iter().map(|p| p.seg()).collect() }).collect());
+    }
+    let mut g = Geometry::new();
+    for region in regions {
+        for lp in region.loops() {
+            append_loop(&mut g, lp, tolerance);
+        }
+    }
+    Ok(offset_exact(&g, -distance, tolerance).iter().map(loop_segs).collect())
+}
+
+/// A loop raygeo traced, as lines and arcs: one move, then its lines and arcs.
+fn loop_segs(g: &Geometry) -> Loop2 {
+    let mut segs = Vec::new();
+    let mut at = Vec2::ZERO;
+    for cmd in g.data() {
+        match *cmd {
+            Command::Move { end } => at = Vec2::new(end.x, end.y),
+            Command::Line { end } => {
+                let b = Vec2::new(end.x, end.y);
+                segs.push(Seg2::Line { a: at, b });
+                at = b;
+            }
+            Command::Arc { end, center_offset, normal } => {
+                let b = Vec2::new(end.x, end.y);
+                let off = Vec2::new(center_offset.x, center_offset.y);
+                let c = at + off;
+                let start = (at - c).angle();
+                // A full circle comes back closed on its start, which the sweep reads as a whole turn.
+                let sweep = get_arc_sweep(start, (b - c).angle(), normal.z < 0.0);
+                segs.push(Seg2::Arc { center: c, radius: off.len(), start, sweep });
+                at = b;
+            }
+            // The offsetting emits lines and arcs only.
+            Command::Bezier { end, .. } => at = Vec2::new(end.x, end.y),
+        }
+    }
+    Loop2 { segs }
 }

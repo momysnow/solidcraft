@@ -11,8 +11,8 @@
 //!   state, falling back to the operation's cut feed.
 //! - **Exact-region clamp** — the clearing planners work on flattened
 //!   regions, so every move target is snapped into the exact valid
-//!   tool-center region (this crate's own offsetting, the oracle here) and
-//!   an arc that would cross a wall is flattened into cuts. The profile
+//!   tool-center region (the region's walls, as exact lines and arcs, are
+//!   the oracle here) and an arc that would cross a wall is flattened into cuts. The profile
 //!   passes take `Clamp::Exact`: the planner walks the exact offset
 //!   itself, so their arcs pass through as arcs.
 //! - **Arc conventions** — arc centres arrive relative to the move's start
@@ -20,14 +20,16 @@
 //!   halves and an arc past half a turn in two pieces, so no arc move
 //!   comes near a full circle.
 
+use std::f64::consts::{FRAC_PI_2, TAU};
+
 use raygeo::ops::container::Ops;
 use raygeo::ops::{MoveCmd, OpCategory, StateCmd};
-use solidcore_record::{Vec2, Vec3};
+use solidcore_record::{Region2, Vec2, Vec3};
 use solidcraft_geom::prelude::*;
 
-use crate::offset::Shape;
 use crate::params::Cut;
 use crate::path::{Move, arc_sweep};
+use crate::piece::{Piece, region_pieces, turn};
 use crate::{CamError, Result};
 
 /// What the translator clamps against: the exact valid tool-center region
@@ -35,7 +37,7 @@ use crate::{CamError, Result};
 /// profile passes.
 pub(crate) enum Clamp {
     /// Snap move targets into the exact region, `keep_out` from the wall.
-    Region { shape: Shape, keep_out: f64 },
+    Region { walls: Walls, keep_out: f64 },
     /// The planner already walked the exact offset: no clamping.
     Exact,
 }
@@ -43,21 +45,21 @@ pub(crate) enum Clamp {
 impl Clamp {
     fn clear(&self, p: Vec2) -> bool {
         match self {
-            Clamp::Region { shape, keep_out } => shape.clear(p, *keep_out),
+            Clamp::Region { walls, keep_out } => walls.clear(p, *keep_out),
             Clamp::Exact => true,
         }
     }
 
     fn clamp_to(&self, from: Vec2, to: Vec2) -> Vec2 {
         match self {
-            Clamp::Region { shape, keep_out } => {
-                if shape.clear(to, *keep_out) || !shape.clear(from, *keep_out) {
+            Clamp::Region { walls, keep_out } => {
+                if walls.clear(to, *keep_out) || !walls.clear(from, *keep_out) {
                     return to;
                 }
                 let (mut lo, mut hi) = (0.0_f64, 1.0_f64);
                 for _ in 0..24 {
                     let mid = (lo + hi) * 0.5;
-                    if shape.clear(from.lerp(to, mid), *keep_out) {
+                    if walls.clear(from.lerp(to, mid), *keep_out) {
                         lo = mid;
                     } else {
                         hi = mid;
@@ -68,6 +70,58 @@ impl Clamp {
             Clamp::Exact => to,
         }
     }
+}
+
+/// The walls of the regions a clearing operation cuts round, as exact lines and arcs: the
+/// minimal oracle the clamp asks whether a tool centre stays clear of them. raygeo has no
+/// public distance or inside query, so this stays next to its one caller.
+pub(crate) struct Walls {
+    loops: Vec<Vec<Piece>>,
+}
+
+impl Walls {
+    /// `tol`: chord error allowed when a spline boundary is replaced by lines.
+    pub(crate) fn from_regions(regions: &[Region2], tol: f64) -> Result<Walls> {
+        Ok(Walls { loops: region_pieces(regions, tol)? })
+    }
+
+    /// Distance from `p` to the nearest wall.
+    pub(crate) fn dist(&self, p: Vec2) -> f64 {
+        self.loops.iter().flatten().map(|piece| piece.dist(p)).fold(f64::INFINITY, f64::min)
+    }
+
+    /// Whether `p` is inside the regions. `sag`: how far `p` is known to be from the boundary
+    /// (arcs are walked in chords that stay within a quarter of it).
+    fn inside(&self, p: Vec2, sag: f64) -> bool {
+        let mut total = 0.0;
+        for piece in self.loops.iter().flatten() {
+            match *piece {
+                Piece::Line { a, b } => total += turn(a - p, b - p),
+                Piece::Arc { r, sweep, .. } => {
+                    let n = arc_steps(r, sweep, sag * 0.25);
+                    let mut prev = piece.start();
+                    for i in 1..=n {
+                        let q = piece.point_at(i as f64 / n as f64);
+                        total += turn(prev - p, q - p);
+                        prev = q;
+                    }
+                }
+            }
+        }
+        (total / TAU).round() != 0.0
+    }
+
+    /// Whether a tool of radius `r` centred on `p` stays inside the regions without cutting the boundary.
+    pub(crate) fn clear(&self, p: Vec2, r: f64) -> bool {
+        self.dist(p) >= r - 1e-7 && self.inside(p, r.max(1e-6))
+    }
+}
+
+/// How many chords walk an arc with at most `sag` between chord and arc.
+fn arc_steps(r: f64, sweep: f64, sag: f64) -> usize {
+    let step = if sag > 0.0 && sag < r { 2.0 * (1.0 - sag / r).acos() } else { FRAC_PI_2 };
+    let n = (sweep.abs() / step.clamp(1e-3, FRAC_PI_2)).ceil();
+    if n.is_finite() { (n as usize).clamp(1, 8192) } else { 1 }
 }
 
 /// Appends the planner's motion commands as moves, keeping the tool's

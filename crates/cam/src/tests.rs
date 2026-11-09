@@ -1,10 +1,10 @@
 use std::f64::consts::PI;
 
-use solidcore_record::{Loop2, Region2, Vec2, Vec3};
+use solidcore_record::{Loop2, Region2, Seg2, Vec2, Vec3};
 use solidcraft_geom::prelude::*;
 
 use super::*;
-use crate::offset::Shape;
+use crate::planner::translate::Walls;
 
 fn v(x: f64, y: f64) -> Vec2 {
     Vec2::new(x, y)
@@ -28,7 +28,7 @@ fn close(a: f64, b: f64, tol: f64) {
 
 /// Every point of the offset loops is `d` from the boundary, and every loop is closed.
 fn check_offset(regions: &[Region2], d: f64, loops: &[Loop2]) {
-    let shape = Shape::from_regions(regions, 0.01).unwrap();
+    let shape = Walls::from_regions(regions, 0.01).unwrap();
     for lp in loops {
         assert!(lp.is_closed(1e-3), "open loop");
         for p in lp.polyline(0.001) {
@@ -88,7 +88,10 @@ fn inside_corner_of_an_l_shape_is_rounded() {
 fn circles_and_holes_offset_exactly() {
     let disc = [Region2 { outer: Loop2::circle(v(3.0, -2.0), 10.0), holes: vec![] }];
     close(area(&offset_regions(&disc, 3.0, 0.01).unwrap()), 49.0 * PI, 1e-6);
-    close(area(&offset_regions(&disc, -3.0, 0.01).unwrap()), 169.0 * PI, 1e-6);
+    let grown = offset_regions(&disc, -3.0, 0.01).unwrap();
+    close(area(&grown), 169.0 * PI, 1e-6);
+    // The offset circle stays an exact arc, not a chain of lines.
+    assert!(grown.iter().all(|lp| !lp.segs.is_empty() && lp.segs.iter().all(|s| matches!(s, Seg2::Arc { .. }))), "{grown:?}");
     // A hole grows as its region shrinks.
     let plate = [Region2 { outer: rect(0.0, 0.0, 40.0, 40.0).outer, holes: vec![Loop2::circle(v(20.0, 20.0), 5.0).reversed()] }];
     let inner = offset_regions(&plate, 3.0, 0.01).unwrap();
@@ -176,7 +179,7 @@ fn pocket_goes_round_an_island() {
     let regions = [Region2 { outer: rect(0.0, 0.0, 60.0, 40.0).outer, holes: vec![island] }];
     let params = PocketParams { stepover: 3.0, climb: false, stock_to_leave: 0.5, tolerance: 0.01, ramp_angle: 0.0 };
     let path = pocket(&regions, &tool(6.0), &params, &cut(0.0, -2.0, 2.0)).unwrap();
-    let shape = Shape::from_regions(&regions, 0.01).unwrap();
+    let shape = Walls::from_regions(&regions, 0.01).unwrap();
     let pts = cutting_points(&path, 0.0);
     for p in &pts {
         // Tool radius 3 plus 0.5 left on the walls.
@@ -355,7 +358,7 @@ fn pocket_with_passes_up_to_a_diameter_apart_still_clears_the_middle() {
     };
     let params = PocketParams { stepover: 5.5, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0 };
     let path = pocket(std::slice::from_ref(&rooms), &tool(6.0), &params, &cut(0.0, -2.0, 2.0)).unwrap();
-    let shape = Shape::from_regions(std::slice::from_ref(&rooms), 0.01).unwrap();
+    let shape = Walls::from_regions(std::slice::from_ref(&rooms), 0.01).unwrap();
     for p in cutting_points(&path, 0.0) {
         assert!(shape.clear(v(p.x, p.y), 3.0 - 1e-4), "gouge at {p:?}");
     }
@@ -932,9 +935,9 @@ fn tooth_passing_frequency_is_rpm_times_flutes_over_sixty() {
 /// The distance from a point to a circular wall is the radial gap, for points inside and
 /// outside, and the same for an island's arc.
 #[test]
-fn shape_distance_to_circular_walls_is_the_radial_gap() {
+fn walls_distance_to_circular_walls_is_the_radial_gap() {
     let disc = [Region2 { outer: Loop2::circle(v(0.0, 0.0), 10.0), holes: vec![] }];
-    let shape = Shape::from_regions(&disc, 0.01).unwrap();
+    let shape = Walls::from_regions(&disc, 0.01).unwrap();
     for (p, want) in [
         (v(8.0, 0.0), 2.0),
         (v(0.0, -8.0), 2.0),
@@ -946,7 +949,7 @@ fn shape_distance_to_circular_walls_is_the_radial_gap() {
     }
     // An island (a circular hole) in a large disc: the island's arc, not its chords, is the wall.
     let island = [Region2 { outer: Loop2::circle(v(0.0, 0.0), 30.0), holes: vec![Loop2::circle(v(0.0, 0.0), 5.0)] }];
-    let shape = Shape::from_regions(&island, 0.01).unwrap();
+    let shape = Walls::from_regions(&island, 0.01).unwrap();
     for (p, want) in [(v(7.0, 0.0), 2.0), (v(0.0, -7.0), 2.0), (v(7.0 * 0.6, 7.0 * 0.8), 2.0)] {
         close(shape.dist(p), want, 1e-6);
     }

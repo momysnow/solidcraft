@@ -10,14 +10,13 @@
 //! direction, feeds the moves, and links its passes machinist-readably (SafeZ travel). This
 //! crate prepares the regions, verifies every path on its own terms, and owns the machine
 //! output: a format-tagged [`program`] behind a [`MachineOutput`] seam, with the G-code post
-//! as its first backend. Its own exact line-and-arc offsetting survives as the oracle: the
-//! translator clamps clearing moves against it, and it prepares the stock to leave.
+//! as its first backend. Offsetting (the stock to leave, the clearing clamp's walls) is raygeo's
+//! exact line-and-arc offsetting, reached only through the planner boundary.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 
 mod check;
 mod gcode;
-mod offset;
 mod ops;
 mod params;
 mod path;
@@ -30,10 +29,10 @@ mod tool;
 
 pub use check::verify;
 pub use gcode::{emit, parse, work_offset_code};
-pub use offset::offset_regions;
 pub use ops::{adaptive, contour, pocket};
 pub use params::{AdaptiveParams, ContourParams, Cut, Feeds, Heights, PocketParams, Side};
 pub use path::{Move, PathStats, Toolpath, arc_sweep};
+pub use planner::geometry::offset_regions;
 pub use post::{CommentStyle, LineNumbers, Post, Units};
 pub use program::{MachineCode, MachineOutput, Operation, Program};
 pub use readback::{Readback, allowed_deviation, readback};

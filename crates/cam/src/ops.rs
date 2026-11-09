@@ -8,11 +8,11 @@ use solidcore_record::{Region2, Vec3};
 use solidcraft_geom::prelude::*;
 
 use crate::check::verify;
-use crate::offset::{Shape, offset_regions};
 use crate::params::{AdaptiveParams, ContourParams, Cut, PocketParams, check_leave, check_ramp, check_tolerance, mills};
 use crate::path::{Move, Toolpath};
 use crate::planner;
-use crate::planner::translate::Clamp;
+use crate::planner::geometry::offset_regions;
+use crate::planner::translate::{Clamp, Walls};
 use crate::tool::Tool;
 use crate::{Result, invalid};
 
@@ -71,7 +71,7 @@ pub fn pocket(regions: &[Region2], tool: &Tool, params: &PocketParams, cut: &Cut
         return invalid("the operation has no regions");
     }
     // The stock to leave comes off the walls before the planner saw the
-    // pocket (the crate's own offsetting, as preparer); a region that
+    // pocket (raygeo's exact offsetting, as preparer); a region that
     // vanishes was too narrow for the tool and the stock.
     let regions = fit_arcs(regions, params.tolerance);
     let prepared = prepare_stock(&regions, params.stock_to_leave, params.tolerance)?;
@@ -84,7 +84,7 @@ pub fn pocket(regions: &[Region2], tool: &Tool, params: &PocketParams, cut: &Cut
         // The oracle the translator clamps against: the prepared region has
         // the stock to leave baked in, so the tool center stays a radius
         // from it.
-        let shape = Shape::from_regions(std::slice::from_ref(region), params.tolerance)?;
+        let walls = Walls::from_regions(std::slice::from_ref(region), params.tolerance)?;
         planner::clearing_region(
             region,
             tool,
@@ -94,7 +94,7 @@ pub fn pocket(regions: &[Region2], tool: &Tool, params: &PocketParams, cut: &Cut
             params.climb,
             params.tolerance,
             cut,
-            &Clamp::Region { shape, keep_out: r },
+            &Clamp::Region { walls, keep_out: r },
             &mut moves,
             &mut pos,
         )?;
@@ -123,7 +123,7 @@ pub fn adaptive(regions: &[Region2], tool: &Tool, params: &AdaptiveParams, cut: 
         return invalid("the tolerance must be above 0 and at most 1 mm");
     }
     // The stock to leave comes off the walls before the planner saw the
-    // pocket (the crate's own offsetting, as preparer). A region that
+    // pocket (raygeo's exact offsetting, as preparer). A region that
     // vanishes was too narrow for the tool and the stock; an island grows
     // by the same amount.
     let regions = fit_arcs(regions, params.tolerance);
@@ -134,7 +134,7 @@ pub fn adaptive(regions: &[Region2], tool: &Tool, params: &AdaptiveParams, cut: 
     let mut moves: Vec<Move> = Vec::new();
     let mut pos: Option<Vec3> = None;
     for region in &prepared {
-        let shape = Shape::from_regions(std::slice::from_ref(region), params.tolerance)?;
+        let walls = Walls::from_regions(std::slice::from_ref(region), params.tolerance)?;
         planner::clearing_region(
             region,
             tool,
@@ -146,7 +146,7 @@ pub fn adaptive(regions: &[Region2], tool: &Tool, params: &AdaptiveParams, cut: 
             params.climb,
             params.tolerance,
             cut,
-            &Clamp::Region { shape, keep_out: tool.radius() },
+            &Clamp::Region { walls, keep_out: tool.radius() },
             &mut moves,
             &mut pos,
         )?;
@@ -174,8 +174,8 @@ fn fit_arcs(regions: &[Region2], tolerance: f64) -> Vec<Region2> {
         .collect()
 }
 
-/// The boundaries of `regions` moved by `stock` into the material (the
-/// crate's own offsetting, preparing for the planner): outers shrink by
+/// The boundaries of `regions` moved by `stock` into the material (raygeo's
+/// exact offsetting, preparing for the planner): outers shrink by
 /// `stock`, islands grow, and each island stays with the outer it sits in.
 /// A region whose outer vanished is dropped.
 fn prepare_stock(regions: &[Region2], stock: f64, tolerance: f64) -> Result<Vec<Region2>> {
