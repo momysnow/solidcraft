@@ -3,11 +3,17 @@
 //! ray are compared with the part's. Stock material the part does not have is a left-over (the cut is too
 //! thin); part material the stock lacks is a gouge (the cut went too deep).
 //!
-//! A ray crosses a band of deviation of thickness `d` over at least `d`, and over exactly `d` only when it
-//! is normal to the band. A grid's deepest run therefore overstates a band that is tangent to its rays (a
-//! slot floor seen by the X rays, for instance), so each headline figure is the smallest of the three grids'.
-//! That is an upper bound on the true depth, exact when some grid's rays are normal to the deviation. A
-//! deviation under the grid resolution ([`Accuracy::resolution`]) is not meaningful.
+//! A deviation run is a stretch of a ray where the stock and the part disagree. One end must be a reference
+//! crossing and the other a stock surface: a run bounded by the stock on both ends is another grid's to see,
+//! and one bounded by the part on both ends (a slot's walls, seen along its floor) is no depth at all. The
+//! run's depth is `length * |n_axis|`, where `n` is the unit normal of the triangle its reference crossing lies
+//! on: exact along the ray for a band normal to that face, an overstatement for one lying along it. Only a
+//! crossing with `|n_axis| >= 1/sqrt(3)` counts, so a grazing face is left to the grid it is normal to.
+//! Features narrower than the grid's resolution may be missed.
+//!
+//! Parity cannot tell overlapping shells or a self-intersecting mesh from a void: a region covered twice
+//! counts as empty and shows as a false gouge. A ray whose crossings are odd in number is skipped and
+//! counted in [`Accuracy::odd_rays`].
 //!
 //! Each reference ray is nudged a tiny fixed amount across its plane, so it never passes exactly through a
 //! mesh edge or vertex and every crossing is counted once. The parity of the crossings is then exact for a
@@ -22,8 +28,13 @@ use crate::dexel::Stock;
 
 /// The reference rays' nudge, as a share of a cell, across the ray's plane (see the module note).
 const NUDGE: f64 = 1.37e-6;
-/// Vertices closer than this share of the mesh's size are one vertex when the mesh is checked closed.
-const WELD_SHARE: f64 = 1e-9;
+/// Vertices closer than this share of the mesh's size are one vertex when the mesh is checked closed: the
+/// export's weld distance (`solidcraft_io`).
+const WELD_SHARE: f64 = 1e-6;
+/// Runs shorter than this, mm, are f32 round-off on a face the two sides share, not deviations.
+const MIN_RUN: f64 = 1e-6;
+/// The least `|n_axis|` a grid counts: 1/sqrt(3).
+const NORMAL_MIN: f64 = 0.577_350_269_189_625_8;
 
 /// A deviation: where it is and how deep. `at` is the middle of its run along its ray, in the stock's frame.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -32,7 +43,8 @@ pub struct Spot {
     pub depth: f64,
 }
 
-/// One grid's figures. `axis` is the grid's ray direction: 0 for X, 1 for Y, 2 for Z.
+/// One grid's figures. `axis` is the grid's ray direction: 0 for X, 1 for Y, 2 for Z. Its mean and RMS are
+/// over the part's surface samples the grid counts (see [`compare`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GridStats {
     pub axis: usize,
@@ -44,28 +56,34 @@ pub struct GridStats {
     pub rms: f64,
 }
 
-/// How far the stock is from the part. The headline figures are the smallest of the three grids' (see the
-/// module note); `grids` gives each grid's own.
+/// How far the stock is from the part. Each headline figure is the largest of the three grids' figures, with
+/// the spot where it is deepest; `grids` gives each grid's own.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Accuracy {
     /// Rays compared, over the three grids.
     pub rays: u64,
-    /// The largest cell of the grid, mm: deviations under it are not meaningful.
+    /// Rays skipped because the mesh crosses them an odd number of times, over the three grids.
+    pub odd_rays: u64,
+    /// The largest cell of the grid, mm: deviations under it may be missed.
     pub resolution: f64,
     pub max_left_over: f64,
     pub worst_left_over: Option<Spot>,
     pub max_gouge: f64,
     pub worst_gouge: Option<Spot>,
-    /// Mean and root mean square over the rays of each ray's deepest deviation (0 where it agrees), the
-    /// smallest of the grids' like the depths.
+    /// Mean and root mean square deviation over the part's surface, mm, area-weighted and independent of the
+    /// stock's size.
     pub mean_abs_dev: f64,
     pub rms: f64,
     pub grids: [GridStats; 3],
 }
 
 /// Compares the stock with the part `positions` and `triangles`, a closed triangle mesh in the stock's frame.
-/// Refused, never a panic: an empty, open or degenerate mesh, a missing vertex, a non-finite position, or a
-/// stock without the memory the comparison needs.
+/// Refused, never a panic: an empty, open or degenerate mesh, a missing vertex, a non-finite position or size,
+/// or a stock without the memory the comparison needs.
+///
+/// The mean and RMS are over the part's surface. Each reference crossing whose triangle a grid counts is a
+/// sample: its deviation is its run's depth (0 where stock and part agree), its weight `cell_u * cell_v /
+/// |n_axis|`, the surface area its ray stands for.
 pub fn compare(stock: &Stock, positions: &[Vec3], triangles: &[[u32; 3]]) -> Result<Accuracy, SimError> {
     if triangles.is_empty() {
         return Err(SimError::BadInput("reference mesh has no triangles".into()));
@@ -77,6 +95,9 @@ pub fn compare(stock: &Stock, positions: &[Vec3], triangles: &[[u32; 3]]) -> Res
         return Err(SimError::BadInput("reference mesh refers to a vertex it does not have".into()));
     }
     let size = diagonal(positions);
+    if !size.is_finite() {
+        return Err(SimError::BadInput("reference mesh has a non-finite size".into()));
+    }
     if !(size > 0.0) || enclosed_volume(positions, triangles).abs() <= 1e-12 * size * size * size {
         return Err(SimError::BadInput("reference mesh encloses no volume".into()));
     }
@@ -86,30 +107,33 @@ pub fn compare(stock: &Stock, positions: &[Vec3], triangles: &[[u32; 3]]) -> Res
     let (used, budget) = stock.memory();
     let ctx = Ctx { stock, positions, triangles, min, cell, n, used, budget, avail: budget.saturating_sub(used) };
     ctx.check_budget(60 * positions.len() as u64 + 24 * triangles.len() as u64)?;
-    check_closed(positions, triangles, (size * WELD_SHARE).max(1e-9))?;
+    check_closed(positions, triangles, (size * WELD_SHARE).max(1e-7))?;
     let runs = [grid(&ctx, 0)?, grid(&ctx, 1)?, grid(&ctx, 2)?];
+    let grids = runs.each_ref().map(|r| r.stats);
     let rays: u64 = runs.iter().map(|r| r.rays).sum();
-    let grids = runs.map(|r| r.stats);
-    let (max_left_over, worst_left_over) = smallest(&grids, |g| g.max_left_over, |g| g.worst_left_over);
-    let (max_gouge, worst_gouge) = smallest(&grids, |g| g.max_gouge, |g| g.worst_gouge);
+    let odd_rays: u64 = runs.iter().map(|r| r.odd).sum();
+    let (w, wd, wd2) = runs.iter().fold((0.0, 0.0, 0.0), |(w, wd, wd2), r| (w + r.w, wd + r.wd, wd2 + r.wd2));
+    let (max_left_over, worst_left_over) = largest(&grids, |g| g.max_left_over, |g| g.worst_left_over);
+    let (max_gouge, worst_gouge) = largest(&grids, |g| g.max_gouge, |g| g.worst_gouge);
     Ok(Accuracy {
         rays,
+        odd_rays,
         resolution: cell.iter().copied().fold(0.0, f64::max),
         max_left_over,
         worst_left_over,
         max_gouge,
         worst_gouge,
-        mean_abs_dev: grids.iter().map(|g| g.mean_abs_dev).fold(f64::INFINITY, f64::min),
-        rms: grids.iter().map(|g| g.rms).fold(f64::INFINITY, f64::min),
+        mean_abs_dev: if w > 0.0 { wd / w } else { 0.0 },
+        rms: if w > 0.0 { (wd2 / w).sqrt() } else { 0.0 },
         grids,
     })
 }
 
-/// The figure of the grid whose `value` is smallest, with its spot.
-fn smallest(grids: &[GridStats], value: fn(&GridStats) -> f64, spot: fn(&GridStats) -> Option<Spot>) -> (f64, Option<Spot>) {
+/// The figure of the grid whose `value` is largest, with its spot.
+fn largest(grids: &[GridStats], value: fn(&GridStats) -> f64, spot: fn(&GridStats) -> Option<Spot>) -> (f64, Option<Spot>) {
     let mut best: Option<&GridStats> = None;
     for g in grids {
-        if best.is_none_or(|b| value(g) < value(b)) {
+        if best.is_none_or(|b| value(g) > value(b)) {
             best = Some(g);
         }
     }
@@ -139,20 +163,14 @@ impl Ctx<'_> {
     }
 }
 
-/// One grid's figures and the number of rays they cover.
+/// One grid's figures, and the sums its samples add to the headline mean and RMS.
 struct GridRun {
     stats: GridStats,
     rays: u64,
-}
-
-/// The deviations of one grid, summed up as its rays go by.
-#[derive(Default)]
-struct Tally {
-    rays: u64,
-    sum: f64,
-    sum_sq: f64,
-    left: Option<Spot>,
-    gouge: Option<Spot>,
+    odd: u64,
+    w: f64,
+    wd: f64,
+    wd2: f64,
 }
 
 /// Keeps `spot` if it is deeper than the one kept.
@@ -162,147 +180,177 @@ fn keep(best: &mut Option<Spot>, spot: Spot) {
     }
 }
 
-/// The reference intervals of ray `(iu, iv)` of the grid along `axis` are compared with the stock's.
+/// The deviation runs of the rays of the grid along `axis`, and its surface samples.
 fn grid(ctx: &Ctx, axis: usize) -> Result<GridRun, SimError> {
     let (u, v) = ((axis + 1) % 3, (axis + 2) % 3);
     let (nu, nv) = (ctx.n[u], ctx.n[v]);
-    let (start, items) = buckets(ctx, axis)?;
-    let mut tally = Tally::default();
-    let (mut crossings, mut ref_iv, mut stock_iv, mut left, mut gouge) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let area = ctx.cell[u] * ctx.cell[v];
+    let (start, mut hits) = crossings(ctx, axis)?;
+    let (mut run_left, mut run_gouge) = (None, None);
+    let (mut rays, mut odd, mut w, mut wd, mut wd2) = (0u64, 0u64, 0.0f64, 0.0f64, 0.0f64);
+    let (mut vals, mut ref_iv, mut stock_iv, mut left, mut gouge, mut dev) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::<f64>::new());
     for iv in 0..nv {
         for iu in 0..nu {
             let r = iv * nu + iu;
-            let (pu, pv) = (ctx.stock.pos(u, iu as i64), ctx.stock.pos(v, iv as i64));
-            let (ou, ov) = (pu + NUDGE * ctx.cell[u], pv + 0.7 * NUDGE * ctx.cell[v]);
-            crossings.clear();
-            let (lo, hi) = (start.get(r).copied().unwrap_or(0) as usize, start.get(r + 1).copied().unwrap_or(0) as usize);
-            for &ti in items.get(lo..hi).unwrap_or(&[]) {
-                let Some(c) = ctx.triangles.get(ti as usize).and_then(|t| corners(ctx.positions, *t)) else { continue };
-                if let Some(t) = hit(c, axis, u, v, ou, ov) {
-                    crossings.push(t);
-                }
+            let ray = &mut hits[start[r] as usize..start[r + 1] as usize];
+            ray.sort_by(|a, b| a.0.total_cmp(&b.0));
+            if ray.len() % 2 == 1 {
+                odd += 1;
+                continue;
             }
-            crossings.sort_by(f64::total_cmp);
-            if crossings.len() % 2 == 1 {
-                return Err(SimError::BadInput("reference mesh is not closed: a ray crosses it an odd number of times".into()));
-            }
-            pair_up(&crossings, &mut ref_iv);
+            rays += 1;
+            vals.clear();
+            vals.extend(ray.iter().map(|h| h.0));
+            pair_up(&vals, &mut ref_iv);
             stock_intervals(ctx, axis, iu, iv, &mut stock_iv);
             subtract(&stock_iv, &ref_iv, &mut left);
             subtract(&ref_iv, &stock_iv, &mut gouge);
-            let mut ray_dev = 0.0f64;
-            for &(a, b) in &left {
-                ray_dev = ray_dev.max(b - a);
-                keep(&mut tally.left, spot(axis, u, v, a, b, pu, pv));
+            dev.clear();
+            dev.resize(ray.len(), 0.0);
+            let (pu, pv) = (ctx.stock.pos(u, iu as i64), ctx.stock.pos(v, iv as i64));
+            for (runs, is_left) in [(&left, true), (&gouge, false)] {
+                for &(a, b) in runs.iter() {
+                    let Some(j) = single_ref(ray, a, b) else { continue };
+                    let len = b - a;
+                    let share = axis_share(ctx, ray[j].1, axis);
+                    if len < MIN_RUN || share < NORMAL_MIN {
+                        continue;
+                    }
+                    let depth = len * share;
+                    dev[j] = dev[j].max(depth);
+                    let s = spot(axis, (u, v), (a, b), (pu, pv), depth);
+                    keep(if is_left { &mut run_left } else { &mut run_gouge }, s);
+                }
             }
-            for &(a, b) in &gouge {
-                ray_dev = ray_dev.max(b - a);
-                keep(&mut tally.gouge, spot(axis, u, v, a, b, pu, pv));
+            for (j, h) in ray.iter().enumerate() {
+                let share = axis_share(ctx, h.1, axis);
+                if share < NORMAL_MIN {
+                    continue;
+                }
+                let weight = area / share;
+                w += weight;
+                wd += weight * dev[j];
+                wd2 += weight * dev[j] * dev[j];
             }
-            tally.rays += 1;
-            tally.sum += ray_dev;
-            tally.sum_sq += ray_dev * ray_dev;
         }
     }
-    let n = tally.rays.max(1) as f64;
     let stats = GridStats {
         axis,
-        max_left_over: tally.left.map_or(0.0, |s| s.depth),
-        worst_left_over: tally.left,
-        max_gouge: tally.gouge.map_or(0.0, |s| s.depth),
-        worst_gouge: tally.gouge,
-        mean_abs_dev: tally.sum / n,
-        rms: (tally.sum_sq / n).sqrt(),
+        max_left_over: run_left.map_or(0.0, |s| s.depth),
+        worst_left_over: run_left,
+        max_gouge: run_gouge.map_or(0.0, |s| s.depth),
+        worst_gouge: run_gouge,
+        mean_abs_dev: if w > 0.0 { wd / w } else { 0.0 },
+        rms: if w > 0.0 { (wd2 / w).sqrt() } else { 0.0 },
     };
-    Ok(GridRun { stats, rays: tally.rays })
+    Ok(GridRun { stats, rays, odd, w, wd, wd2 })
 }
 
-/// The spot of a run `[a, b]` along the ray of grid `axis` through `(pu, pv)`, at its middle.
-fn spot(axis: usize, u: usize, v: usize, a: f64, b: f64, pu: f64, pv: f64) -> Spot {
+/// The spot of a run `(a, b)` along the ray of grid `axis` through `(pu, pv)`, at its middle.
+fn spot(axis: usize, (u, v): (usize, usize), (a, b): (f64, f64), (pu, pv): (f64, f64), depth: f64) -> Spot {
     let mut p = [0.0f64; 3];
     p[axis] = 0.5 * (a + b);
     p[u] = pu;
     p[v] = pv;
-    Spot { at: Vec3::from(p), depth: b - a }
+    Spot { at: Vec3::from(p), depth }
 }
 
-/// The triangles each ray of the grid along `axis` can cross, as a table: ray `r` owns `items[start[r]..start[r + 1]]`.
-fn buckets(ctx: &Ctx, axis: usize) -> Result<(Vec<u32>, Vec<u32>), SimError> {
+/// The index of the reference crossing at `x`, when a run's end `x` is one. `subtract` copies its endpoints
+/// unchanged, so the match is bitwise.
+fn ref_end(ray: &[(f64, u32)], x: f64) -> Option<usize> {
+    let i = ray.partition_point(|h| h.0 < x);
+    ray.get(i).filter(|h| h.0.to_bits() == x.to_bits()).map(|_| i)
+}
+
+/// The crossing a run is bounded by, when exactly one of its ends is a reference crossing. A run bounded by
+/// the stock on both ends, or by the reference on both, is skipped.
+fn single_ref(ray: &[(f64, u32)], a: f64, b: f64) -> Option<usize> {
+    match (ref_end(ray, a), ref_end(ray, b)) {
+        (Some(j), None) | (None, Some(j)) => Some(j),
+        _ => None,
+    }
+}
+
+/// `|n_axis|` of triangle `tri`: the unit normal's component along the grid's rays (0 when degenerate).
+fn axis_share(ctx: &Ctx, tri: u32, axis: usize) -> f64 {
+    let Some(c) = ctx.triangles.get(tri as usize).and_then(|t| corners(ctx.positions, *t)) else { return 0.0 };
+    let e1: [f64; 3] = std::array::from_fn(|k| c[1][k] - c[0][k]);
+    let e2: [f64; 3] = std::array::from_fn(|k| c[2][k] - c[0][k]);
+    let n = [e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]];
+    let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+    if len > 0.0 { n[axis].abs() / len } else { 0.0 }
+}
+
+/// The crossings of the grid's rays with the reference, as a table: ray `r` owns `hits[start[r]..start[r + 1]]`,
+/// each crossing its `(t, triangle)`. Counted first, then filled, so the table is only as big as the real hits.
+fn crossings(ctx: &Ctx, axis: usize) -> Result<(Vec<u32>, Vec<(f64, u32)>), SimError> {
     let (u, v) = ((axis + 1) % 3, (axis + 2) % 3);
     let rays = ctx.n[u] * ctx.n[v];
-    let mut entries: u64 = 0;
-    for t in ctx.triangles {
-        if let Some(c) = cover(ctx, axis, *t) {
-            entries += c.count();
-        }
-    }
-    ctx.check_budget((rays as u64).saturating_mul(8).saturating_add(entries.saturating_mul(4)))?;
+    ctx.check_budget((rays as u64 + 1).saturating_mul(4))?;
     let mut start = vec![0u32; rays + 1];
-    for t in ctx.triangles {
-        if let Some(c) = cover(ctx, axis, *t) {
-            for r in c.rays() {
-                if let Some(s) = start.get_mut(r + 1) {
-                    *s += 1;
-                }
-            }
-        }
-    }
-    let mut acc = 0u32;
+    scan(ctx, axis, |r, _, _| start[r + 1] += 1)?;
+    let mut total: u32 = 0;
     for s in start.iter_mut() {
-        acc = acc.checked_add(*s).ok_or_else(|| SimError::BadInput("reference mesh is too large for the comparison".into()))?;
-        *s = acc;
+        total = total.checked_add(*s).ok_or_else(|| SimError::BadInput("reference mesh crosses the rays too often for the comparison".into()))?;
+        *s = total;
     }
+    ctx.check_budget((total as u64).saturating_mul(16))?;
     let mut fill: Vec<u32> = start.get(..rays).unwrap_or(&[]).to_vec();
-    let mut items = vec![0u32; acc as usize];
+    let mut hits = vec![(0.0f64, 0u32); total as usize];
+    scan(ctx, axis, |r, t, ti| {
+        if let Some(f) = fill.get_mut(r)
+            && let Some(slot) = hits.get_mut(*f as usize)
+        {
+            *slot = (t, ti);
+            *f += 1;
+        }
+    })?;
+    Ok((start, hits))
+}
+
+/// Calls `emit(ray, t, triangle)` for every real crossing of the grid's rays with the mesh. Each triangle is
+/// scan-converted: row by row over its projection, only the rays inside the row's span are tested, so a long
+/// sliver costs its own area and not its bounding box.
+fn scan(ctx: &Ctx, axis: usize, mut emit: impl FnMut(usize, f64, u32)) -> Result<(), SimError> {
+    let (u, v) = ((axis + 1) % 3, (axis + 2) % 3);
     for (ti, t) in ctx.triangles.iter().enumerate() {
-        if let Some(c) = cover(ctx, axis, *t) {
-            let ti = u32::try_from(ti).map_err(|_| SimError::BadInput("reference mesh has too many triangles".into()))?;
-            for r in c.rays() {
-                let Some(f) = fill.get_mut(r) else { continue };
-                if let Some(slot) = items.get_mut(*f as usize) {
-                    *slot = ti;
-                    *f += 1;
+        let Some(c) = corners(ctx.positions, *t) else { continue };
+        let p: [(f64, f64); 3] = c.map(|q| (q[u], q[v]));
+        if cross((p[1].0 - p[0].0, p[1].1 - p[0].1), (p[2].0 - p[0].0, p[2].1 - p[0].1)) == 0.0 {
+            continue;
+        }
+        let vmin = p.iter().fold(f64::INFINITY, |m, q| m.min(q.1));
+        let vmax = p.iter().fold(f64::NEG_INFINITY, |m, q| m.max(q.1));
+        let Some((iv0, iv1)) = ray_range(vmin, vmax, ctx.min[v], ctx.cell[v], ctx.n[v]) else { continue };
+        let ti = u32::try_from(ti).map_err(|_| SimError::BadInput("reference mesh has too many triangles".into()))?;
+        for iv in iv0..=iv1 {
+            let y = ctx.stock.pos(v, iv as i64);
+            let Some((lo, hi)) = span(&p, y) else { continue };
+            let Some((iu0, iu1)) = ray_range(lo, hi, ctx.min[u], ctx.cell[u], ctx.n[u]) else { continue };
+            for iu in iu0..=iu1 {
+                let (ou, ov) = (ctx.stock.pos(u, iu as i64) + NUDGE * ctx.cell[u], y + 0.7 * NUDGE * ctx.cell[v]);
+                if let Some(t) = hit(c, axis, u, v, ou, ov) {
+                    emit(iv * ctx.n[u] + iu, t, ti);
                 }
             }
         }
     }
-    Ok((start, items))
+    Ok(())
 }
 
-/// The block of rays a triangle's projection can reach: inclusive index ranges along the two perpendicular axes.
-#[derive(Clone, Copy)]
-struct Cover {
-    u0: usize,
-    u1: usize,
-    v0: usize,
-    v1: usize,
-    nu: usize,
-}
-
-impl Cover {
-    fn count(&self) -> u64 {
-        ((self.u1 - self.u0 + 1) * (self.v1 - self.v0 + 1)) as u64
+/// The `u` span where the projected triangle `p` meets the line `v = y`, if it does.
+fn span(p: &[(f64, f64); 3], y: f64) -> Option<(f64, f64)> {
+    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    for k in 0..3 {
+        let (a, b) = (p[k], p[(k + 1) % 3]);
+        if (a.1 - y) * (b.1 - y) <= 0.0 && a.1 != b.1 {
+            let x = a.0 + (y - a.1) * (b.0 - a.0) / (b.1 - a.1);
+            lo = lo.min(x);
+            hi = hi.max(x);
+        }
     }
-
-    fn rays(self) -> impl Iterator<Item = usize> {
-        (self.v0..=self.v1).flat_map(move |iv| (self.u0..=self.u1).map(move |iu| iv * self.nu + iu))
-    }
-}
-
-/// The rays a triangle can cross, with a slack of a ray each side. A triangle that projects to zero area
-/// along the axis crosses no ray, so it covers none.
-fn cover(ctx: &Ctx, axis: usize, t: [u32; 3]) -> Option<Cover> {
-    let (u, v) = ((axis + 1) % 3, (axis + 2) % 3);
-    let c = corners(ctx.positions, t)?;
-    let (p0, p1, p2) = ((c[0][u], c[0][v]), (c[1][u], c[1][v]), (c[2][u], c[2][v]));
-    if cross((p1.0 - p0.0, p1.1 - p0.1), (p2.0 - p0.0, p2.1 - p0.1)) == 0.0 {
-        return None;
-    }
-    let (umin, umax) = (p0.0.min(p1.0).min(p2.0), p0.0.max(p1.0).max(p2.0));
-    let (vmin, vmax) = (p0.1.min(p1.1).min(p2.1), p0.1.max(p1.1).max(p2.1));
-    let (u0, u1) = ray_range(umin, umax, ctx.min[u], ctx.cell[u], ctx.n[u])?;
-    let (v0, v1) = ray_range(vmin, vmax, ctx.min[v], ctx.cell[v], ctx.n[v])?;
-    Some(Cover { u0, u1, v0, v1, nu: ctx.n[u] })
+    (lo <= hi).then_some((lo, hi))
 }
 
 /// The inclusive ray indices along one axis whose lattice positions lie within `lo..=hi`, with a slack of one.
@@ -356,7 +404,8 @@ fn pair_up(crossings: &[f64], out: &mut Vec<(f64, f64)>) {
     }
 }
 
-/// The parts of the sorted, disjoint intervals `a` that `b` does not cover, sorted and disjoint.
+/// The parts of the sorted, disjoint intervals `a` that `b` does not cover, sorted and disjoint. Endpoints are
+/// copied from `a` or `b` unchanged.
 fn subtract(a: &[(f64, f64)], b: &[(f64, f64)], out: &mut Vec<(f64, f64)>) {
     out.clear();
     let mut j = 0;

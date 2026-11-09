@@ -712,7 +712,7 @@ fn accuracy_of_an_uncut_stock_against_its_own_block_is_exact() {
     assert!(r["max_gouge"].as_f64().unwrap_or(f64::NAN) < 1e-6, "{r}");
     assert_eq!(r["grids"].as_array().map(Vec::len), Some(3), "{r}");
     // The deepest spot is round-off on a face the two sides share: its depth is far below the cell.
-    assert!(r["worst_gouge"]["depth"].as_f64().unwrap_or(f64::NAN) < 1e-6, "{r}");
+    assert!(r["worst_gouge"].is_null() || r["worst_gouge"]["depth"].as_f64().unwrap_or(f64::NAN) < 1e-6, "{r}");
 }
 
 #[test]

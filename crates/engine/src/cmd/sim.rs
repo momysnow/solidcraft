@@ -79,7 +79,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .contract(&ACCURACY)
         .output(output_schema_for::<AccuracyReply>)
         .noundo()
-        .params("body: the name of a body in the design. Compares the stock as the simulation has cut it so far with that body's placed tessellation (the export's Fine quality), ray by ray on the stock's three grids: material the stock keeps where the part has none is a left-over (cut too thin), part material the stock lacks is a gouge (cut too deep). Replies rays, resolution (the grid's largest cell, mm: smaller deviations are not meaningful), max_left_over and max_gouge (mm, with worst_left_over and worst_gouge as {at: [x,y,z], depth}: the middle of the deepest run), mean_abs_dev and rms (mm, over the rays; the smallest of the grids' figures), cursor and total (moves cut so far, and in the program) and grids: each grid's own figures in x, y, z order. The headline figures are the smallest of the grids': a deviation that runs along one grid's rays overstates its depth there. Read only. Errors without sim.setup, with no such body, or when the part is open, degenerate or too large for the stock's memory."),
+        .params("body: the name of a body in the design. Compares the stock as the simulation has cut it so far with that body's placed tessellation, in the program's workpiece frame (no work-offset mapping): the export's Fine quality, with a chord no more than 0.05 of the grid spacing h (replied as chord_tolerance, mm). Ray by ray on the stock's three grids: material the stock keeps where the part has none is a left-over (cut too thin), part material the stock lacks is a gouge (cut too deep). Replies rays and odd_rays (rays skipped because the mesh crosses them an odd number of times), resolution (the grid's largest cell, mm: depth along rays is exact, but features narrower than the resolution may be missed), max_left_over and max_gouge (mm, the largest of the grids' figures, with worst_left_over and worst_gouge as {at: [x,y,z], depth}: the middle of the deepest run), mean_abs_dev and rms (mm, area-weighted over the part's surface), cursor and total (moves cut so far, and in the program), chord_tolerance (mm) and grids: each grid's own figures in x, y, z order. Read only. Errors without sim.setup, with no such body, or when the part is open, degenerate, non-finite or too large for the stock's memory."),
 ];
 
 /// Reads the parameters into their contract's type. Unknown keys are the contract's business
@@ -351,15 +351,18 @@ fn accuracy(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let input: AccuracyParams = parse(C, p)?;
     let (cursor, total) = s.sim_progress().ok_or_else(|| bad(C, NO_SIM))?;
+    let h = s.sim.job().map(|j| j.h()).ok_or_else(|| bad(C, NO_SIM))?;
     let st = s.world_state()?;
     let body = st.body(&input.body).ok_or_else(|| bad(C, format!("no body `{}`", input.body)))?;
-    let mesh = solidcraft_io::export_mesh_at(&body.body, MeshQuality::Fine).map_err(|e| bad(C, e.to_string()))?;
+    // The Fine export's chord, but no coarser than the grid resolves: a facet may stand off by 0.05 h at most.
+    let chord = solidcraft_io::quality_chord(&body.body, MeshQuality::Fine).min(0.05 * h);
+    let mesh = solidcraft_io::export_mesh_chord(&body.body, chord).map_err(|e| bad(C, e.to_string()))?;
     let stock = s.sim_stock().ok_or_else(|| bad(C, NO_SIM))?;
     let a = accuracy::compare(stock, &mesh.positions, &mesh.triangles).map_err(|e| sim_error(C, e))?;
-    serde_json::to_value(accuracy_reply(&input.body, cursor, total, &a)).map_err(|e| bad(C, e.to_string()))
+    serde_json::to_value(accuracy_reply(&input.body, cursor, total, chord, &a)).map_err(|e| bad(C, e.to_string()))
 }
 
-fn accuracy_reply(body: &str, cursor: usize, total: usize, a: &Accuracy) -> AccuracyReply {
+fn accuracy_reply(body: &str, cursor: usize, total: usize, chord: f64, a: &Accuracy) -> AccuracyReply {
     let spot = |s: &accuracy::Spot| SpotReply { at: s.at.into(), depth: s.depth };
     let grid = |g: &accuracy::GridStats| GridReply {
         axis: ["x", "y", "z"].get(g.axis).copied().unwrap_or("?").to_string(),
@@ -373,6 +376,8 @@ fn accuracy_reply(body: &str, cursor: usize, total: usize, a: &Accuracy) -> Accu
         cursor: count(cursor),
         total: count(total),
         rays: a.rays,
+        odd_rays: a.odd_rays,
+        chord_tolerance: chord,
         resolution: a.resolution,
         max_left_over: a.max_left_over,
         worst_left_over: a.worst_left_over.as_ref().map(spot),
