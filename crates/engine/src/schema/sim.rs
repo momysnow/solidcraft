@@ -255,6 +255,55 @@ pub struct ClearReply {
     pub cleared: bool,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct AccuracyParams {
+    /// The name of a body in the design, as the model lists it. Its placed copy is what is compared.
+    pub body: String,
+}
+
+/// A point in the stock's frame, mm, and a deviation's depth there, mm.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct SpotReply {
+    pub at: [f64; 3],
+    pub depth: f64,
+}
+
+/// One grid of the stock: its ray direction (`x`, `y` or `z`) and its own figures.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct GridReply {
+    pub axis: String,
+    pub max_left_over: f64,
+    pub max_gouge: f64,
+    pub mean_abs_dev: f64,
+    pub rms: f64,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct AccuracyReply {
+    /// The body compared.
+    pub body: String,
+    /// Moves cut so far, and moves in the program: `cursor` below `total` means the stock is part-cut.
+    pub cursor: u64,
+    pub total: u64,
+    /// Rays compared, over the stock's three grids.
+    pub rays: u64,
+    /// The largest cell of the stock's grid, mm: deviations under it are not meaningful.
+    pub resolution: f64,
+    /// Deepest stock material the part does not have, mm (too thick); the smallest of the grids' depths.
+    pub max_left_over: f64,
+    pub worst_left_over: Option<SpotReply>,
+    /// Deepest part material the stock lacks, mm (cut too deep); the smallest of the grids' depths.
+    pub max_gouge: f64,
+    pub worst_gouge: Option<SpotReply>,
+    /// Mean and root mean square over the rays of each ray's deepest deviation (0 where it agrees); the
+    /// smallest of the grids' figures, like the depths.
+    pub mean_abs_dev: f64,
+    pub rms: f64,
+    /// Each grid's own figures, in the order x, y, z.
+    pub grids: Vec<GridReply>,
+}
+
 #[cfg(test)]
 #[path = "sim_tests.rs"]
 mod tests;

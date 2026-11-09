@@ -1,0 +1,20 @@
+{
+  "en": {
+    "cmd.sim_accuracy": "Simulation Accuracy"
+  },
+  "ar": {
+    "cmd.sim_accuracy": "Simulation Accuracy"
+  },
+  "he": {
+    "cmd.sim_accuracy": "Simulation Accuracy"
+  },
+  "ja": {
+    "cmd.sim_accuracy": "シミュレーションの精度"
+  },
+  "vi": {
+    "cmd.sim_accuracy": "Simulation Accuracy"
+  },
+  "zh": {
+    "cmd.sim_accuracy": "模拟精度"
+  }
+}
