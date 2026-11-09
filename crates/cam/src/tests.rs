@@ -928,3 +928,26 @@ fn tooth_passing_frequency_is_rpm_times_flutes_over_sixty() {
     close(tooth_passing_hz(12_000.0, 4), 800.0, 1e-9);
     assert_eq!(tooth_passing_hz(0.0, 4), 0.0);
 }
+
+/// The distance from a point to a circular wall is the radial gap, for points inside and
+/// outside, and the same for an island's arc.
+#[test]
+fn shape_distance_to_circular_walls_is_the_radial_gap() {
+    let disc = [Region2 { outer: Loop2::circle(v(0.0, 0.0), 10.0), holes: vec![] }];
+    let shape = Shape::from_regions(&disc, 0.01).unwrap();
+    for (p, want) in [
+        (v(8.0, 0.0), 2.0),
+        (v(0.0, -8.0), 2.0),
+        (v(8.0 * std::f64::consts::FRAC_1_SQRT_2, 8.0 * std::f64::consts::FRAC_1_SQRT_2), 2.0),
+        (v(12.0, 0.0), 2.0),
+        (v(0.0, 0.0), 10.0),
+    ] {
+        close(shape.dist(p), want, 1e-6);
+    }
+    // An island (a circular hole) in a large disc: the island's arc, not its chords, is the wall.
+    let island = [Region2 { outer: Loop2::circle(v(0.0, 0.0), 30.0), holes: vec![Loop2::circle(v(0.0, 0.0), 5.0)] }];
+    let shape = Shape::from_regions(&island, 0.01).unwrap();
+    for (p, want) in [(v(7.0, 0.0), 2.0), (v(0.0, -7.0), 2.0), (v(7.0 * 0.6, 7.0 * 0.8), 2.0)] {
+        close(shape.dist(p), want, 1e-6);
+    }
+}
