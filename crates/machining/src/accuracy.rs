@@ -1,19 +1,15 @@
-//! Accuracy of the simulated stock against the designed part. Every ray of the stock's three grids is
-//! intersected with the part, a closed triangle mesh, and the material intervals the stock keeps on the
-//! ray are compared with the part's. Stock material the part does not have is a left-over (the cut is too
-//! thin); part material the stock lacks is a gouge (the cut went too deep).
+//! Accuracy of the simulated stock against the designed part. The stock's surface is sampled where each of
+//! its three grids' rays enter and leave material: every end of every stock interval, a point on the stock's
+//! surface. Each sample is measured against the part, a closed triangle mesh: its distance to the nearest part
+//! surface is the deviation there. A sample inside the part is a gouge (the cut went too deep), one outside is a
+//! left-over (too much material is left). The inside test is the reference parity on the sample's own ray.
 //!
-//! A deviation run is a stretch of a ray where the stock and the part disagree. One end must be a reference
-//! crossing and the other a stock surface: a run bounded by the stock on both ends is another grid's to see,
-//! and one bounded by the part on both ends (a slot's walls, seen along its floor) is no depth at all. The
-//! run's depth is `length * |n_axis|`, where `n` is the unit normal of the triangle its reference crossing lies
-//! on: exact along the ray for a band normal to that face, an overstatement for one lying along it. Only a
-//! crossing with `|n_axis| >= 1/sqrt(3)` counts, so a grazing face is left to the grid it is normal to.
-//! Features narrower than the grid's resolution may be missed.
+//! Points between the rays are not sampled, so a feature narrower than the grid's resolution may be missed.
+//! The deviation is exact at the samples, and the largest sample is the headline.
 //!
 //! Parity cannot tell overlapping shells or a self-intersecting mesh from a void: a region covered twice
-//! counts as empty and shows as a false gouge. A ray whose crossings are odd in number is skipped and
-//! counted in [`Accuracy::odd_rays`].
+//! counts as empty and shows as a false gouge. A ray whose crossings are odd in number is skipped and counted
+//! in [`Accuracy::odd_rays`].
 //!
 //! Each reference ray is nudged a tiny fixed amount across its plane, so it never passes exactly through a
 //! mesh edge or vertex and every crossing is counted once. The parity of the crossings is then exact for a
@@ -22,6 +18,8 @@
 use std::collections::HashMap;
 
 use solidcore_record::Vec3;
+use solidcraft_geom::Mesh;
+use solidcraft_geom::compare::TriangleTree;
 
 use crate::SimError;
 use crate::dexel::Stock;
@@ -31,12 +29,10 @@ const NUDGE: f64 = 1.37e-6;
 /// Vertices closer than this share of the mesh's size are one vertex when the mesh is checked closed: the
 /// export's weld distance (`solidcraft_io`).
 const WELD_SHARE: f64 = 1e-6;
-/// Runs shorter than this, mm, are f32 round-off on a face the two sides share, not deviations.
-const MIN_RUN: f64 = 1e-6;
-/// The least `|n_axis|` a grid counts: 1/sqrt(3).
-const NORMAL_MIN: f64 = 0.577_350_269_189_625_8;
+/// A deviation under this, mm, is f32 round-off on a face the two sides share: it is no spot.
+const MIN_DEPTH: f64 = 1e-6;
 
-/// A deviation: where it is and how deep. `at` is the middle of its run along its ray, in the stock's frame.
+/// A deviation: where it is and how deep. `at` is the stock's surface point, in the stock's frame.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Spot {
     pub at: Vec3,
@@ -44,7 +40,7 @@ pub struct Spot {
 }
 
 /// One grid's figures. `axis` is the grid's ray direction: 0 for X, 1 for Y, 2 for Z. Its mean and RMS are
-/// over the part's surface samples the grid counts (see [`compare`]).
+/// over the samples the grid counts (see [`compare`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GridStats {
     pub axis: usize,
@@ -64,7 +60,7 @@ pub struct Accuracy {
     pub rays: u64,
     /// Rays skipped because the mesh crosses them an odd number of times, over the three grids.
     pub odd_rays: u64,
-    /// The largest cell of the grid, mm: deviations under it may be missed.
+    /// The largest cell of the grid, mm: deviations between the rays may be missed.
     pub resolution: f64,
     pub max_left_over: f64,
     pub worst_left_over: Option<Spot>,
@@ -81,9 +77,9 @@ pub struct Accuracy {
 /// Refused, never a panic: an empty, open or degenerate mesh, a missing vertex, a non-finite position or size,
 /// or a stock without the memory the comparison needs.
 ///
-/// The mean and RMS are over the part's surface. Each reference crossing whose triangle a grid counts is a
-/// sample: its deviation is its run's depth (0 where stock and part agree), its weight `cell_u * cell_v /
-/// |n_axis|`, the surface area its ray stands for.
+/// The mean and RMS weigh each sample by the area its ray stands for on the part: `cell_u * cell_v / |n_axis|`,
+/// where `n` is the unit normal of the part triangle nearest the sample. A sample counts only in the grid whose
+/// axis that normal leans on most, so a face seen by three grids is weighed once.
 pub fn compare(stock: &Stock, positions: &[Vec3], triangles: &[[u32; 3]]) -> Result<Accuracy, SimError> {
     if triangles.is_empty() {
         return Err(SimError::BadInput("reference mesh has no triangles".into()));
@@ -106,9 +102,11 @@ pub fn compare(stock: &Stock, positions: &[Vec3], triangles: &[[u32; 3]]) -> Res
     let cell: [f64; 3] = std::array::from_fn(|k| (max[k] - min[k]) / n[k] as f64);
     let (used, budget) = stock.memory();
     let ctx = Ctx { stock, positions, triangles, min, cell, n, used, budget, avail: budget.saturating_sub(used) };
-    ctx.check_budget(60 * positions.len() as u64 + 24 * triangles.len() as u64)?;
+    // The vertices, the triangles, their normals and the tree over them.
+    ctx.check_budget(60 * positions.len() as u64 + 200 * triangles.len() as u64)?;
     check_closed(positions, triangles, (size * WELD_SHARE).max(1e-7))?;
-    let runs = [grid(&ctx, 0)?, grid(&ctx, 1)?, grid(&ctx, 2)?];
+    let surface = Surface::new(positions, triangles);
+    let runs = [grid(&ctx, &surface, 0)?, grid(&ctx, &surface, 1)?, grid(&ctx, &surface, 2)?];
     let grids = runs.each_ref().map(|r| r.stats);
     let rays: u64 = runs.iter().map(|r| r.rays).sum();
     let odd_rays: u64 = runs.iter().map(|r| r.odd).sum();
@@ -163,7 +161,28 @@ impl Ctx<'_> {
     }
 }
 
-/// One grid's figures, and the sums its samples add to the headline mean and RMS.
+/// The reference the samples are measured against: the nearest point of its surface, and each triangle's
+/// unit normal (zero for a degenerate one).
+struct Surface {
+    tree: TriangleTree,
+    normals: Vec<[f64; 3]>,
+}
+
+impl Surface {
+    fn new(positions: &[Vec3], triangles: &[[u32; 3]]) -> Surface {
+        let mesh = Mesh { positions: positions.to_vec(), triangles: triangles.to_vec(), ..Mesh::default() };
+        let normals = triangles.iter().map(|t| unit_normal(positions, *t)).collect();
+        Surface { tree: TriangleTree::new(&mesh), normals }
+    }
+
+    /// The distance from `p` to the surface, and the index of the triangle it is nearest to.
+    fn nearest(&self, p: [f64; 3]) -> Option<(f64, usize)> {
+        let (d, t) = self.tree.nearest(Vec3::from(p))?;
+        Some((d, t as usize))
+    }
+}
+
+/// One grid's figures and the sums its samples add to the headline mean and RMS.
 struct GridRun {
     stats: GridStats,
     rays: u64,
@@ -180,16 +199,15 @@ fn keep(best: &mut Option<Spot>, spot: Spot) {
     }
 }
 
-/// The deviation runs of the rays of the grid along `axis`, and its surface samples.
-fn grid(ctx: &Ctx, axis: usize) -> Result<GridRun, SimError> {
+/// The samples of the grid along `axis`: every end of every stock interval on its rays.
+fn grid(ctx: &Ctx, surface: &Surface, axis: usize) -> Result<GridRun, SimError> {
     let (u, v) = ((axis + 1) % 3, (axis + 2) % 3);
     let (nu, nv) = (ctx.n[u], ctx.n[v]);
     let area = ctx.cell[u] * ctx.cell[v];
     let (start, mut hits) = crossings(ctx, axis)?;
-    let (mut run_left, mut run_gouge) = (None, None);
+    let (mut left, mut gouge): (Option<Spot>, Option<Spot>) = (None, None);
     let (mut rays, mut odd, mut w, mut wd, mut wd2) = (0u64, 0u64, 0.0f64, 0.0f64, 0.0f64);
-    let (mut vals, mut ref_iv, mut stock_iv, mut left, mut gouge, mut dev) =
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::<f64>::new());
+    let (mut vals, mut ref_iv, mut stock_iv) = (Vec::new(), Vec::new(), Vec::new());
     for iv in 0..nv {
         for iu in 0..nu {
             let r = iv * nu + iu;
@@ -204,82 +222,67 @@ fn grid(ctx: &Ctx, axis: usize) -> Result<GridRun, SimError> {
             vals.extend(ray.iter().map(|h| h.0));
             pair_up(&vals, &mut ref_iv);
             stock_intervals(ctx, axis, iu, iv, &mut stock_iv);
-            subtract(&stock_iv, &ref_iv, &mut left);
-            subtract(&ref_iv, &stock_iv, &mut gouge);
-            dev.clear();
-            dev.resize(ray.len(), 0.0);
             let (pu, pv) = (ctx.stock.pos(u, iu as i64), ctx.stock.pos(v, iv as i64));
-            for (runs, is_left) in [(&left, true), (&gouge, false)] {
-                for &(a, b) in runs.iter() {
-                    let Some(j) = single_ref(ray, a, b) else { continue };
-                    let len = b - a;
-                    let share = axis_share(ctx, ray[j].1, axis);
-                    if len < MIN_RUN || share < NORMAL_MIN {
-                        continue;
+            for &(a, b) in stock_iv.iter() {
+                for t in [a, b] {
+                    let p = point(axis, (u, v), t, (pu, pv));
+                    let Some((d, tri)) = surface.nearest(p) else { continue };
+                    let n = surface.normals[tri];
+                    if largest_axis(&n) == axis && n[axis] != 0.0 {
+                        let weight = area / n[axis].abs();
+                        w += weight;
+                        wd += weight * d;
+                        wd2 += weight * d * d;
                     }
-                    let depth = len * share;
-                    dev[j] = dev[j].max(depth);
-                    let s = spot(axis, (u, v), (a, b), (pu, pv), depth);
-                    keep(if is_left { &mut run_left } else { &mut run_gouge }, s);
+                    if d > MIN_DEPTH {
+                        let inside = ref_iv.iter().any(|&(x, y)| x < t && t < y);
+                        let spot = Spot { at: Vec3::from(p), depth: d };
+                        keep(if inside { &mut gouge } else { &mut left }, spot);
+                    }
                 }
-            }
-            for (j, h) in ray.iter().enumerate() {
-                let share = axis_share(ctx, h.1, axis);
-                if share < NORMAL_MIN {
-                    continue;
-                }
-                let weight = area / share;
-                w += weight;
-                wd += weight * dev[j];
-                wd2 += weight * dev[j] * dev[j];
             }
         }
     }
     let stats = GridStats {
         axis,
-        max_left_over: run_left.map_or(0.0, |s| s.depth),
-        worst_left_over: run_left,
-        max_gouge: run_gouge.map_or(0.0, |s| s.depth),
-        worst_gouge: run_gouge,
+        max_left_over: left.map_or(0.0, |s| s.depth),
+        worst_left_over: left,
+        max_gouge: gouge.map_or(0.0, |s| s.depth),
+        worst_gouge: gouge,
         mean_abs_dev: if w > 0.0 { wd / w } else { 0.0 },
         rms: if w > 0.0 { (wd2 / w).sqrt() } else { 0.0 },
     };
     Ok(GridRun { stats, rays, odd, w, wd, wd2 })
 }
 
-/// The spot of a run `(a, b)` along the ray of grid `axis` through `(pu, pv)`, at its middle.
-fn spot(axis: usize, (u, v): (usize, usize), (a, b): (f64, f64), (pu, pv): (f64, f64), depth: f64) -> Spot {
+/// The point at coordinate `t` along the ray of grid `axis` through `(pu, pv)`.
+fn point(axis: usize, (u, v): (usize, usize), t: f64, (pu, pv): (f64, f64)) -> [f64; 3] {
     let mut p = [0.0f64; 3];
-    p[axis] = 0.5 * (a + b);
+    p[axis] = t;
     p[u] = pu;
     p[v] = pv;
-    Spot { at: Vec3::from(p), depth }
+    p
 }
 
-/// The index of the reference crossing at `x`, when a run's end `x` is one. `subtract` copies its endpoints
-/// unchanged, so the match is bitwise.
-fn ref_end(ray: &[(f64, u32)], x: f64) -> Option<usize> {
-    let i = ray.partition_point(|h| h.0 < x);
-    ray.get(i).filter(|h| h.0.to_bits() == x.to_bits()).map(|_| i)
-}
-
-/// The crossing a run is bounded by, when exactly one of its ends is a reference crossing. A run bounded by
-/// the stock on both ends, or by the reference on both, is skipped.
-fn single_ref(ray: &[(f64, u32)], a: f64, b: f64) -> Option<usize> {
-    match (ref_end(ray, a), ref_end(ray, b)) {
-        (Some(j), None) | (None, Some(j)) => Some(j),
-        _ => None,
+/// The index of the axis `n` leans on most. A tie goes to the lower axis.
+fn largest_axis(n: &[f64; 3]) -> usize {
+    let mut best = 0;
+    for k in 1..3 {
+        if n[k].abs() > n[best].abs() {
+            best = k;
+        }
     }
+    best
 }
 
-/// `|n_axis|` of triangle `tri`: the unit normal's component along the grid's rays (0 when degenerate).
-fn axis_share(ctx: &Ctx, tri: u32, axis: usize) -> f64 {
-    let Some(c) = ctx.triangles.get(tri as usize).and_then(|t| corners(ctx.positions, *t)) else { return 0.0 };
-    let e1: [f64; 3] = std::array::from_fn(|k| c[1][k] - c[0][k]);
-    let e2: [f64; 3] = std::array::from_fn(|k| c[2][k] - c[0][k]);
+/// The unit normal of triangle `t` (zero when it is degenerate).
+fn unit_normal(positions: &[Vec3], t: [u32; 3]) -> [f64; 3] {
+    let Some([a, b, c]) = corners(positions, t) else { return [0.0; 3] };
+    let e1: [f64; 3] = std::array::from_fn(|k| b[k] - a[k]);
+    let e2: [f64; 3] = std::array::from_fn(|k| c[k] - a[k]);
     let n = [e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]];
     let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
-    if len > 0.0 { n[axis].abs() / len } else { 0.0 }
+    if len > 0.0 { n.map(|x| x / len) } else { [0.0; 3] }
 }
 
 /// The crossings of the grid's rays with the reference, as a table: ray `r` owns `hits[start[r]..start[r + 1]]`,
@@ -400,35 +403,6 @@ fn pair_up(crossings: &[f64], out: &mut Vec<(f64, f64)>) {
     while let (Some(a), Some(b)) = (it.next(), it.next()) {
         if b > a {
             out.push((a, b));
-        }
-    }
-}
-
-/// The parts of the sorted, disjoint intervals `a` that `b` does not cover, sorted and disjoint. Endpoints are
-/// copied from `a` or `b` unchanged.
-fn subtract(a: &[(f64, f64)], b: &[(f64, f64)], out: &mut Vec<(f64, f64)>) {
-    out.clear();
-    let mut j = 0;
-    for &(a_lo, a_hi) in a {
-        let mut lo = a_lo;
-        while j < b.len() && b.get(j).is_some_and(|x| x.1 <= lo) {
-            j += 1;
-        }
-        let mut k = j;
-        while let Some(&(b_lo, b_hi)) = b.get(k)
-            && b_lo < a_hi
-        {
-            if b_lo > lo {
-                out.push((lo, b_lo));
-            }
-            lo = lo.max(b_hi);
-            if lo >= a_hi {
-                break;
-            }
-            k += 1;
-        }
-        if lo < a_hi {
-            out.push((lo, a_hi));
         }
     }
 }

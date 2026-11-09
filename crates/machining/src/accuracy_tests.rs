@@ -1,10 +1,13 @@
 //! The accuracy comparison against parts whose answers are worked out by hand: a box stock cut by a flat
-//! slot, a plunge, a groove, a chamfer and leaves, against the parts they should match; a box against itself;
-//! and the open, degenerate and hostile meshes it must refuse.
+//! slot, a plunge, a groove, a tunnel and a chamfer, and leaves, against the parts they should match; a box
+//! against itself; the nearest-point query against brute force; and the open, degenerate and hostile meshes it
+//! must refuse.
 
 use solidcore_record::Vec3;
+use solidcraft_geom::Mesh;
+use solidcraft_geom::compare::{TriangleTree, closest_on_triangle};
 
-use super::{Accuracy, compare, subtract};
+use super::{Accuracy, compare};
 use crate::SimError;
 use crate::dexel::Stock;
 use crate::sweep::{FlatTool, LinearFixedAxis};
@@ -23,16 +26,14 @@ fn stock_corners() -> (Vec3, Vec3) {
 /// The box stock, cut from the top by a Ø6 flat end mill along Y at x = 30, its tip at height `tip`.
 fn slotted_stock(tip: f64) -> Stock {
     let (min, max) = stock_corners();
-    let mut s = Stock::new_box(min, max, H, BUDGET).expect("stock");
-    let tool = FlatTool::new(3.0, 20.0, Vec3::Z).expect("tool");
-    s.apply(&LinearFixedAxis { from: Vec3::new(30.0, -5.0, tip), to: Vec3::new(30.0, 25.0, tip), tool }, 1).expect("cut");
-    s
+    cut(min, max, 3.0, 20.0, Vec3::Z, Vec3::new(30.0, -5.0, tip), Vec3::new(30.0, 25.0, tip))
 }
 
-/// The box stock with a sweep of `radius` at `from` to `to`, cut from the top.
-fn cut(min: Vec3, max: Vec3, radius: f64, from: Vec3, to: Vec3) -> Stock {
+/// The box stock `min`..`max`, cut by a flat tool of `radius` and `length` along `axis`, its tip moved from
+/// `from` to `to`.
+fn cut(min: Vec3, max: Vec3, radius: f64, length: f64, axis: Vec3, from: Vec3, to: Vec3) -> Stock {
     let mut s = Stock::new_box(min, max, H, BUDGET).expect("stock");
-    let tool = FlatTool::new(radius, 20.0, Vec3::Z).expect("tool");
+    let tool = FlatTool::new(radius, length, axis).expect("tool");
     s.apply(&LinearFixedAxis { from, to, tool }, 1).expect("cut");
     s
 }
@@ -148,6 +149,12 @@ fn a_slot_agrees_with_its_own_part() {
 }
 
 #[test]
+fn an_exact_slot_is_zero() {
+    let a = compared(&slotted_stock(-4.0), &slot_part(4.0));
+    assert!(a.max_left_over.max(a.max_gouge) < 1e-3, "{a:?}");
+}
+
+#[test]
 fn a_slot_0_5_mm_deeper_than_the_cut_leaves_a_half_millimetre_left_over() {
     let a = compared(&slotted_stock(-4.0), &slot_part(4.5));
     assert!((a.max_left_over - 0.5).abs() <= 1e-3, "left-over {}", a.max_left_over);
@@ -169,8 +176,8 @@ fn a_slot_0_5_mm_shallower_than_the_cut_gouges_half_a_millimetre() {
 #[test]
 fn the_headline_is_the_largest_grid_and_each_grid_is_reported() {
     let a = compared(&slotted_stock(-4.0), &slot_part(4.5));
-    // The Z rays cross the 0.5 mm band normally. The X rays run along the slot's floor between its walls: both
-    // ends are the part's, so that run is no depth and the X grid reports nothing.
+    // The Z rays sample the slot's floor, 0.5 mm off. The X rays see the floor's band only between the walls,
+    // where the stock has no surface of its own: the X grid reports nothing.
     assert!((a.grids[2].max_left_over - 0.5).abs() <= 1e-3, "Z grid {:?}", a.grids[2]);
     assert!(a.grids[0].max_left_over < 1e-3, "X grid {:?}", a.grids[0]);
     assert_eq!(a.max_left_over, a.grids.iter().map(|g| g.max_left_over).fold(0.0, f64::max));
@@ -194,10 +201,24 @@ fn oversized_stock(leave: f64, h: f64) -> Stock {
 }
 
 #[test]
-fn a_uniform_leave_is_its_depth_at_every_grid_spacing() {
+fn a_leave_on_the_top_and_bottom_is_its_depth_at_every_grid_spacing() {
+    // The stock is 0.2 mm larger above and below and flush at the sides, so its corners are 0.2 mm from the
+    // part's: the largest sample is exactly the leave.
     for h in [0.1, 0.25, 0.5] {
-        let a = compare(&oversized_stock(0.2, h), &box_part().p, &box_part().t).unwrap_or_else(|e| panic!("compare: {e}"));
-        assert!((a.max_left_over - 0.2).abs() < 0.05, "h {h}: left-over {}", a.max_left_over);
+        let (min, max) = stock_corners();
+        let s = Stock::new_box(Vec3::new(min.x, min.y, min.z - 0.2), Vec3::new(max.x, max.y, max.z + 0.2), h, BUDGET).expect("stock");
+        let a = compared(&s, &box_part());
+        assert!((a.max_left_over - 0.2).abs() < 1e-3, "h {h}: left-over {}", a.max_left_over);
+        assert!(a.max_gouge < 1e-6, "h {h}: gouge {}", a.max_gouge);
+    }
+}
+
+#[test]
+fn a_leave_on_every_side_is_0_2_mm_on_average_and_at_most_its_corner_distance() {
+    // The stock's corners are 0.2 sqrt(3) from the part's, so the largest sample is between 0.2 and that.
+    for h in [0.1, 0.25, 0.5] {
+        let a = compared(&oversized_stock(0.2, h), &box_part());
+        assert!(a.max_left_over >= 0.2 - 1e-3 && a.max_left_over <= 0.2 * 3f64.sqrt() + 1e-3, "h {h}: left-over {}", a.max_left_over);
         assert!(a.max_gouge < 1e-6, "h {h}: gouge {}", a.max_gouge);
         assert!((a.mean_abs_dev - 0.2).abs() < 0.05, "h {h}: mean {}", a.mean_abs_dev);
         assert!((a.rms - 0.2).abs() < 0.05, "h {h}: rms {}", a.rms);
@@ -208,22 +229,35 @@ fn a_uniform_leave_is_its_depth_at_every_grid_spacing() {
 fn a_plunge_3_mm_too_deep_gouges_3_mm() {
     // The Ø2 tool's tip ends at z -3; the design is solid there.
     let (min, max) = stock_corners();
-    let s = cut(min, max, 1.0, Vec3::new(30.0, 10.0, 1.0), Vec3::new(30.0, 10.0, -3.0));
+    let s = cut(min, max, 1.0, 20.0, Vec3::Z, Vec3::new(30.0, 10.0, 1.0), Vec3::new(30.0, 10.0, -3.0));
     let a = compared(&s, &box_part());
     assert!((a.max_gouge - 3.0).abs() < 0.05, "gouge {}", a.max_gouge);
     assert!(a.max_left_over < 1e-6, "left-over {}", a.max_left_over);
     let worst = a.worst_gouge.unwrap_or_else(|| panic!("no gouge spot: {a:?}"));
-    assert!((worst.at.z + 1.5).abs() < 0.05, "gouge at z {}", worst.at.z);
+    assert!((worst.at.z + 3.0).abs() < 0.05, "gouge at z {}", worst.at.z);
 }
 
 #[test]
 fn a_1_mm_groove_2_mm_deep_along_y_gouges_2_mm() {
     let (min, max) = stock_corners();
-    let s = cut(min, max, 0.5, Vec3::new(30.0, -5.0, -2.0), Vec3::new(30.0, 25.0, -2.0));
+    let s = cut(min, max, 0.5, 20.0, Vec3::Z, Vec3::new(30.0, -5.0, -2.0), Vec3::new(30.0, 25.0, -2.0));
     let a = compared(&s, &box_part());
     assert!((a.max_gouge - 2.0).abs() < 0.05, "gouge {}", a.max_gouge);
     assert!(a.max_left_over < 1e-6, "left-over {}", a.max_left_over);
     assert!(a.grids[1].max_gouge < 1e-6, "the Y rays run along the groove: {:?}", a.grids[1]);
+}
+
+#[test]
+fn a_through_hole_the_part_does_not_have_gouges_to_the_nearest_face() {
+    // A Ø2 tunnel along X at y 10, z -5, which the part lacks: its wall sits 5 mm from the top and from the
+    // bottom face at its sides, the largest distance from the wall to the part's surface.
+    let (min, max) = stock_corners();
+    let s = cut(min, max, 1.0, 100.0, Vec3::X, Vec3::new(-5.0, 10.0, -5.0), Vec3::new(-4.0, 10.0, -5.0));
+    let a = compared(&s, &box_part());
+    assert!((a.max_gouge - 5.0).abs() <= H, "gouge {}", a.max_gouge);
+    assert!(a.max_left_over < 1e-6, "left-over {}", a.max_left_over);
+    let worst = a.worst_gouge.unwrap_or_else(|| panic!("no gouge spot: {a:?}"));
+    assert!((worst.at.z + 5.0).abs() <= H, "gouge at z {}", worst.at.z);
 }
 
 #[test]
@@ -236,23 +270,42 @@ fn a_chamfer_of_leg_2_left_uncut_leaves_about_1_4_mm() {
 }
 
 #[test]
-fn an_exact_slot_is_zero() {
-    let a = compared(&slotted_stock(-4.0), &slot_part(4.0));
-    assert!(a.max_left_over.max(a.max_gouge) < 1e-3, "{a:?}");
-}
-
-/// Open: the headline is 4.0 here, not 1.0. The Z rays through the 1 mm wall strip run 4 mm along it, and
-/// their run's reference end is the slot floor (normal z), so `length * |n_axis|` overstates it. The X grid
-/// measures 1.0 correctly. Needs a rule for bands tangent to their ray (see the module note).
-#[test]
-#[ignore = "known overstatement: a wall strip standing on a floor reads 4.0 in the Z grid, not 1.0"]
 fn a_leave_of_1_mm_on_the_walls_and_0_5_mm_on_the_floor_leaves_1_mm() {
     // Stock cut by a Ø4 tool at tip -3.5: 1 mm of wall on each side of the Ø6 slot, 0.5 mm over its floor.
     let (min, max) = stock_corners();
-    let s = cut(min, max, 2.0, Vec3::new(30.0, -5.0, -3.5), Vec3::new(30.0, 25.0, -3.5));
+    let s = cut(min, max, 2.0, 20.0, Vec3::Z, Vec3::new(30.0, -5.0, -3.5), Vec3::new(30.0, 25.0, -3.5));
     let a = compared(&s, &slot_part(4.0));
     assert!((a.grids[0].max_left_over - 1.0).abs() < 0.05, "X grid {:?}", a.grids[0]);
     assert!((a.max_left_over - 1.0).abs() < 0.05, "left-over {}", a.max_left_over);
+}
+
+#[test]
+fn the_nearest_part_point_is_the_brute_force_one() {
+    let p = box_part();
+    let mesh = Mesh { positions: p.p.clone(), triangles: p.t.clone(), ..Mesh::default() };
+    let tree = TriangleTree::new(&mesh);
+    let mut seed = 0x2545_f491_4f6c_dd1du64;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed >> 11) as f64 / (1u64 << 53) as f64
+    };
+    for _ in 0..200 {
+        let q = Vec3::new(-15.0 + 90.0 * next(), -15.0 + 50.0 * next(), -25.0 + 40.0 * next());
+        let brute =
+            p.t.iter()
+                .map(|t| {
+                    let [a, b, c] = t.map(|i| p.p[i as usize]);
+                    {
+                        let r = closest_on_triangle(q, a, b, c) - q;
+                        (r.x * r.x + r.y * r.y + r.z * r.z).sqrt()
+                    }
+                })
+                .fold(f64::INFINITY, f64::min);
+        let (d, _) = tree.nearest(q).expect("a point of the tree");
+        assert!((d - brute).abs() < 1e-9, "tree {d} brute {brute} at {q:?}");
+    }
 }
 
 #[test]
@@ -309,19 +362,4 @@ fn a_stock_without_the_memory_for_the_check_is_refused() {
     let s = Stock::new_box(min, max, H, need).expect("a stock that fits exactly");
     let p = box_part();
     assert!(matches!(compare(&s, &p.p, &p.t), Err(SimError::Budget { .. })));
-}
-
-#[test]
-fn subtract_keeps_what_the_other_side_does_not_cover() {
-    let mut out = Vec::new();
-    subtract(&[(0.0, 10.0)], &[(2.0, 3.0), (5.0, 7.0)], &mut out);
-    assert_eq!(out, vec![(0.0, 2.0), (3.0, 5.0), (7.0, 10.0)]);
-    subtract(&[(0.0, 1.0), (2.0, 3.0)], &[(0.5, 2.5)], &mut out);
-    assert_eq!(out, vec![(0.0, 0.5), (2.5, 3.0)]);
-    subtract(&[(0.0, 4.0)], &[(1.0, 2.0), (2.0, 3.0)], &mut out);
-    assert_eq!(out, vec![(0.0, 1.0), (3.0, 4.0)]);
-    subtract(&[(0.0, 1.0)], &[(0.0, 1.0)], &mut out);
-    assert!(out.is_empty());
-    subtract(&[(0.0, 1.0)], &[(-1.0, 2.0)], &mut out);
-    assert!(out.is_empty());
 }

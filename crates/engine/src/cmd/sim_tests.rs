@@ -729,7 +729,7 @@ fn a_slot_cut_into_a_solid_block_is_a_gouge_as_deep_as_the_cut() {
     assert!((gouge - 2.0).abs() <= res, "the slot is 2 mm deep into the block: {r}");
     assert!(r["max_left_over"].as_f64().unwrap_or(f64::NAN) < 1e-6, "{r}");
     let z = r["worst_gouge"]["at"][2].as_f64().unwrap_or(f64::NAN);
-    assert!((z + 1.0).abs() <= res, "the deepest gouge is mid-slot, at z -1: {r}");
+    assert!((z + 2.0).abs() <= res, "the deepest gouge is the slot's floor, at z -2: {r}");
 }
 
 #[test]
@@ -744,7 +744,7 @@ fn a_block_3_mm_shorter_than_the_stock_leaves_3_mm_of_left_over() {
     assert!((left - 3.0).abs() <= res, "the stock is 3 mm taller than the block: {r}");
     assert!(r["max_gouge"].as_f64().unwrap_or(f64::NAN) < 1e-6, "{r}");
     let z = r["worst_left_over"]["at"][2].as_f64().unwrap_or(f64::NAN);
-    assert!((z + 1.5).abs() <= res, "the deepest left-over is mid-band, at z -1.5: {r}");
+    assert!(z.abs() <= res, "the deepest left-over is the stock's top, at z 0: {r}");
 }
 
 #[test]

@@ -294,17 +294,20 @@ pub struct AccuracyReply {
     /// The chord tolerance the part was tessellated to, mm: the Fine export's, and no more than 0.05 of the
     /// grid's spacing.
     pub chord_tolerance: f64,
-    /// The largest cell of the stock's grid, mm. Depth along rays is exact, but features narrower than this
-    /// may be missed.
+    /// The largest cell of the stock's grid, mm. Points between the rays are not sampled, so features narrower
+    /// than this may be missed.
     pub resolution: f64,
-    /// Deepest stock material the part does not have, mm (too thick); the largest of the grids' depths.
+    /// Deepest stock material the part does not have, mm (too thick): the distance from the stock's surface to
+    /// the part. The largest of the grids' figures.
     pub max_left_over: f64,
     pub worst_left_over: Option<SpotReply>,
-    /// Deepest part material the stock lacks, mm (cut too deep); the largest of the grids' depths.
+    /// Deepest part material the stock lacks, mm (cut too deep): the distance from the stock's surface to the
+    /// part. The largest of the grids' figures.
     pub max_gouge: f64,
     pub worst_gouge: Option<SpotReply>,
     /// Mean and root mean square deviation over the part's surface, mm, area-weighted: independent of the
-    /// stock's size, and zero where stock and part agree.
+    /// stock's size, and zero where stock and part agree. Each stock sample weighs the part area its ray stands
+    /// for, counted once in the grid its nearest part face leans on most.
     pub mean_abs_dev: f64,
     pub rms: f64,
     /// Each grid's own figures, in the order x, y, z.
