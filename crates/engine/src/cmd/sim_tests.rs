@@ -758,3 +758,101 @@ fn sim_full_run_timing() {
         setup["moves"], setup["h"], setup_time, run_time, run["removed_volume"]
     );
 }
+
+/// A solid design box over the stock's box, 60 x 20 mm in plan and `height` mm tall from z = -10: its top
+/// is at `height - 10`. Returns its name.
+fn design_box(s: &mut Session, height: f64) -> String {
+    let reply = call(s, "solid.box", &json!({"length": 60, "width": 20, "height": height, "corner": [0, 0, -10]}));
+    reply["bodies"][0].as_str().unwrap_or_else(|| panic!("no body name in {reply}")).to_string()
+}
+
+fn accuracy(s: &mut Session, body: &str) -> Value {
+    call(s, "sim.accuracy", &json!({"body": body}))
+}
+
+#[test]
+fn accuracy_of_an_uncut_stock_against_its_own_block_is_exact() {
+    let mut s = Session::default();
+    let body = design_box(&mut s, 10.0);
+    call(&mut s, "sim.setup", &setup_params(SLOT));
+    let r = accuracy(&mut s, &body);
+    assert_eq!((r["cursor"].as_u64(), r["total"].as_u64()), (Some(0), Some(SLOT_MOVES)), "{r}");
+    assert_eq!(r["rays"], 200_000, "{r}");
+    assert!(r["max_left_over"].as_f64().unwrap_or(f64::NAN) < 1e-6, "{r}");
+    assert!(r["max_gouge"].as_f64().unwrap_or(f64::NAN) < 1e-6, "{r}");
+    assert_eq!(r["grids"].as_array().map(Vec::len), Some(3), "{r}");
+    // The deepest spot is round-off on a face the two sides share: its depth is far below the cell.
+    assert!(r["worst_gouge"].is_null() || r["worst_gouge"]["depth"].as_f64().unwrap_or(f64::NAN) < 1e-6, "{r}");
+}
+
+#[test]
+fn a_slot_cut_into_a_solid_block_is_a_gouge_as_deep_as_the_cut() {
+    let mut s = Session::default();
+    let body = design_box(&mut s, 10.0);
+    call(&mut s, "sim.setup", &setup_params(SLOT));
+    call(&mut s, "sim.run", &json!({}));
+    let r = accuracy(&mut s, &body);
+    assert_eq!(r["cursor"], SLOT_MOVES, "{r}");
+    let res = r["resolution"].as_f64().unwrap_or(f64::NAN);
+    assert!((res - 0.1).abs() < 1e-9, "resolution {r}");
+    let gouge = r["max_gouge"].as_f64().unwrap_or(f64::NAN);
+    assert!((gouge - 2.0).abs() <= res, "the slot is 2 mm deep into the block: {r}");
+    assert!(r["max_left_over"].as_f64().unwrap_or(f64::NAN) < 1e-6, "{r}");
+    let z = r["worst_gouge"]["at"][2].as_f64().unwrap_or(f64::NAN);
+    assert!((z + 2.0).abs() <= res, "the deepest gouge is the slot's floor, at z -2: {r}");
+}
+
+#[test]
+fn a_block_3_mm_shorter_than_the_stock_leaves_3_mm_of_left_over() {
+    let mut s = Session::default();
+    let body = design_box(&mut s, 7.0);
+    call(&mut s, "sim.setup", &setup_params(SLOT));
+    call(&mut s, "sim.run", &json!({}));
+    let r = accuracy(&mut s, &body);
+    let res = r["resolution"].as_f64().unwrap_or(f64::NAN);
+    let left = r["max_left_over"].as_f64().unwrap_or(f64::NAN);
+    assert!((left - 3.0).abs() <= res, "the stock is 3 mm taller than the block: {r}");
+    assert!(r["max_gouge"].as_f64().unwrap_or(f64::NAN) < 1e-6, "{r}");
+    let z = r["worst_left_over"]["at"][2].as_f64().unwrap_or(f64::NAN);
+    assert!(z.abs() <= res, "the deepest left-over is the stock's top, at z 0: {r}");
+}
+
+#[test]
+fn accuracy_follows_the_cut_so_far_and_changes_nothing() {
+    let mut s = Session::default();
+    let body = design_box(&mut s, 10.0);
+    call(&mut s, "sim.setup", &setup_params(SLOT));
+    call(&mut s, "sim.run", &json!({"to": 2}));
+    let before = s.sim_stock().map(|st| st.state_hash());
+    let r = accuracy(&mut s, &body);
+    assert_eq!((r["cursor"].as_u64(), r["total"].as_u64()), (Some(2), Some(SLOT_MOVES)), "{r}");
+    assert_eq!(s.sim_stock().map(|st| st.state_hash()), before, "accuracy cut the stock");
+    assert_eq!(call(&mut s, "sim.status", &json!({}))["cursor"], 2);
+}
+
+#[test]
+fn hostile_accuracy_params_are_refused_not_panicked() {
+    let mut s = Session::default();
+    let body = design_box(&mut s, 10.0);
+    assert!(s.execute("sim.accuracy", &json!({"body": body})).is_err(), "accuracy with no simulation");
+    call(&mut s, "sim.setup", &setup_params(SLOT));
+    let before = s.sim_stock().map(|st| st.state_hash());
+    let cases = [
+        json!({}),
+        json!({"body": 5}),
+        json!({"body": null}),
+        json!({"body": ""}),
+        json!({"body": "No such body"}),
+        json!({"body": "\u{0}"}),
+        json!({"body": "x".repeat(10_000)}),
+        json!({"body": [body]}),
+        json!([body]),
+        json!("box"),
+    ];
+    for params in cases {
+        assert!(s.execute("sim.accuracy", &params).is_err(), "{params} was accepted");
+    }
+    assert_eq!(s.sim_stock().map(|st| st.state_hash()), before, "a refused call cut the stock");
+    assert_eq!(call(&mut s, "sim.clear", &json!({}))["cleared"], true);
+    assert!(s.execute("sim.accuracy", &json!({"body": body})).is_err(), "accuracy after clear");
+}

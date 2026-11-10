@@ -458,7 +458,17 @@ pub fn export_mesh(b: &solidcraft_kernel::Body) -> Result<Mesh> {
 
 /// [`export_mesh`] at `quality` (never finer than 1 µm).
 pub fn export_mesh_at(b: &solidcraft_kernel::Body, quality: MeshQuality) -> Result<Mesh> {
-    Ok(b.mesh(&solidcraft_kernel::MeshTolerance::chord((b.size() * quality.share()).max(1e-3)))?)
+    export_mesh_chord(b, quality_chord(b, quality))
+}
+
+/// The chord tolerance, mm, of `quality` for `b`: its share of the body's size, never finer than 1 µm.
+pub fn quality_chord(b: &solidcraft_kernel::Body, quality: MeshQuality) -> f64 {
+    (b.size() * quality.share()).max(1e-3)
+}
+
+/// `b` tessellated with the chord tolerance `chord`, mm.
+pub fn export_mesh_chord(b: &solidcraft_kernel::Body, chord: f64) -> Result<Mesh> {
+    Ok(b.mesh(&solidcraft_kernel::MeshTolerance::chord(chord))?)
 }
 
 /// Distance within which an exported mesh's vertices are welded (STL, 3MF and OBJ alike).

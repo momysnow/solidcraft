@@ -8,7 +8,9 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde_json::Value;
 use solidcore_record::Vec3;
+use solidcraft_io::MeshQuality;
 use solidcraft_machining::SimError;
+use solidcraft_machining::accuracy::{self, Accuracy};
 use solidcraft_machining::dexel::Stock;
 use solidcraft_machining::gcode::{self, CodeTable};
 use solidcraft_machining::sweep::FlatTool;
@@ -18,8 +20,8 @@ use web_time::Instant;
 use super::CommandSpec;
 use crate::params::bad;
 use crate::schema::sim::{
-    BoundsReply, ClearParams, ClearReply, DiagReply, MemoryReply, MoveTarget, PartialReply, RunParams, RunReply, SetupParams, SetupReply, ShapeName,
-    StatusParams, StatusReply, ToolParams, ToolPoseReply,
+    AccuracyParams, AccuracyReply, BoundsReply, ClearParams, ClearReply, DiagReply, GridReply, MemoryReply, MoveTarget, PartialReply, RunParams,
+    RunReply, SetupParams, SetupReply, ShapeName, SpotReply, StatusParams, StatusReply, ToolParams, ToolPoseReply,
 };
 use crate::schema::{TypedContract, output_schema_for};
 use crate::sim_jobs::{Job, Setup};
@@ -29,6 +31,7 @@ const SETUP: TypedContract<SetupParams> = TypedContract::new();
 const RUN: TypedContract<RunParams> = TypedContract::new();
 const STATUS: TypedContract<StatusParams> = TypedContract::new();
 const CLEAR: TypedContract<ClearParams> = TypedContract::new();
+const ACCURACY: TypedContract<AccuracyParams> = TypedContract::new();
 
 /// The memory cap a setup gets when it names none, in MB.
 const DEFAULT_MEMORY_MB: u64 = 512;
@@ -72,6 +75,11 @@ pub static COMMANDS: &[CommandSpec] = &[
         .noundo()
         .doc_only()
         .params("No parameters. Drops the simulation and its stock. Replies cleared: whether there was one."),
+    CommandSpec::new("sim.accuracy", "Simulation Accuracy", crate::checked!("sim.accuracy", accuracy))
+        .contract(&ACCURACY)
+        .output(output_schema_for::<AccuracyReply>)
+        .noundo()
+        .params("body: the name of a body in the design. Compares the stock as the simulation has cut it so far with that body's placed tessellation, in the program's workpiece frame (no work-offset mapping): the export's Fine quality, with a chord no more than 0.05 of the grid spacing h (replied as chord_tolerance, mm). The stock's surface is sampled where its three grids' rays enter and leave material; each sample is a deviation of its distance to the part: a sample inside the part is a gouge (cut too deep), one outside a left-over (cut too thin). Points between the rays are not sampled, so features narrower than the resolution may be missed. Replies rays and odd_rays (rays skipped because the mesh crosses them an odd number of times), resolution (the grid's largest cell, mm), max_left_over and max_gouge (mm, the largest of the grids' figures, with worst_left_over and worst_gouge as {at: [x,y,z], depth}: the stock surface point of the deepest sample), mean_abs_dev and rms (mm, area-weighted over the part's surface), cursor and total (moves cut so far, and in the program), chord_tolerance (mm) and grids: each grid's own figures in x, y, z order. Read only. Errors without sim.setup, with no such body, or when the part is open, degenerate, non-finite or too large for the stock's memory."),
 ];
 
 /// Reads the parameters into their contract's type. Unknown keys are the contract's business
@@ -341,4 +349,51 @@ fn clear(s: &mut Session, p: &Value) -> Result<Value> {
     const C: &str = "sim.clear";
     parse::<ClearParams>(C, p)?;
     serde_json::to_value(ClearReply { cleared: s.sim.clear() }).map_err(|e| bad(C, e.to_string()))
+}
+
+/// Compares the stock with a body's tessellation (see the command's text). Read only.
+fn accuracy(s: &mut Session, p: &Value) -> Result<Value> {
+    const C: &str = "sim.accuracy";
+    // serde reads a one-field struct from a one-element array too: the parameters must be an object.
+    if !p.is_object() {
+        return Err(bad(C, "parameters must be an object with a body name"));
+    }
+    let input: AccuracyParams = parse(C, p)?;
+    let (cursor, total) = s.sim_progress().ok_or_else(|| bad(C, NO_SIM))?;
+    let h = s.sim.job().map(|j| j.h()).ok_or_else(|| bad(C, NO_SIM))?;
+    let st = s.world_state()?;
+    let body = st.body(&input.body).ok_or_else(|| bad(C, format!("no body `{}`", input.body)))?;
+    // The Fine export's chord, but no coarser than the grid resolves: a facet may stand off by 0.05 h at most.
+    let chord = solidcraft_io::quality_chord(&body.body, MeshQuality::Fine).min(0.05 * h);
+    let mesh = solidcraft_io::export_mesh_chord(&body.body, chord).map_err(|e| bad(C, e.to_string()))?;
+    let stock = s.sim_stock().ok_or_else(|| bad(C, NO_SIM))?;
+    let a = accuracy::compare(stock, &mesh.positions, &mesh.triangles).map_err(|e| sim_error(C, e))?;
+    serde_json::to_value(accuracy_reply(&input.body, cursor, total, chord, &a)).map_err(|e| bad(C, e.to_string()))
+}
+
+fn accuracy_reply(body: &str, cursor: usize, total: usize, chord: f64, a: &Accuracy) -> AccuracyReply {
+    let spot = |s: &accuracy::Spot| SpotReply { at: s.at.into(), depth: s.depth };
+    let grid = |g: &accuracy::GridStats| GridReply {
+        axis: ["x", "y", "z"].get(g.axis).copied().unwrap_or("?").to_string(),
+        max_left_over: g.max_left_over,
+        max_gouge: g.max_gouge,
+        mean_abs_dev: g.mean_abs_dev,
+        rms: g.rms,
+    };
+    AccuracyReply {
+        body: body.to_string(),
+        cursor: count(cursor),
+        total: count(total),
+        rays: a.rays,
+        odd_rays: a.odd_rays,
+        chord_tolerance: chord,
+        resolution: a.resolution,
+        max_left_over: a.max_left_over,
+        worst_left_over: a.worst_left_over.as_ref().map(spot),
+        max_gouge: a.max_gouge,
+        worst_gouge: a.worst_gouge.as_ref().map(spot),
+        mean_abs_dev: a.mean_abs_dev,
+        rms: a.rms,
+        grids: a.grids.iter().map(grid).collect(),
+    }
 }

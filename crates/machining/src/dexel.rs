@@ -517,7 +517,8 @@ impl Stock {
         self.ray_segs(axis, iu, iv).iter().any(|s| f64::from(s.lo) <= t && t <= f64::from(s.hi))
     }
 
-    fn ray_segs(&self, axis: usize, iu: usize, iv: usize) -> &[Seg] {
+    /// The material intervals of ray `(iu, iv)` of the grid along `axis`, in the stored frame.
+    pub(crate) fn ray_segs(&self, axis: usize, iu: usize, iv: usize) -> &[Seg] {
         let Some(grid) = self.grids.get(axis) else { return &[] };
         if iu >= grid.nu || iv >= grid.nv {
             return &[];

@@ -256,6 +256,65 @@ pub struct ClearReply {
     pub cleared: bool,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct AccuracyParams {
+    /// The name of a body in the design, as the model lists it. Its placed copy, in the program's workpiece
+    /// frame (no work-offset mapping), is what is compared.
+    pub body: String,
+}
+
+/// A point in the stock's frame, mm, and a deviation's depth there, mm.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct SpotReply {
+    pub at: [f64; 3],
+    pub depth: f64,
+}
+
+/// One grid of the stock: its ray direction (`x`, `y` or `z`) and its own figures.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct GridReply {
+    pub axis: String,
+    pub max_left_over: f64,
+    pub max_gouge: f64,
+    pub mean_abs_dev: f64,
+    pub rms: f64,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct AccuracyReply {
+    /// The body compared.
+    pub body: String,
+    /// Moves cut so far, and moves in the program: `cursor` below `total` means the stock is part-cut.
+    pub cursor: u64,
+    pub total: u64,
+    /// Rays compared, over the stock's three grids.
+    pub rays: u64,
+    /// Rays skipped because the mesh crosses them an odd number of times, over the three grids.
+    pub odd_rays: u64,
+    /// The chord tolerance the part was tessellated to, mm: the Fine export's, and no more than 0.05 of the
+    /// grid's spacing.
+    pub chord_tolerance: f64,
+    /// The largest cell of the stock's grid, mm. Points between the rays are not sampled, so features narrower
+    /// than this may be missed.
+    pub resolution: f64,
+    /// Deepest stock material the part does not have, mm (too thick): the distance from the stock's surface to
+    /// the part. The largest of the grids' figures.
+    pub max_left_over: f64,
+    pub worst_left_over: Option<SpotReply>,
+    /// Deepest part material the stock lacks, mm (cut too deep): the distance from the stock's surface to the
+    /// part. The largest of the grids' figures.
+    pub max_gouge: f64,
+    pub worst_gouge: Option<SpotReply>,
+    /// Mean and root mean square deviation over the part's surface, mm, area-weighted: independent of the
+    /// stock's size, and zero where stock and part agree. Each stock sample weighs the part area its ray stands
+    /// for, counted once in the grid its nearest part face leans on most.
+    pub mean_abs_dev: f64,
+    pub rms: f64,
+    /// Each grid's own figures, in the order x, y, z.
+    pub grids: Vec<GridReply>,
+}
+
 #[cfg(test)]
 #[path = "sim_tests.rs"]
 mod tests;
